@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -95,9 +96,11 @@ class _AppFlowState extends ConsumerState<AppFlow>
   Widget build(BuildContext context) {
     final isAuthenticated = ref.watch(isAuthenticatedProvider);
     final hasCompletedOnboarding = ref.watch(hasCompletedOnboardingProvider);
+    final forceShowOnboarding =
+        kDebugMode && ref.watch(forceShowOnboardingProvider);
     final destination = !isAuthenticated
         ? const AuthPage()
-        : hasCompletedOnboarding
+        : hasCompletedOnboarding && !forceShowOnboarding
             ? const HomeShell()
             : const OnboardingPage();
 

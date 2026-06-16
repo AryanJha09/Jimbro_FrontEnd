@@ -28,13 +28,13 @@ class JimTheme {
             _sans(base.textTheme.headlineMedium, 24, FontWeight.w700),
         headlineSmall: _sans(base.textTheme.headlineSmall, 20, FontWeight.w700),
         titleLarge: _sans(base.textTheme.titleLarge, 18, FontWeight.w700),
-        titleMedium: _sans(base.textTheme.titleMedium, 16, FontWeight.w700),
-        titleSmall: _sans(base.textTheme.titleSmall, 14, FontWeight.w700),
-        bodyLarge: _sans(base.textTheme.bodyLarge, 16, FontWeight.w500),
-        bodyMedium: _sans(base.textTheme.bodyMedium, 14, FontWeight.w500),
-        bodySmall: _sans(base.textTheme.bodySmall, 12, FontWeight.w500),
+        titleMedium: _sans(base.textTheme.titleMedium, 16, FontWeight.w600),
+        titleSmall: _sans(base.textTheme.titleSmall, 14, FontWeight.w600),
+        bodyLarge: _sans(base.textTheme.bodyLarge, 16, FontWeight.w400),
+        bodyMedium: _sans(base.textTheme.bodyMedium, 14, FontWeight.w400),
+        bodySmall: _sans(base.textTheme.bodySmall, 12, FontWeight.w400),
         labelLarge: _sans(base.textTheme.labelLarge, 13, FontWeight.w700),
-        labelMedium: _sans(base.textTheme.labelMedium, 12, FontWeight.w700),
+        labelMedium: _sans(base.textTheme.labelMedium, 12, FontWeight.w600),
       ),
       appBarTheme: const AppBarTheme(
         surfaceTintColor: Colors.transparent,
@@ -45,7 +45,7 @@ class JimTheme {
         color: JimColors.plaque,
         margin: EdgeInsets.zero,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(JimRadius.md),
+          borderRadius: BorderRadius.circular(JimRadius.card),
           side: const BorderSide(color: JimColors.line),
         ),
       ),
@@ -59,15 +59,15 @@ class JimTheme {
         hintStyle: _sans(base.textTheme.bodyMedium, 14, FontWeight.w500)
             ?.copyWith(color: JimColors.inkMuted),
         border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(JimRadius.md),
+          borderRadius: BorderRadius.circular(JimRadius.control),
           borderSide: const BorderSide(color: JimColors.line),
         ),
         enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(JimRadius.md),
+          borderRadius: BorderRadius.circular(JimRadius.control),
           borderSide: const BorderSide(color: JimColors.line),
         ),
         focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(JimRadius.md),
+          borderRadius: BorderRadius.circular(JimRadius.control),
           borderSide: const BorderSide(
             color: JimColors.accentLine,
             width: 1.4,
@@ -82,18 +82,27 @@ class JimTheme {
         showUnselectedLabels: false,
         type: BottomNavigationBarType.fixed,
       ),
+      chipTheme: ChipThemeData(
+        selectedColor: JimColors.accentSoft,
+        backgroundColor: JimColors.plaque,
+        labelStyle: _sans(base.textTheme.labelLarge, 13, FontWeight.w700),
+        side: const BorderSide(color: JimColors.line),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(JimRadius.pill),
+        ),
+      ),
     );
   }
 
   static TextStyle? _sans(TextStyle? base, double size, FontWeight weight) {
     return base?.copyWith(
       fontFamily: 'Avenir Next',
-      fontFamilyFallback: const ['Helvetica Neue', '.SF Pro Text'],
+      fontFamilyFallback: const ['Futura', 'Helvetica Neue', '.SF Pro Text'],
       fontSize: size,
       fontWeight: weight,
       color: JimColors.ink,
-      letterSpacing: -.2,
-      height: 1.4,
+      letterSpacing: 0,
+      height: 1.36,
     );
   }
 }

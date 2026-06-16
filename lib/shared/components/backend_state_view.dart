@@ -1,8 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../core/theme/jim_tokens.dart';
-import 'jim_button.dart';
-import 'jim_surface.dart';
+import 'jim_page_scaffold.dart';
 
 class BackendLoadingView extends StatelessWidget {
   const BackendLoadingView({
@@ -24,14 +23,10 @@ class BackendLoadingView extends StatelessWidget {
       ),
       child: SafeArea(
         child: Center(
-          child: JimSurface(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const CircularProgressIndicator(),
-                const SizedBox(height: JimSpacing.md),
-                Text(message, textAlign: TextAlign.center),
-              ],
+          child: Padding(
+            padding: const EdgeInsets.all(JimSpacing.lg),
+            child: JimLoadingState(
+              message: message,
             ),
           ),
         ),
@@ -64,32 +59,10 @@ class BackendErrorView extends StatelessWidget {
         child: Center(
           child: Padding(
             padding: const EdgeInsets.all(JimSpacing.lg),
-            child: JimSurface(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(
-                    Icons.cloud_off_rounded,
-                    color: JimColors.terracotta,
-                    size: 42,
-                  ),
-                  const SizedBox(height: JimSpacing.md),
-                  Text(
-                    'Could not load app state',
-                    style: Theme.of(context).textTheme.titleLarge,
-                  ),
-                  const SizedBox(height: JimSpacing.sm),
-                  Text(
-                    '$error',
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: JimColors.inkSoft,
-                        ),
-                  ),
-                  const SizedBox(height: JimSpacing.md),
-                  JimPrimaryButton(label: 'Retry', onPressed: onRetry),
-                ],
-              ),
+            child: JimErrorState(
+              title: 'Could not load app state',
+              message: '$error',
+              onRetry: onRetry,
             ),
           ),
         ),

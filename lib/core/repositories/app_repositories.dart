@@ -2,13 +2,18 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../shared/models/app_models.dart';
 import '../../shared/models/atlas_insight.dart';
+import '../../shared/models/jim_chat_models.dart';
+import '../../shared/models/onboarding_models.dart';
 import '../config/app_config.dart';
 import '../network/jim_api_client.dart';
+import '../nutrition/nutrition_targets.dart';
 
 abstract class AuthRepository {
   Future<AuthSession?> currentSession();
@@ -20,6 +25,24 @@ abstract class AuthRepository {
   Future<void> signOut();
 }
 
+class AuthSessionExpiredException implements Exception {
+  const AuthSessionExpiredException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+class AtlasProfileSyncException implements Exception {
+  const AtlasProfileSyncException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
 abstract class ProfileRepository {
   Future<UserProfile> loadProfile(AuthSession? session);
   Future<UserStaticMetrics> loadMetrics(AuthSession? session);
@@ -28,20 +51,43 @@ abstract class ProfileRepository {
     AuthSession? session,
     UserStaticMetrics metrics,
   );
+  Future<UserStaticMetrics> submitAtlasOnboarding(
+    AuthSession? session,
+    UserProfile profile,
+    OnboardingAnswersDto answers,
+  );
+  Future<UserStaticMetrics> loadAtlasMetrics(AuthSession? session);
+  Future<UserStaticMetrics> patchAtlasProfile(
+    AuthSession? session, {
+    required UserProfile previous,
+    required UserProfile next,
+  });
 }
 
 abstract class WorkoutRepository {
+  Future<List<WorkoutTemplateDraft>> loadTemplates(AuthSession? session);
   Future<WorkoutTemplateDraft> loadTemplate(AuthSession? session);
+  Future<List<WorkoutScheduleEntry>> loadSchedule(AuthSession? session);
   Future<WorkoutLogDraft> loadWorkoutLog(AuthSession? session);
   Future<List<ExerciseSuggestion>> searchExercises(String query);
   Future<WorkoutTemplateDraft> saveTemplate(
     AuthSession? session,
     WorkoutTemplateDraft template,
   );
+  Future<void> deleteTemplate(AuthSession? session, int templateId);
+  Future<WorkoutScheduleEntry> saveScheduleEntry(
+    AuthSession? session,
+    WorkoutScheduleEntry entry,
+  );
+  Future<void> deleteScheduleEntry(
+    AuthSession? session,
+    WorkoutScheduleEntry entry,
+  );
   Future<WorkoutLogDraft> saveWorkoutLog(
     AuthSession? session,
     WorkoutLogDraft log,
   );
+  Future<void> flushPending(AuthSession? session);
 }
 
 abstract class NutritionRepository {
@@ -52,6 +98,7 @@ abstract class NutritionRepository {
     AuthSession? session,
     List<FoodLogDraft> logs,
   );
+  Future<void> flushPending(AuthSession? session);
 }
 
 abstract class ConsistencyRepository {
@@ -79,6 +126,27 @@ abstract class AtlasRepository {
   Future<AtlasInsight> previewPrompt(AuthSession? session, String prompt);
 }
 
+abstract class AgentContextRepository {
+  Future<AgentContextSnapshot> load(AuthSession? session);
+}
+
+abstract class JimChatRepository {
+  Future<JimChatResponse> send(
+    AuthSession? session, {
+    required String sessionId,
+    required String message,
+    required JimChatMode mode,
+    String? selectedOption,
+  });
+  Stream<JimChatStreamEvent> stream(
+    AuthSession? session, {
+    required String sessionId,
+    required String message,
+    required JimChatMode mode,
+  });
+  Future<void> endSession(AuthSession? session, String sessionId);
+}
+
 abstract class SearchRepository {
   SearchState emptyState();
   Future<List<SearchResultGroup>> search(AuthSession? session, String query);
@@ -94,8 +162,8 @@ class MockAuthRepository implements AuthRepository {
   Future<AuthSession> signInWithMockProvider(String provider) async {
     _session = AuthSession(
       userId: 'mock-user-1',
-      displayName: provider == 'email' ? 'Email user' : 'Aryan',
-      email: 'aryan@example.com',
+      displayName: 'JimBro User',
+      email: 'user@example.com',
       accessToken: 'mock-supabase-access-token',
       refreshToken: 'mock-refresh-token',
       provider: provider,
@@ -321,28 +389,35 @@ class SupabaseAuthRepository implements AuthRepository {
 
 class MockProfileRepository implements ProfileRepository {
   UserProfile _profile = const UserProfile(
-    name: 'Aryan',
-    goal: 'Lean muscle gain',
-    coachingPreference: 'Contextual + concise',
-    userLevel: UserLevel.intermediate,
-    age: 22,
-    heightCm: 181,
-    weightKg: 78,
-    weeksActive: 10,
-    prefersVoiceLogging: true,
+    name: 'JimBro User',
+    goal: '',
+    coachingPreference: '',
+    userLevel: UserLevel.beginner,
+    age: 0,
+    heightCm: 0,
+    weightKg: 0,
+    sex: '',
+    availableTimeMinutes: 0,
+    trainingPreference: '',
+    activityLevel: '',
+    dietaryPreference: '',
+    goalTimeframe: '',
+    weeksActive: 0,
+    prefersVoiceLogging: false,
   );
 
   UserStaticMetrics _metrics = const UserStaticMetrics(
-    bmr: 1980,
-    tdee: 2740,
-    maintenanceCalories: 2740,
-    cutCalories: 2280,
-    bulkCalories: 3020,
-    proteinG: 170,
-    carbsG: 290,
-    fatG: 72,
-    hydrationL: 3.8,
-    cutIntensity: 'Moderate',
+    bmr: 0,
+    tdee: 0,
+    targetCalories: 0,
+    maintenanceCalories: 0,
+    cutCalories: 0,
+    bulkCalories: 0,
+    proteinG: 0,
+    carbsG: 0,
+    fatG: 0,
+    hydrationL: 0,
+    cutIntensity: '',
   );
 
   @override
@@ -368,6 +443,33 @@ class MockProfileRepository implements ProfileRepository {
     _metrics = metrics;
     return _metrics;
   }
+
+  @override
+  Future<UserStaticMetrics> submitAtlasOnboarding(
+    AuthSession? session,
+    UserProfile profile,
+    OnboardingAnswersDto answers,
+  ) async {
+    _profile = profile;
+    _metrics = _localMetricsForProfile(profile);
+    return _metrics;
+  }
+
+  @override
+  Future<UserStaticMetrics> loadAtlasMetrics(AuthSession? session) async {
+    return _metrics;
+  }
+
+  @override
+  Future<UserStaticMetrics> patchAtlasProfile(
+    AuthSession? session, {
+    required UserProfile previous,
+    required UserProfile next,
+  }) async {
+    _profile = next;
+    _metrics = _localMetricsForProfile(next);
+    return _metrics;
+  }
 }
 
 class FastApiProfileRepository implements ProfileRepository {
@@ -375,47 +477,78 @@ class FastApiProfileRepository implements ProfileRepository {
 
   final Dio _dio;
   final ProfileRepository _fallback;
+  final _profileCache = <String, _CacheEntry<UserProfile>>{};
 
   @override
   Future<UserProfile> loadProfile(AuthSession? session) async {
     if (session == null) {
       return _fallback.loadProfile(session);
     }
-    try {
-      final response = await _requestWithSessionRetry(
-        _dio,
-        session,
-        (headers) => _dio.get<dynamic>(
-          '/supabase/profile',
-          options: Options(headers: headers),
-        ),
-      );
-      final data = _unwrapData(response.data);
-      if (data is! Map<String, dynamic>) {
-        return _fallback.loadProfile(session);
-      }
-      return UserProfile(
-        name: data['username']?.toString() ??
-            data['name']?.toString() ??
-            session.displayName,
-        goal: data['goal']?.toString() ?? 'Lean muscle gain',
-        coachingPreference:
-            data['coaching_preference']?.toString() ?? 'Contextual + concise',
-        userLevel: _parseUserLevel(data['user_level']?.toString()),
-        age: _toInt(data['age'], 22),
-        heightCm: _toDouble(data['height_cm'], 181),
-        weightKg: _toDouble(data['weight_kg'], 78),
-        weeksActive: _toInt(data['weeks_active'], 1),
-        prefersVoiceLogging: data['prefers_voice_logging'] == true,
-      );
-    } catch (_) {
-      return _fallback.loadProfile(session);
+    final cached = _profileCache[session.userId];
+    final response = await _requestWithSessionRetry(
+      _dio,
+      session,
+      (headers) => _dio.get<dynamic>(
+        '/supabase/profile',
+        options: Options(headers: headers),
+      ),
+    );
+    if (_isMissingBackendSupabaseServiceKey(response)) {
+      return cached?.value ?? await _fallback.loadProfile(session);
     }
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiProfileRepository.loadProfile',
+      session: session,
+      allowNotFoundAsEmpty: true,
+    );
+    if (response.statusCode == 404) {
+      return cached?.value ?? await _fallback.loadProfile(session);
+    }
+    final data = _unwrapData(response.data);
+    if (data is! Map<String, dynamic>) {
+      throw Exception(
+        'Profile response shape mismatch.\n'
+        'source: lib/core/repositories/app_repositories.dart -> FastApiProfileRepository.loadProfile\n'
+        'request: GET ${_dio.options.baseUrl}/supabase/profile\n'
+        'expected_payload: {"success":true,"data":{...profile fields...}}\n'
+        'actual_response: ${_responseSnippet(response.data) ?? 'empty'}',
+      );
+    }
+    final profile = UserProfile(
+      name: data['username']?.toString() ??
+          data['name']?.toString() ??
+          session.displayName,
+      goal: data['goal']?.toString() ?? 'Lean muscle gain',
+      coachingPreference:
+          data['coaching_preference']?.toString() ?? 'Contextual + concise',
+      userLevel: _parseUserLevel(data['user_level']?.toString()),
+      age: _toInt(data['age'], 0),
+      heightCm: _toDouble(data['height_cm'], 0),
+      weightKg: _toDouble(data['weight_kg'], 0),
+      sex: data['sex']?.toString() ?? '',
+      availableTimeMinutes: _toInt(
+        data['available_time_min'] ?? data['available_time_minutes'],
+        0,
+      ),
+      trainingPreference: data['training_preference']?.toString() ?? '',
+      activityLevel: data['activity_level']?.toString() ?? '',
+      dietaryPreference: data['dietary_preference']?.toString() ?? '',
+      goalTimeframe: data['goal_timeframe']?.toString() ?? '',
+      weeksActive: _toInt(data['weeks_active'], 0),
+      prefersVoiceLogging: data['prefers_voice_logging'] == true,
+    );
+    _profileCache[session.userId] = _CacheEntry(
+      profile,
+      ttl: FrontendCachePolicy.profile,
+    );
+    return profile;
   }
 
   @override
   Future<UserStaticMetrics> loadMetrics(AuthSession? session) async {
-    return _fallback.loadMetrics(session);
+    return loadAtlasMetrics(session);
   }
 
   @override
@@ -426,8 +559,26 @@ class FastApiProfileRepository implements ProfileRepository {
     if (session == null) {
       return _fallback.saveProfile(session, profile);
     }
-    try {
-      await _requestWithSessionRetry(
+    final payload = profileBackendPayload(profile);
+    final response = await _requestWithSessionRetry(
+      _dio,
+      session,
+      (headers) => _dio.post<dynamic>(
+        '/supabase/profile',
+        data: payload,
+        options: Options(headers: headers),
+      ),
+    );
+    if (_isMissingBackendSupabaseServiceKey(response)) {
+      final saved = await _fallback.saveProfile(session, profile);
+      _profileCache[session.userId] = _CacheEntry(
+        saved,
+        ttl: FrontendCachePolicy.profile,
+      );
+      return saved;
+    }
+    if (response.statusCode == 400 || response.statusCode == 422) {
+      final legacyResponse = await _requestWithSessionRetry(
         _dio,
         session,
         (headers) => _dio.post<dynamic>(
@@ -441,10 +592,37 @@ class FastApiProfileRepository implements ProfileRepository {
           options: Options(headers: headers),
         ),
       );
+      if (_isMissingBackendSupabaseServiceKey(legacyResponse)) {
+        final saved = await _fallback.saveProfile(session, profile);
+        _profileCache[session.userId] = _CacheEntry(
+          saved,
+          ttl: FrontendCachePolicy.profile,
+        );
+        return saved;
+      }
+      _throwIfRequestFailed(
+        legacyResponse,
+        source:
+            'lib/core/repositories/app_repositories.dart -> FastApiProfileRepository.saveProfile legacy retry',
+        session: session,
+      );
+      _profileCache[session.userId] = _CacheEntry(
+        profile,
+        ttl: FrontendCachePolicy.profile,
+      );
       return profile;
-    } catch (_) {
-      return _fallback.saveProfile(session, profile);
     }
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiProfileRepository.saveProfile',
+      session: session,
+    );
+    _profileCache[session.userId] = _CacheEntry(
+      profile,
+      ttl: FrontendCachePolicy.profile,
+    );
+    return profile;
   }
 
   @override
@@ -454,69 +632,140 @@ class FastApiProfileRepository implements ProfileRepository {
   ) async {
     return _fallback.saveMetrics(session, metrics);
   }
+
+  @override
+  Future<UserStaticMetrics> submitAtlasOnboarding(
+    AuthSession? session,
+    UserProfile profile,
+    OnboardingAnswersDto answers,
+  ) async {
+    if (session == null) {
+      return _fallback.submitAtlasOnboarding(session, profile, answers);
+    }
+    final payload = atlasOnboardingPayloadFromProfile(
+      profile,
+      answers: answers,
+    );
+    _validateAtlasPayloadCanSync(payload);
+    final response = await _requestWithSessionRetry(
+      _dio,
+      session,
+      (headers) => _dio.post<dynamic>(
+        '/atlas/onboard',
+        data: payload,
+        options: Options(headers: headers),
+      ),
+    );
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiProfileRepository.submitAtlasOnboarding',
+      session: session,
+    );
+    final metrics = _mapAtlasMetrics(response.data);
+    if (_metricsAreUsable(metrics)) {
+      return metrics;
+    }
+    return loadAtlasMetrics(session);
+  }
+
+  @override
+  Future<UserStaticMetrics> loadAtlasMetrics(AuthSession? session) async {
+    if (session == null) {
+      return _fallback.loadAtlasMetrics(session);
+    }
+    final response = await _recoverableLoadRequest(
+      () => _requestWithSessionRetry(
+        _dio,
+        session,
+        (headers) => _dio.get<dynamic>(
+          '/atlas/metrics',
+          options: Options(headers: headers),
+        ),
+      ),
+    );
+    if (response == null || _routeLooksUnsupported(response)) {
+      return _fallback.loadAtlasMetrics(session);
+    }
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiProfileRepository.loadAtlasMetrics',
+      session: session,
+    );
+    return _mapAtlasMetrics(response.data);
+  }
+
+  @override
+  Future<UserStaticMetrics> patchAtlasProfile(
+    AuthSession? session, {
+    required UserProfile previous,
+    required UserProfile next,
+  }) async {
+    if (session == null) {
+      return _fallback.patchAtlasProfile(
+        session,
+        previous: previous,
+        next: next,
+      );
+    }
+    final payload = atlasProfilePatchPayload(
+      previous: previous,
+      next: next,
+    );
+    if (payload.isEmpty) {
+      return loadAtlasMetrics(session);
+    }
+    final response = await _requestWithSessionRetry(
+      _dio,
+      session,
+      (headers) => _dio.patch<dynamic>(
+        '/atlas/profile',
+        data: payload,
+        options: Options(headers: headers),
+      ),
+    );
+    if (_routeLooksUnsupported(response)) {
+      return _fallback.patchAtlasProfile(
+        session,
+        previous: previous,
+        next: next,
+      );
+    }
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiProfileRepository.patchAtlasProfile',
+      session: session,
+    );
+    final metrics = _mapAtlasMetrics(response.data);
+    if (_metricsAreUsable(metrics)) {
+      return metrics;
+    }
+    return loadAtlasMetrics(session);
+  }
 }
 
 class MockWorkoutRepository implements WorkoutRepository {
-  late WorkoutTemplateDraft _template = WorkoutTemplateDraft(
-    name: 'Push I / Upper',
-    description:
-        'Bench focus with chest, delts, and triceps arranged for a repeatable high-quality session.',
-    durationMinutes: 62,
-    goal: 'Hypertrophy',
-    exercises: [
-      WorkoutExerciseDraft(
-        exerciseName: 'Bench Press',
-        notes: 'Own the top set, keep one rep in reserve.',
-        targetSets: 4,
-        targetReps: 6,
-        sets: const [
-          SetDraft(
-            setNumber: 1,
-            weightKg: 72.5,
-            reps: 6,
-            isWarmup: false,
-            isCompleted: true,
-            rpe: 8,
-          ),
-          SetDraft(
-            setNumber: 2,
-            weightKg: 72.5,
-            reps: 6,
-            isWarmup: false,
-            isCompleted: true,
-            rpe: 8.5,
-          ),
-        ],
-      ),
-      WorkoutExerciseDraft(
-        exerciseName: 'Incline Dumbbell Press',
-        notes: 'Slow eccentric, smooth lockout.',
-        targetSets: 3,
-        targetReps: 10,
-        sets: const [
-          SetDraft(
-            setNumber: 1,
-            weightKg: 28,
-            reps: 10,
-            isWarmup: false,
-            isCompleted: true,
-            rpe: 8,
-          ),
-        ],
-      ),
-    ],
-  );
-
-  late WorkoutLogDraft _workoutLog = WorkoutLogDraft(
-    name: 'Today\'s Push Session',
-    notes: 'Energy is solid. Prioritize clean bar path.',
-    startedAtLabel: '7:15 PM',
-    exercises: _template.exercises,
-  );
+  final List<WorkoutTemplateDraft> _templates = [];
+  final List<WorkoutScheduleEntry> _schedule = [];
+  WorkoutLogDraft _workoutLog = WorkoutLogDraft.empty;
+  int _nextTemplateId = 1;
+  int _nextScheduleId = 1;
 
   @override
-  Future<WorkoutTemplateDraft> loadTemplate(AuthSession? session) async =>
-      _template;
+  Future<List<WorkoutTemplateDraft>> loadTemplates(
+          AuthSession? session) async =>
+      List.unmodifiable(_templates);
+
+  @override
+  Future<WorkoutTemplateDraft> loadTemplate(AuthSession? session) async {
+    return _templates.isEmpty ? WorkoutTemplateDraft.empty : _templates.last;
+  }
+
+  @override
+  Future<List<WorkoutScheduleEntry>> loadSchedule(AuthSession? session) async =>
+      List.unmodifiable(_schedule);
 
   @override
   Future<WorkoutLogDraft> loadWorkoutLog(AuthSession? session) async =>
@@ -538,12 +787,64 @@ class MockWorkoutRepository implements WorkoutRepository {
     AuthSession? session,
     WorkoutTemplateDraft template,
   ) async {
-    _template = template;
-    _workoutLog = _workoutLog.copyWith(
-      name: template.name,
-      exercises: template.exercises,
+    final saved = template.copyWith(
+      templateId: template.templateId ?? _nextTemplateId++,
     );
-    return _template;
+    final existingIndex = _templates.indexWhere(
+      (item) => item.templateId == saved.templateId,
+    );
+    if (existingIndex == -1) {
+      _templates.add(saved);
+    } else {
+      _templates[existingIndex] = saved;
+    }
+    _workoutLog = _workoutLog.copyWith(
+      templateId: saved.templateId,
+      name: saved.name,
+      exercises: saved.exercises,
+    );
+    return saved;
+  }
+
+  @override
+  Future<void> deleteTemplate(AuthSession? session, int templateId) async {
+    _templates.removeWhere((template) => template.templateId == templateId);
+    _schedule.removeWhere((entry) => entry.templateId == templateId);
+    if (_workoutLog.templateId == templateId) {
+      _workoutLog = _workoutLog.copyWith(templateId: null);
+    }
+  }
+
+  @override
+  Future<WorkoutScheduleEntry> saveScheduleEntry(
+    AuthSession? session,
+    WorkoutScheduleEntry entry,
+  ) async {
+    final saved = entry.copyWith(
+      scheduleId: entry.scheduleId ?? 'local-${_nextScheduleId++}',
+      userId: entry.userId ?? session?.userId,
+    );
+    final existingIndex = _schedule.indexWhere(
+      (item) =>
+          item.scheduleId == saved.scheduleId || item.weekday == saved.weekday,
+    );
+    if (existingIndex == -1) {
+      _schedule.add(saved);
+    } else {
+      _schedule[existingIndex] = saved;
+    }
+    return saved;
+  }
+
+  @override
+  Future<void> deleteScheduleEntry(
+    AuthSession? session,
+    WorkoutScheduleEntry entry,
+  ) async {
+    _schedule.removeWhere(
+      (item) =>
+          item.scheduleId == entry.scheduleId || item.weekday == entry.weekday,
+    );
   }
 
   @override
@@ -554,20 +855,34 @@ class MockWorkoutRepository implements WorkoutRepository {
     _workoutLog = log;
     return _workoutLog;
   }
+
+  @override
+  Future<void> flushPending(AuthSession? session) async {}
 }
 
 class FastApiWorkoutRepository implements WorkoutRepository {
-  FastApiWorkoutRepository(this._dio);
+  FastApiWorkoutRepository(
+    this._dio, {
+    LocalWorkoutScheduleStore? scheduleFallback,
+    OfflineOutboxStore? outbox,
+  })  : _scheduleFallback =
+            scheduleFallback ?? const LocalWorkoutScheduleStore(),
+        _outbox = outbox ?? const OfflineOutboxStore();
 
   final Dio _dio;
+  final LocalWorkoutScheduleStore _scheduleFallback;
+  final OfflineOutboxStore _outbox;
   final _exerciseSearchCache =
       <String, _CacheEntry<List<ExerciseSuggestion>>>{};
+  final _templatesCache = <String, _CacheEntry<List<WorkoutTemplateDraft>>>{};
+  static bool? _workoutScheduleBackendSupported;
 
   @override
-  Future<WorkoutTemplateDraft> loadTemplate(AuthSession? session) async {
+  Future<List<WorkoutTemplateDraft>> loadTemplates(AuthSession? session) async {
     if (session == null) {
-      return WorkoutTemplateDraft.empty;
+      return const [];
     }
+    final cached = _templatesCache[session.userId];
     final response = await _recoverableLoadRequest(
       () => _requestWithSessionRetry(
         _dio,
@@ -579,23 +894,70 @@ class FastApiWorkoutRepository implements WorkoutRepository {
       ),
     );
     if (response == null) {
-      return WorkoutTemplateDraft.empty;
+      return cached?.value ?? const [];
     }
     _throwIfRequestFailed(
       response,
       source:
-          'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.loadTemplate',
-      allowUnauthorizedAsEmpty: true,
+          'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.loadTemplates',
     );
-    if (response.statusCode == 401) {
-      return WorkoutTemplateDraft.empty;
-    }
     final data = _unwrapData(response.data);
     if (data is! List || data.isEmpty) {
+      return cached?.value ?? const [];
+    }
+    final templates = data.map(_mapWorkoutTemplate).toList();
+    _templatesCache[session.userId] = _CacheEntry(
+      templates,
+      ttl: FrontendCachePolicy.templates,
+    );
+    return templates;
+  }
+
+  @override
+  Future<WorkoutTemplateDraft> loadTemplate(AuthSession? session) async {
+    final templates = await loadTemplates(session);
+    if (templates.isEmpty) {
       return WorkoutTemplateDraft.empty;
     }
-    final template = _pickMostRecentMap(data, 'updated_at');
-    return _mapWorkoutTemplate(template);
+    return _pickMostRecentTemplate(templates);
+  }
+
+  @override
+  Future<List<WorkoutScheduleEntry>> loadSchedule(AuthSession? session) async {
+    final local = await _scheduleFallback.load(session);
+    if (session == null || _workoutScheduleBackendSupported == false) {
+      return local;
+    }
+    final response = await _recoverableLoadRequest(
+      () => _requestWithSessionRetry(
+        _dio,
+        session,
+        (headers) => _dio.get<dynamic>(
+          '/workout-schedule',
+          options: Options(headers: headers),
+        ),
+      ),
+    );
+    if (response == null) {
+      return local;
+    }
+    if (_routeLooksUnsupported(response)) {
+      _markWorkoutScheduleUnsupported(response);
+      return local;
+    }
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.loadSchedule',
+    );
+    final data = _unwrapData(response.data);
+    if (data is! List) {
+      return local;
+    }
+    _workoutScheduleBackendSupported = true;
+    final remote = data.map(_mapWorkoutScheduleEntry).toList();
+    await _scheduleFallback.replace(session, remote);
+    return remote;
   }
 
   @override
@@ -620,11 +982,7 @@ class FastApiWorkoutRepository implements WorkoutRepository {
       response,
       source:
           'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.loadWorkoutLog',
-      allowUnauthorizedAsEmpty: true,
     );
-    if (response.statusCode == 401) {
-      return WorkoutLogDraft.empty;
-    }
     final data = _unwrapData(response.data);
     if (data is! List || data.isEmpty) {
       return WorkoutLogDraft.empty;
@@ -677,7 +1035,10 @@ class FastApiWorkoutRepository implements WorkoutRepository {
           })
           .whereType<ExerciseSuggestion>()
           .toList();
-      _exerciseSearchCache[normalized] = _CacheEntry(suggestions);
+      _exerciseSearchCache[normalized] = _CacheEntry(
+        suggestions,
+        ttl: FrontendCachePolicy.exerciseSearch,
+      );
       return _mergeExerciseSuggestions(suggestions, local);
     } catch (_) {
       return cached?.value ?? local;
@@ -690,7 +1051,14 @@ class FastApiWorkoutRepository implements WorkoutRepository {
     WorkoutTemplateDraft template,
   ) async {
     if (session == null) {
-      throw Exception('You must be signed in to save workout templates.');
+      throw Exception(
+        'Authentication session missing in workout template repository.\n'
+        'source: lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.saveTemplate\n'
+        'problem: saveTemplate received session == null, so no Authorization header could be created.\n'
+        'backend_request_sent: false\n'
+        'expected: AppDraftController should resolve AuthSession before calling this repository.\n'
+        'fix: Verify authSessionProvider and AuthRepository.currentSession() both contain the Supabase session after login.',
+      );
     }
     final normalized = _validateWorkoutTemplateDraft(template);
     final resolvedExercises = <WorkoutExerciseDraft>[];
@@ -701,21 +1069,57 @@ class FastApiWorkoutRepository implements WorkoutRepository {
         ),
       );
     }
-    final payload = {
-      'name': normalized.name,
-      'description':
-          normalized.description.isEmpty ? null : normalized.description,
-      'exercises': resolvedExercises.asMap().entries.map((entry) {
-        final exercise = entry.value;
-        return {
-          'exercise_id': exercise.exerciseId,
-          'order_index': entry.key + 1,
-          'notes': exercise.notes.isEmpty ? null : exercise.notes,
-        };
-      }).toList(),
-    };
-    final response = normalized.templateId == null
-        ? await _requestWithSessionRetry(
+    final richPayload = workoutTemplateRichPayload(
+      normalized,
+      resolvedExercises,
+    );
+    final documentedPayload = workoutTemplateDocumentedPayload(
+      normalized,
+      resolvedExercises,
+    );
+    var response = await _sendWorkoutTemplatePayload(
+      session,
+      normalized.templateId,
+      richPayload,
+    );
+    if (_shouldRetryDocumentedPayload(response)) {
+      _debugPayloadRetry(
+        route: '/workout-templates',
+        statusCode: response.statusCode,
+        attemptedPayload: richPayload,
+        retryPayload: documentedPayload,
+      );
+      response = await _sendWorkoutTemplatePayload(
+        session,
+        normalized.templateId,
+        documentedPayload,
+      );
+    }
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.saveTemplate',
+    );
+    final mapped = _mapWorkoutTemplate(_unwrapData(response.data));
+    final responseTemplateId =
+        _toNullableInt(_asMap(_unwrapData(response.data))['template_id']);
+    final saved = mapped.name.trim().isEmpty
+        ? normalized.copyWith(
+            templateId: responseTemplateId ?? normalized.templateId,
+          )
+        : mapped;
+    final readBack = await _readBackTemplateIfSupported(session, saved);
+    _cacheSavedTemplate(session, readBack);
+    return readBack;
+  }
+
+  Future<Response<dynamic>> _sendWorkoutTemplatePayload(
+    AuthSession session,
+    int? templateId,
+    Map<String, Object?> payload,
+  ) {
+    return templateId == null
+        ? _requestWithSessionRetry(
             _dio,
             session,
             (headers) => _dio.post<dynamic>(
@@ -724,21 +1128,215 @@ class FastApiWorkoutRepository implements WorkoutRepository {
               options: Options(headers: headers),
             ),
           )
-        : await _requestWithSessionRetry(
+        : _requestWithSessionRetry(
             _dio,
             session,
             (headers) => _dio.patch<dynamic>(
-              '/workout-templates/${normalized.templateId}',
+              '/workout-templates/$templateId',
               data: payload,
               options: Options(headers: headers),
             ),
           );
+  }
+
+  Future<WorkoutTemplateDraft> _readBackTemplateIfSupported(
+    AuthSession session,
+    WorkoutTemplateDraft saved,
+  ) async {
+    final templateId = saved.templateId;
+    if (templateId == null) {
+      return saved;
+    }
+    final response = await _recoverableLoadRequest(
+      () => _requestWithSessionRetry(
+        _dio,
+        session,
+        (headers) => _dio.get<dynamic>(
+          '/workout-templates/$templateId',
+          options: Options(headers: headers),
+        ),
+      ),
+    );
+    if (response == null || _routeLooksUnsupported(response)) {
+      return saved;
+    }
     _throwIfRequestFailed(
       response,
       source:
-          'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.saveTemplate',
+          'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository._readBackTemplateIfSupported',
     );
-    return _mapWorkoutTemplate(_unwrapData(response.data));
+    final mapped = _mapWorkoutTemplate(_unwrapData(response.data));
+    return mapped.name.trim().isEmpty ? saved : mapped;
+  }
+
+  @override
+  Future<void> deleteTemplate(AuthSession? session, int templateId) async {
+    if (session == null) {
+      throw Exception(
+        'Authentication session missing in workout template repository.\n'
+        'source: lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.deleteTemplate\n'
+        'problem: deleteTemplate received session == null, so no Authorization header could be created.\n'
+        'backend_request_sent: false',
+      );
+    }
+    final response = await _requestWithSessionRetry(
+      _dio,
+      session,
+      (headers) => _dio.delete<dynamic>(
+        '/workout-templates/$templateId',
+        options: Options(headers: headers),
+      ),
+    );
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.deleteTemplate',
+    );
+    final cached = _templatesCache[session.userId]?.value;
+    if (cached != null) {
+      _templatesCache[session.userId] = _CacheEntry(
+        cached
+            .where((template) => template.templateId != templateId)
+            .toList(growable: false),
+        ttl: FrontendCachePolicy.templates,
+      );
+    }
+  }
+
+  void _cacheSavedTemplate(
+    AuthSession session,
+    WorkoutTemplateDraft saved,
+  ) {
+    final current = _templatesCache[session.userId]?.value ?? const [];
+    final index = current.indexWhere(
+      (template) => template.templateId == saved.templateId,
+    );
+    final updated = [...current];
+    if (index == -1) {
+      updated.add(saved);
+    } else {
+      updated[index] = saved;
+    }
+    _templatesCache[session.userId] = _CacheEntry(
+      updated,
+      ttl: FrontendCachePolicy.templates,
+    );
+  }
+
+  @override
+  Future<WorkoutScheduleEntry> saveScheduleEntry(
+    AuthSession? session,
+    WorkoutScheduleEntry entry,
+  ) async {
+    if (session == null) {
+      return _scheduleFallback.save(session, entry);
+    }
+    if (_workoutScheduleBackendSupported == false) {
+      return _scheduleFallback.save(session, entry);
+    }
+    final payload = _workoutSchedulePayload(session, entry);
+    final scheduleId = entry.scheduleId;
+    try {
+      final response = scheduleId == null || scheduleId.startsWith('local-')
+          ? await _requestWithSessionRetry(
+              _dio,
+              session,
+              (headers) => _dio.post<dynamic>(
+                '/workout-schedule',
+                data: payload,
+                options: Options(headers: headers),
+              ),
+            )
+          : await _requestWithSessionRetry(
+              _dio,
+              session,
+              (headers) => _dio.patch<dynamic>(
+                '/workout-schedule/$scheduleId',
+                data: payload,
+                options: Options(headers: headers),
+              ),
+            );
+      if (_routeLooksUnsupported(response)) {
+        _markWorkoutScheduleUnsupported(response);
+        return _scheduleFallback.save(session, entry);
+      }
+      _throwIfRequestFailed(
+        response,
+        source:
+            'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.saveScheduleEntry',
+      );
+      final saved = _mapWorkoutScheduleEntry(_unwrapData(response.data));
+      await _scheduleFallback.save(session, saved);
+      _workoutScheduleBackendSupported = true;
+      return saved;
+    } on DioException catch (error) {
+      if (_isRecoverableLoadFailure(error) ||
+          _routeLooksUnsupported(error.response)) {
+        if (_routeLooksUnsupported(error.response)) {
+          _markWorkoutScheduleUnsupported(error.response);
+        }
+        return _scheduleFallback.save(session, entry);
+      }
+      rethrow;
+    }
+  }
+
+  @override
+  Future<void> deleteScheduleEntry(
+    AuthSession? session,
+    WorkoutScheduleEntry entry,
+  ) async {
+    if (session == null) {
+      await _scheduleFallback.delete(session, entry);
+      return;
+    }
+    if (_workoutScheduleBackendSupported == false) {
+      await _scheduleFallback.delete(session, entry);
+      return;
+    }
+    final scheduleId = entry.scheduleId;
+    if (scheduleId == null || scheduleId.startsWith('local-')) {
+      await _scheduleFallback.delete(session, entry);
+      return;
+    }
+    try {
+      final response = await _requestWithSessionRetry(
+        _dio,
+        session,
+        (headers) => _dio.delete<dynamic>(
+          '/workout-schedule/$scheduleId',
+          options: Options(headers: headers),
+        ),
+      );
+      if (!_routeLooksUnsupported(response)) {
+        _throwIfRequestFailed(
+          response,
+          source:
+              'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.deleteScheduleEntry',
+        );
+        _workoutScheduleBackendSupported = true;
+      } else {
+        _markWorkoutScheduleUnsupported(response);
+      }
+    } on DioException catch (error) {
+      if (!_isRecoverableLoadFailure(error) &&
+          !_routeLooksUnsupported(error.response)) {
+        rethrow;
+      }
+      if (_routeLooksUnsupported(error.response)) {
+        _markWorkoutScheduleUnsupported(error.response);
+      }
+    }
+    await _scheduleFallback.delete(session, entry);
+  }
+
+  void _markWorkoutScheduleUnsupported(Response<dynamic>? response) {
+    _workoutScheduleBackendSupported = false;
+    if (kDebugMode) {
+      debugPrint(
+        'JimBro schedule backend unsupported status=${response?.statusCode ?? 'unknown'} route=/workout-schedule; using local schedule store.',
+      );
+    }
   }
 
   @override
@@ -747,8 +1345,44 @@ class FastApiWorkoutRepository implements WorkoutRepository {
     WorkoutLogDraft log,
   ) async {
     if (session == null) {
-      throw Exception('You must be signed in to log workouts.');
+      throw Exception(
+        'Authentication session missing in workout log repository.\n'
+        'source: lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.saveWorkoutLog\n'
+        'problem: saveWorkoutLog received session == null, so no Authorization header could be created.\n'
+        'backend_request_sent: false\n'
+        'expected: AppDraftController should resolve AuthSession before calling this repository.\n'
+        'fix: Verify authSessionProvider and AuthRepository.currentSession() both contain the Supabase session after login.',
+      );
     }
+    try {
+      final saved = await _saveWorkoutLogOnline(session, log);
+      await flushPending(session);
+      return saved;
+    } on DioException catch (error) {
+      if (_shouldQueueOffline(error)) {
+        final normalized = _validateWorkoutLogDraft(log);
+        await _outbox.enqueue(
+          session,
+          OfflineOutboxItem(
+            localId: _localMutationId('workout-log'),
+            operationType: 'workout_log_create',
+            payload: workoutLogDraftToJson(normalized),
+            createdAt: DateTime.now(),
+            retryCount: 0,
+            lastErrorCode: _dioErrorCode(error),
+            lastErrorMessage: _safeErrorSummary(error),
+          ),
+        );
+        return normalized;
+      }
+      rethrow;
+    }
+  }
+
+  Future<WorkoutLogDraft> _saveWorkoutLogOnline(
+    AuthSession session,
+    WorkoutLogDraft log,
+  ) async {
     final normalized = _validateWorkoutLogDraft(log);
     final resolvedExercises = <WorkoutExerciseDraft>[];
     for (final exercise in normalized.exercises) {
@@ -758,95 +1392,156 @@ class FastApiWorkoutRepository implements WorkoutRepository {
         ),
       );
     }
+    final richPayload = workoutLogRichPayload(normalized, resolvedExercises);
+    final documentedPayload = workoutLogDocumentedPayload(
+      normalized,
+      resolvedExercises,
+    );
     if (normalized.workoutLogId != null) {
-      final response = await _requestWithSessionRetry(
+      var response = await _requestWithSessionRetry(
         _dio,
         session,
         (headers) => _dio.patch<dynamic>(
           '/workout-logs/${normalized.workoutLogId}',
-          data: {
-            'name': normalized.name,
-            'notes': normalized.notes.isEmpty ? null : normalized.notes,
-          },
+          data: richPayload,
           options: Options(headers: headers),
         ),
       );
+      if (_shouldRetryDocumentedPayload(response)) {
+        _debugPayloadRetry(
+          route: '/workout-logs/${normalized.workoutLogId}',
+          statusCode: response.statusCode,
+          attemptedPayload: richPayload,
+          retryPayload: documentedPayload,
+        );
+        response = await _requestWithSessionRetry(
+          _dio,
+          session,
+          (headers) => _dio.patch<dynamic>(
+            '/workout-logs/${normalized.workoutLogId}',
+            data: documentedPayload,
+            options: Options(headers: headers),
+          ),
+        );
+      }
       _throwIfRequestFailed(
         response,
         source:
             'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.saveWorkoutLog.patch',
       );
-      return _mapWorkoutLog(_unwrapData(response.data));
+      final mapped = _mapWorkoutLog(_unwrapData(response.data));
+      return mapped.exercises.isEmpty ? normalized : mapped;
     }
-    final response = await _requestWithSessionRetry(
+    var response = await _requestWithSessionRetry(
       _dio,
       session,
       (headers) => _dio.post<dynamic>(
         '/workout-logs',
-        data: {
-          'name': normalized.name,
-          'template_id': normalized.templateId,
-          'notes': normalized.notes.isEmpty ? null : normalized.notes,
-          'exercises': resolvedExercises.asMap().entries.map((entry) {
-            final exercise = entry.value;
-            return {
-              'exercise_id': exercise.exerciseId,
-              'order_index': entry.key + 1,
-              'notes': exercise.notes.isEmpty ? null : exercise.notes,
-              'sets': exercise.sets.map((setDraft) {
-                return {
-                  'set_number': setDraft.setNumber,
-                  'reps': setDraft.reps,
-                  'weight_kg': setDraft.weightKg,
-                  'is_warmup': setDraft.isWarmup,
-                  if (setDraft.rpe > 0) 'rpe': setDraft.rpe,
-                };
-              }).toList(),
-            };
-          }).toList(),
-        },
+        data: richPayload,
         options: Options(headers: headers),
       ),
     );
+    if (_shouldRetryDocumentedPayload(response)) {
+      _debugPayloadRetry(
+        route: '/workout-logs',
+        statusCode: response.statusCode,
+        attemptedPayload: richPayload,
+        retryPayload: documentedPayload,
+      );
+      response = await _requestWithSessionRetry(
+        _dio,
+        session,
+        (headers) => _dio.post<dynamic>(
+          '/workout-logs',
+          data: documentedPayload,
+          options: Options(headers: headers),
+        ),
+      );
+    }
     _throwIfRequestFailed(
       response,
       source:
           'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.saveWorkoutLog.post',
     );
-    return _mapWorkoutLog(_unwrapData(response.data));
+    final mapped = _mapWorkoutLog(_unwrapData(response.data));
+    final responseLogId =
+        _toNullableInt(_asMap(_unwrapData(response.data))['workout_log_id']);
+    final saved = mapped.exercises.isEmpty
+        ? normalized.copyWith(workoutLogId: responseLogId)
+        : mapped;
+    return _readBackWorkoutLogIfSupported(session, saved);
+  }
+
+  @override
+  Future<void> flushPending(AuthSession? session) async {
+    if (session == null) {
+      return;
+    }
+    final items = await _outbox.load(session);
+    for (final item in items) {
+      if (item.needsReview || item.operationType != 'workout_log_create') {
+        continue;
+      }
+      try {
+        await _saveWorkoutLogOnline(
+            session, workoutLogDraftFromJson(item.payload));
+        await _outbox.remove(session, item.localId);
+      } on AuthSessionExpiredException {
+        return;
+      } on DioException catch (error) {
+        final status = error.response?.statusCode ?? 0;
+        if (status == 401) {
+          return;
+        }
+        await _outbox.update(
+          session,
+          item.copyWith(
+            retryCount: item.retryCount + 1,
+            lastErrorCode: _dioErrorCode(error),
+            lastErrorMessage: _safeErrorSummary(error),
+            needsReview: status == 400 || status == 422,
+          ),
+        );
+        if (!_shouldQueueOffline(error)) {
+          continue;
+        }
+      }
+    }
+  }
+
+  Future<WorkoutLogDraft> _readBackWorkoutLogIfSupported(
+    AuthSession session,
+    WorkoutLogDraft saved,
+  ) async {
+    final logId = saved.workoutLogId;
+    if (logId == null) {
+      return saved;
+    }
+    final response = await _recoverableLoadRequest(
+      () => _requestWithSessionRetry(
+        _dio,
+        session,
+        (headers) => _dio.get<dynamic>(
+          '/workout-logs/$logId',
+          options: Options(headers: headers),
+        ),
+      ),
+    );
+    if (response == null || _routeLooksUnsupported(response)) {
+      return saved;
+    }
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository._readBackWorkoutLogIfSupported',
+    );
+    final mapped = _mapWorkoutLog(_unwrapData(response.data));
+    return mapped.exercises.isEmpty ? saved : mapped;
   }
 }
 
 class MockNutritionRepository implements NutritionRepository {
-  List<FoodLogDraft> _foodLogs = const [
-    FoodLogDraft(
-      foodName: 'Eggs',
-      quantityGrams: 150,
-      mealType: MealType.breakfast,
-      calories: 215,
-      protein: 18,
-      carbs: 2,
-      fat: 15,
-    ),
-    FoodLogDraft(
-      foodName: 'Sourdough toast',
-      quantityGrams: 70,
-      mealType: MealType.breakfast,
-      calories: 180,
-      protein: 6,
-      carbs: 34,
-      fat: 2,
-    ),
-    FoodLogDraft(
-      foodName: 'Chicken rice bowl',
-      quantityGrams: 420,
-      mealType: MealType.lunch,
-      calories: 640,
-      protein: 48,
-      carbs: 66,
-      fat: 16,
-    ),
-  ];
+  List<FoodLogDraft> _foodLogs = const [];
 
   @override
   Future<List<FoodLogDraft>> loadFoodLogs(AuthSession? session) async =>
@@ -862,9 +1557,7 @@ class MockNutritionRepository implements NutritionRepository {
     if (normalized.length < 2) {
       return const [];
     }
-    return _mockFoodSuggestions
-        .where((food) => food.name.toLowerCase().contains(normalized))
-        .toList();
+    return _localFoodSuggestions(normalized);
   }
 
   @override
@@ -875,6 +1568,9 @@ class MockNutritionRepository implements NutritionRepository {
     _foodLogs = logs;
     return _foodLogs;
   }
+
+  @override
+  Future<void> flushPending(AuthSession? session) async {}
 
   DailyNutritionSummary _summaryFor(List<FoodLogDraft> logs) {
     double calories = 0;
@@ -889,31 +1585,39 @@ class MockNutritionRepository implements NutritionRepository {
     }
 
     return DailyNutritionSummary(
-      targetCalories: 2740,
+      targetCalories: 0,
       consumedCalories: calories,
-      proteinTarget: 170,
+      proteinTarget: 0,
       proteinConsumed: protein,
-      carbsTarget: 290,
+      carbsTarget: 0,
       carbsConsumed: carbs,
-      fatTarget: 72,
+      fatTarget: 0,
       fatConsumed: fat,
-      hydrationTargetLiters: 3.8,
-      hydrationConsumedLiters: 2.7,
+      hydrationTargetLiters: 0,
+      hydrationConsumedLiters: 0,
     );
   }
 }
 
 class FastApiNutritionRepository implements NutritionRepository {
-  FastApiNutritionRepository(this._dio);
+  FastApiNutritionRepository(
+    this._dio, {
+    OfflineOutboxStore? outbox,
+  }) : _outbox = outbox ?? const OfflineOutboxStore();
 
   final Dio _dio;
+  final OfflineOutboxStore _outbox;
   final _foodSearchCache = <String, _CacheEntry<List<FoodSuggestion>>>{};
+  final _todayFoodLogCache = <String, _CacheEntry<List<FoodLogDraft>>>{};
+  final _summaryCache = <String, _CacheEntry<DailyNutritionSummary>>{};
 
   @override
   Future<List<FoodLogDraft>> loadFoodLogs(AuthSession? session) async {
     if (session == null) {
       return const [];
     }
+    final cacheKey = '${session.userId}:${_todayIso()}';
+    final cached = _todayFoodLogCache[cacheKey];
     final response = await _recoverableLoadRequest(
       () => _requestWithSessionRetry(
         _dio,
@@ -926,22 +1630,23 @@ class FastApiNutritionRepository implements NutritionRepository {
       ),
     );
     if (response == null) {
-      return const [];
+      return cached?.value ?? const [];
     }
     _throwIfRequestFailed(
       response,
       source:
           'lib/core/repositories/app_repositories.dart -> FastApiNutritionRepository.loadFoodLogs',
-      allowUnauthorizedAsEmpty: true,
     );
-    if (response.statusCode == 401) {
-      return const [];
-    }
     final data = _unwrapData(response.data);
     if (data is! List) {
-      return const [];
+      return cached?.value ?? const [];
     }
-    return data.map<FoodLogDraft>((item) => _mapFoodLog(item)).toList();
+    final logs = data.map<FoodLogDraft>((item) => _mapFoodLog(item)).toList();
+    _todayFoodLogCache[cacheKey] = _CacheEntry(
+      logs,
+      ttl: FrontendCachePolicy.todayFoodLog,
+    );
+    return logs;
   }
 
   @override
@@ -949,6 +1654,8 @@ class FastApiNutritionRepository implements NutritionRepository {
     if (session == null) {
       return DailyNutritionSummary.empty;
     }
+    final cacheKey = '${session.userId}:${_todayIso()}';
+    final cached = _summaryCache[cacheKey];
     final response = await _recoverableLoadRequest(
       () => _requestWithSessionRetry(
         _dio,
@@ -960,38 +1667,33 @@ class FastApiNutritionRepository implements NutritionRepository {
       ),
     );
     if (response == null) {
-      return DailyNutritionSummary.empty;
+      final logs = await loadFoodLogs(session);
+      return cached?.value ?? nutritionSummaryFromFoodLogs(logs);
+    }
+    if (_routeLooksUnsupported(response)) {
+      if (kDebugMode) {
+        debugPrint(
+          'JimBro food summary endpoint unavailable status=${response.statusCode ?? 'unknown'} route=/food-log/summary/YYYY-MM-DD; aggregating food-log rows.',
+        );
+      }
+      final logs = await loadFoodLogs(session);
+      return nutritionSummaryFromFoodLogs(logs);
     }
     _throwIfRequestFailed(
       response,
       source:
           'lib/core/repositories/app_repositories.dart -> FastApiNutritionRepository.loadSummary',
-      allowNotFoundAsEmpty: true,
-      allowUnauthorizedAsEmpty: true,
     );
-    if (response.statusCode == 401) {
-      return DailyNutritionSummary.empty;
-    }
     final data = _unwrapData(response.data);
     if (data is! Map<String, dynamic>) {
-      return DailyNutritionSummary.empty;
+      return cached?.value ?? DailyNutritionSummary.empty;
     }
-    return DailyNutritionSummary(
-      targetCalories:
-          _toNutritionDouble(data['target_calories'], 0, max: 20000),
-      consumedCalories:
-          _toNutritionDouble(data['total_calories'], 0, max: 20000),
-      proteinTarget: _toNutritionDouble(data['protein_target'], 0, max: 1000),
-      proteinConsumed: _toNutritionDouble(data['total_protein'], 0, max: 1000),
-      carbsTarget: _toNutritionDouble(data['carbs_target'], 0, max: 2000),
-      carbsConsumed: _toNutritionDouble(data['total_carbs'], 0, max: 2000),
-      fatTarget: _toNutritionDouble(data['fat_target'], 0, max: 1000),
-      fatConsumed: _toNutritionDouble(data['total_fat'], 0, max: 1000),
-      hydrationTargetLiters:
-          _toNutritionDouble(data['hydration_target'], 0, max: 20),
-      hydrationConsumedLiters:
-          _toNutritionDouble(data['hydration_consumed'], 0, max: 20),
+    final summary = dailyNutritionSummaryFromBackend(data);
+    _summaryCache[cacheKey] = _CacheEntry(
+      summary,
+      ttl: FrontendCachePolicy.dashboard,
     );
+    return summary;
   }
 
   @override
@@ -1010,11 +1712,11 @@ class FastApiNutritionRepository implements NutritionRepository {
         queryParameters: {'q': normalized},
       ).timeout(const Duration(seconds: 5));
       if (response.statusCode == null || response.statusCode! >= 400) {
-        return cached?.value ?? _localFoodSuggestions(normalized);
+        return cached?.value ?? const [];
       }
       final data = _unwrapData(response.data);
       if (data is! List) {
-        return cached?.value ?? _localFoodSuggestions(normalized);
+        return cached?.value ?? const [];
       }
       final suggestions = data
           .map<FoodSuggestion?>((item) {
@@ -1024,40 +1726,17 @@ class FastApiNutritionRepository implements NutritionRepository {
             if (id.trim().isEmpty || name.trim().isEmpty) {
               return null;
             }
-            return FoodSuggestion(
-              foodId: id,
-              name: name,
-              caloriesPer100g: _toNutritionDouble(
-                map['calories_per_100g'],
-                0,
-                max: 2000,
-              ),
-              proteinPer100g: _toNutritionDouble(
-                map['protein_per_100g'],
-                0,
-                max: 200,
-              ),
-              carbsPer100g: _toNutritionDouble(
-                map['carbs_per_100g'],
-                0,
-                max: 200,
-              ),
-              fatPer100g: _toNutritionDouble(
-                map['fat_per_100g'],
-                0,
-                max: 200,
-              ),
-              source: map['source']?.toString() ?? 'Food catalog',
-            );
+            return foodSuggestionFromBackend(map);
           })
           .whereType<FoodSuggestion>()
           .toList();
-      _foodSearchCache[normalized] = _CacheEntry(suggestions);
-      return suggestions.isEmpty
-          ? _localFoodSuggestions(normalized)
-          : suggestions;
+      _foodSearchCache[normalized] = _CacheEntry(
+        suggestions,
+        ttl: FrontendCachePolicy.foodSearch,
+      );
+      return suggestions;
     } catch (_) {
-      return cached?.value ?? _localFoodSuggestions(normalized);
+      return cached?.value ?? const [];
     }
   }
 
@@ -1069,6 +1748,38 @@ class FastApiNutritionRepository implements NutritionRepository {
     if (session == null) {
       throw Exception('You must be signed in to save nutrition logs.');
     }
+    try {
+      final saved = await _saveFoodLogsOnline(session, logs);
+      await flushPending(session);
+      return saved;
+    } on DioException catch (error) {
+      if (_shouldQueueOffline(error)) {
+        final normalized = logs.map(_validateFoodLogDraft).toList();
+        _cacheTodayFoodLogs(session, normalized);
+        await _outbox.enqueue(
+          session,
+          OfflineOutboxItem(
+            localId: _localMutationId('nutrition-batch'),
+            operationType: 'nutrition_logs_replace',
+            payload: {
+              'logs': normalized.map(foodLogDraftToJson).toList(),
+            },
+            createdAt: DateTime.now(),
+            retryCount: 0,
+            lastErrorCode: _dioErrorCode(error),
+            lastErrorMessage: _safeErrorSummary(error),
+          ),
+        );
+        return normalized;
+      }
+      rethrow;
+    }
+  }
+
+  Future<List<FoodLogDraft>> _saveFoodLogsOnline(
+    AuthSession session,
+    List<FoodLogDraft> logs,
+  ) async {
     final existingLogs = await loadFoodLogs(session);
     final existingById = {
       for (final log in existingLogs)
@@ -1129,7 +1840,10 @@ class FastApiNutritionRepository implements NutritionRepository {
           (headers) => _dio.patch<dynamic>(
             '/food-log/${normalized.foodLogId}',
             data: {
-              'quantity_grams': normalized.quantityGrams,
+              'quantity_g': normalized.quantityGrams,
+              'quantity_source': _quantitySourceWire(
+                normalized.quantitySource,
+              ),
             },
             options: Options(headers: headers),
           ),
@@ -1164,12 +1878,7 @@ class FastApiNutritionRepository implements NutritionRepository {
         session,
         (headers) => _dio.post<dynamic>(
           '/food-log',
-          data: {
-            'food_id': foodId,
-            'quantity_grams': normalized.quantityGrams,
-            'date': date,
-            'meal_type': normalized.mealType.name,
-          },
+          data: foodLogBackendPayload(normalized, foodId: foodId, date: date),
           options: Options(headers: headers),
         ),
       );
@@ -1180,7 +1889,57 @@ class FastApiNutritionRepository implements NutritionRepository {
       );
       saved.add(_mapFoodLog(_unwrapData(createResponse.data)));
     }
+    _cacheTodayFoodLogs(session, saved);
     return saved;
+  }
+
+  void _cacheTodayFoodLogs(AuthSession session, List<FoodLogDraft> logs) {
+    final cacheKey = '${session.userId}:${_todayIso()}';
+    _todayFoodLogCache[cacheKey] = _CacheEntry(
+      logs,
+      ttl: FrontendCachePolicy.todayFoodLog,
+    );
+    _summaryCache[cacheKey] = _CacheEntry(
+      nutritionSummaryFromFoodLogs(logs),
+      ttl: FrontendCachePolicy.dashboard,
+    );
+  }
+
+  @override
+  Future<void> flushPending(AuthSession? session) async {
+    if (session == null) {
+      return;
+    }
+    final items = await _outbox.load(session);
+    for (final item in items) {
+      if (item.needsReview || item.operationType != 'nutrition_logs_replace') {
+        continue;
+      }
+      try {
+        final rawLogs = item.payload['logs'];
+        final logs = rawLogs is List
+            ? rawLogs.map(foodLogDraftFromJson).toList(growable: false)
+            : const <FoodLogDraft>[];
+        await _saveFoodLogsOnline(session, logs);
+        await _outbox.remove(session, item.localId);
+      } on AuthSessionExpiredException {
+        return;
+      } on DioException catch (error) {
+        final status = error.response?.statusCode ?? 0;
+        if (status == 401) {
+          return;
+        }
+        await _outbox.update(
+          session,
+          item.copyWith(
+            retryCount: item.retryCount + 1,
+            lastErrorCode: _dioErrorCode(error),
+            lastErrorMessage: _safeErrorSummary(error),
+            needsReview: status == 400 || status == 422,
+          ),
+        );
+      }
+    }
   }
 
   Future<String?> _createFoodForLog(
@@ -1206,33 +1965,380 @@ class FastApiNutritionRepository implements NutritionRepository {
       session,
       (headers) => _dio.post<dynamic>(
         '/food',
-        data: {
-          'name': log.foodName,
-          'calories_per_100g': (log.calories * factor).toStringAsFixed(2),
-          'protein_per_100g': (log.protein * factor).toStringAsFixed(2),
-          'carbs_per_100g': (log.carbs * factor).toStringAsFixed(2),
-          'fat_per_100g': (log.fat * factor).toStringAsFixed(2),
-          'source': 'JimBro',
-        },
+        data: customFoodBackendPayload(log, factor: factor),
         options: Options(headers: headers),
       ),
     );
+    if (_routeLooksUnsupported(response)) {
+      throw Exception(
+        'Custom food creation is not available on this backend yet. Select a catalog result from search or retry when /food is enabled.',
+      );
+    }
     _throwIfRequestFailed(
       response,
       source:
           'lib/core/repositories/app_repositories.dart -> FastApiNutritionRepository._createFoodForLog',
     );
     final data = _asMap(_unwrapData(response.data));
-    return data['food_id']?.toString();
+    final foodId = data['food_id']?.toString();
+    if (foodId == null || foodId.isEmpty) {
+      throw Exception(
+        'The backend created "${log.foodName}" but did not return a food_id.',
+      );
+    }
+    return foodId;
   }
+}
+
+class MockAgentContextRepository implements AgentContextRepository {
+  @override
+  Future<AgentContextSnapshot> load(AuthSession? session) async {
+    return AgentContextSnapshot.empty;
+  }
+}
+
+class FastApiAgentContextRepository implements AgentContextRepository {
+  FastApiAgentContextRepository(this._dio);
+
+  final Dio _dio;
+
+  @override
+  Future<AgentContextSnapshot> load(AuthSession? session) async {
+    if (session == null || session.provider == 'mock') {
+      return AgentContextSnapshot.empty;
+    }
+
+    final contextResponse = await _get(session, '/agent/context');
+    if (contextResponse != null &&
+        contextResponse.statusCode != 404 &&
+        contextResponse.statusCode != 405) {
+      _throwIfRequestFailed(
+        contextResponse,
+        source:
+            'lib/core/repositories/app_repositories.dart -> FastApiAgentContextRepository.load',
+        session: session,
+      );
+      return agentContextFromBackend(contextResponse.data);
+    }
+
+    final responses = await Future.wait<Response<dynamic>?>([
+      _get(session, '/atlas/metrics'),
+      _get(session, '/food-log/summary/${_todayIso()}'),
+      _get(session, '/workout-logs/trends'),
+      _get(session, '/workout-logs'),
+      _get(session, '/workout-templates'),
+    ]);
+    for (final response in responses.whereType<Response<dynamic>>()) {
+      _throwIfRequestFailed(
+        response,
+        source:
+            'lib/core/repositories/app_repositories.dart -> FastApiAgentContextRepository.load fallback',
+        session: session,
+        allowNotFoundAsEmpty: true,
+      );
+    }
+
+    return AgentContextSnapshot(
+      atlasMetrics: _successfulData(responses[0]) == null
+          ? null
+          : _mapAtlasMetrics(responses[0]!.data),
+      todaysNutrition: _successfulData(responses[1]) == null
+          ? null
+          : dailyNutritionSummaryFromBackend(
+              _asMap(_unwrapData(responses[1]!.data)),
+            ),
+      workoutTrends: _successfulData(responses[2]) == null
+          ? WorkoutTrendSummary.empty
+          : _mapWorkoutTrends(responses[2]!.data),
+      recentWorkouts: _mapWorkoutLogList(_successfulData(responses[3])),
+      activeTemplate: _mapActiveTemplate(_successfulData(responses[4])),
+      usedFallbackEndpoints: true,
+    );
+  }
+
+  Future<Response<dynamic>?> _get(AuthSession session, String path) {
+    return _recoverableLoadRequest(
+      () => _requestWithSessionRetry(
+        _dio,
+        session,
+        (headers) => _dio.get<dynamic>(
+          path,
+          options: Options(headers: headers),
+        ),
+      ),
+    );
+  }
+
+  dynamic _successfulData(Response<dynamic>? response) {
+    final status = response?.statusCode ?? 0;
+    return status >= 200 && status < 300 ? response?.data : null;
+  }
+}
+
+class MockJimChatRepository implements JimChatRepository {
+  @override
+  Future<JimChatResponse> send(
+    AuthSession? session, {
+    required String sessionId,
+    required String message,
+    required JimChatMode mode,
+    String? selectedOption,
+  }) async {
+    final response = selectedOption == null
+        ? atlasMockResponseForChat(message)
+        : 'Local mock selection received. No workout or food was logged.';
+    return JimChatResponse(
+      sessionId: sessionId,
+      message: response,
+    );
+  }
+
+  @override
+  Stream<JimChatStreamEvent> stream(
+    AuthSession? session, {
+    required String sessionId,
+    required String message,
+    required JimChatMode mode,
+  }) async* {
+    final response = await send(
+      session,
+      sessionId: sessionId,
+      message: message,
+      mode: mode,
+    );
+    yield JimChatStreamEvent.textDelta(response.message);
+    yield JimChatStreamEvent.done(response);
+  }
+
+  @override
+  Future<void> endSession(AuthSession? session, String sessionId) async {}
+}
+
+class FastApiJimChatRepository implements JimChatRepository {
+  FastApiJimChatRepository(this._dio);
+
+  final Dio _dio;
+
+  @override
+  Future<JimChatResponse> send(
+    AuthSession? session, {
+    required String sessionId,
+    required String message,
+    required JimChatMode mode,
+    String? selectedOption,
+  }) async {
+    final activeSession = _requireChatSession(session);
+    final response = await _requestWithSessionRetry(
+      _dio,
+      activeSession,
+      (headers) => _dio.post<dynamic>(
+        '/chat/',
+        data: jimChatRequestPayload(
+          sessionId: sessionId,
+          message: selectedOption == null ? message : '',
+          mode: mode,
+          selectedOption: selectedOption,
+        ),
+        options: Options(headers: headers),
+      ),
+    );
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiJimChatRepository.send',
+      session: activeSession,
+    );
+    return jimChatResponseFromBackend(response.data);
+  }
+
+  @override
+  Stream<JimChatStreamEvent> stream(
+    AuthSession? session, {
+    required String sessionId,
+    required String message,
+    required JimChatMode mode,
+  }) async* {
+    final activeSession = _requireChatSession(session);
+    final response = await _requestWithSessionRetry(
+      _dio,
+      activeSession,
+      (headers) => _dio.post<ResponseBody>(
+        '/chat/stream',
+        data: jimChatRequestPayload(
+          sessionId: sessionId,
+          message: message,
+          mode: mode,
+        ),
+        options: Options(
+          headers: {
+            ...headers,
+            'Accept': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+          },
+          responseType: ResponseType.stream,
+        ),
+      ),
+    );
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiJimChatRepository.stream',
+      session: activeSession,
+    );
+    final body = response.data;
+    if (body is! ResponseBody) {
+      throw Exception('Chat stream returned no event stream.');
+    }
+    yield* parseJimChatSse(body.stream);
+  }
+
+  @override
+  Future<void> endSession(AuthSession? session, String sessionId) async {
+    final activeSession = _requireChatSession(session);
+    final response = await _requestWithSessionRetry(
+      _dio,
+      activeSession,
+      (headers) => _dio.delete<dynamic>(
+        '/chat/$sessionId',
+        options: Options(headers: headers),
+      ),
+    );
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiJimChatRepository.endSession',
+      session: activeSession,
+      allowNotFoundAsEmpty: true,
+    );
+  }
+}
+
+AuthSession _requireChatSession(AuthSession? session) {
+  if (session == null) {
+    throw Exception('Sign in before starting a live Jim chat.');
+  }
+  return session;
+}
+
+Map<String, Object?> jimChatRequestPayload({
+  required String sessionId,
+  required String message,
+  required JimChatMode mode,
+  String? selectedOption,
+}) {
+  return {
+    'session_id': sessionId,
+    'message': message,
+    'mode': mode.wireName,
+    if (selectedOption != null) 'selected_option': selectedOption,
+  };
+}
+
+JimChatResponse jimChatResponseFromBackend(dynamic raw) {
+  final data = _asMap(_unwrapData(raw));
+  final options = data['clarification_options'];
+  return JimChatResponse(
+    sessionId: data['session_id']?.toString() ?? '',
+    message:
+        (data['message'] ?? data['response'] ?? data['text'])?.toString() ?? '',
+    requiresClarification: data['requires_clarification'] == true,
+    clarificationPrompt:
+        (data['prompt'] ?? data['clarification_prompt'])?.toString(),
+    clarificationOptions: options is List
+        ? options
+            .map((rawOption) {
+              final option = _asMap(rawOption);
+              return JimClarificationOption(
+                id: option['id']?.toString() ?? '',
+                label: option['label']?.toString() ?? '',
+              );
+            })
+            .where((option) => option.id.isNotEmpty && option.label.isNotEmpty)
+            .toList(growable: false)
+        : const [],
+    actionsTaken: _stringList(data['actions_taken']),
+  );
+}
+
+Stream<JimChatStreamEvent> parseJimChatSse(Stream<List<int>> bytes) async* {
+  var eventName = '';
+  final dataLines = <String>[];
+
+  await for (final line
+      in bytes.transform(utf8.decoder).transform(const LineSplitter())) {
+    if (line.isEmpty) {
+      if (dataLines.isNotEmpty) {
+        yield _jimChatEventFromSse(eventName, dataLines.join('\n'));
+      }
+      eventName = '';
+      dataLines.clear();
+      continue;
+    }
+    if (line.startsWith(':')) {
+      continue;
+    }
+    if (line.startsWith('event:')) {
+      eventName = line.substring(6).trim();
+    } else if (line.startsWith('data:')) {
+      dataLines.add(line.substring(5).trimLeft());
+    }
+  }
+  if (dataLines.isNotEmpty) {
+    yield _jimChatEventFromSse(eventName, dataLines.join('\n'));
+  }
+}
+
+JimChatStreamEvent _jimChatEventFromSse(String eventName, String rawData) {
+  dynamic decoded;
+  try {
+    decoded = jsonDecode(rawData);
+  } catch (_) {
+    decoded = rawData;
+  }
+  final data = _asMap(decoded);
+  final type = (eventName.isEmpty ? data['type'] : eventName)
+          ?.toString()
+          .toLowerCase() ??
+      'text_delta';
+  if (type == 'done' || type == 'complete' || type == 'completed') {
+    return JimChatStreamEvent.done(jimChatResponseFromBackend(data));
+  }
+  if (type == 'error' || type == 'failed') {
+    return JimChatStreamEvent.error(
+      (data['error'] ?? data['message'] ?? rawData).toString(),
+    );
+  }
+  return JimChatStreamEvent.textDelta(
+    (data['text_delta'] ?? data['delta'] ?? data['text'] ?? decoded).toString(),
+  );
+}
+
+List<String> _stringList(dynamic raw) {
+  if (raw is! List) {
+    return const [];
+  }
+  return raw
+      .map((value) => value is Map
+          ? (value['type'] ?? value['action'])?.toString() ?? ''
+          : value.toString())
+      .where((value) => value.trim().isNotEmpty)
+      .toList(growable: false);
+}
+
+String atlasMockResponseForChat(String message) {
+  final normalized = message.trim().toLowerCase();
+  if (normalized.contains('supplement') || normalized.contains('creatine')) {
+    return 'Local mock guidance: supplements are optional. Training, food, sleep, and recovery remain the foundation. This is general information, not medical advice.';
+  }
+  return 'Local mock response: Jim can discuss training, nutrition, and general fitness here. No backend action was performed.';
 }
 
 class MockConsistencyRepository implements ConsistencyRepository {
   ConsistencyState _consistency = const ConsistencyState(
-    currentStreak: 12,
-    longestStreak: 18,
-    weeklyCheckins: 5,
-    totalLogs: 46,
+    currentStreak: 0,
+    longestStreak: 0,
+    weeklyCheckins: 0,
+    totalLogs: 0,
   );
 
   @override
@@ -1257,20 +2363,18 @@ class MockAtlasRepository implements AtlasRepository {
   ) async {
     return [
       AtlasInsight(
-        title: 'Recovery note',
+        title: 'Start with one useful action',
         mainText:
-            'Your recent training load and sleep pattern suggest a strong pressing day. Start controlled, then let the session build.',
-        confidence: AtlasConfidence.high,
-        actionItems: const ['Bench focus today', 'Stop first set at RPE 8'],
+            'Log a workout or a meal today and Jim will have a stronger signal for the next coaching step.',
+        confidence: AtlasConfidence.medium,
+        actionItems: const ['Pick one workout', 'Log one meal'],
       ),
       const AtlasInsight(
-        title: 'Soreness is not the score',
+        title: 'Build signal before complexity',
         mainText:
-            'Feeling wrecked can come from novelty or fatigue, but progress comes from quality work repeated over time. Trend lines beat soreness.',
+            'A few honest entries are more useful than a perfect plan you never update. Keep the first week simple.',
         confidence: AtlasConfidence.medium,
-        isMythBust: true,
-        actionItems: ['Track progression weekly'],
-        learnMoreKey: 'doms-vs-growth',
+        actionItems: ['Repeat one template', 'Use simple meal logs'],
       ),
     ];
   }
@@ -1278,11 +2382,11 @@ class MockAtlasRepository implements AtlasRepository {
   @override
   Future<AtlasInsight> loadHistoryInsight(AuthSession? session) async {
     return const AtlasInsight(
-      title: 'Steady pattern, slight plateau',
+      title: 'Progress needs real logs',
       mainText:
-          'Your estimated top set has climbed well across the cycle, but the last two exposures flattened. A small load jump and more rest should restart momentum.',
-      confidence: AtlasConfidence.high,
-      actionItems: ['Add 2.5kg next session', 'Rest 3 minutes on top sets'],
+          'Finish workouts with reps and weight so Jim can turn your history into truthful progression notes.',
+      confidence: AtlasConfidence.medium,
+      actionItems: ['Finish a workout', 'Enter reps and weight'],
     );
   }
 
@@ -1292,6 +2396,24 @@ class MockAtlasRepository implements AtlasRepository {
     DailyNutritionSummary summary,
   ) async {
     final shortfall = (summary.proteinTarget - summary.proteinConsumed).round();
+    if (summary.proteinTarget <= 0) {
+      return const AtlasInsight(
+        title: 'Targets unlock after profile setup',
+        mainText:
+            'Add profile basics to estimate calories, protein, and hydration. Until then, logged totals still count.',
+        confidence: AtlasConfidence.medium,
+        actionItems: ['Finish profile basics', 'Log one meal'],
+      );
+    }
+    if (shortfall <= 0) {
+      return const AtlasInsight(
+        title: 'Protein target covered',
+        mainText:
+            'You have reached today’s protein target. Keep the rest of the day simple and repeatable.',
+        confidence: AtlasConfidence.medium,
+        actionItems: ['Stay consistent', 'Log remaining meals'],
+      );
+    }
     return AtlasInsight(
       title: 'Protein timing stays flexible',
       mainText:
@@ -1463,54 +2585,6 @@ List<ExerciseSuggestion> _mergeExerciseSuggestions(
   return byId.values.toList();
 }
 
-const _mockFoodSuggestions = [
-  FoodSuggestion(
-    foodId: 'mock-chicken-breast',
-    name: 'Chicken Breast',
-    caloriesPer100g: 165,
-    proteinPer100g: 31,
-    carbsPer100g: 0,
-    fatPer100g: 3.6,
-    source: 'JimBro seed',
-  ),
-  FoodSuggestion(
-    foodId: 'mock-eggs',
-    name: 'Eggs',
-    caloriesPer100g: 143,
-    proteinPer100g: 12.6,
-    carbsPer100g: 0.7,
-    fatPer100g: 9.5,
-    source: 'JimBro seed',
-  ),
-  FoodSuggestion(
-    foodId: 'mock-greek-yogurt',
-    name: 'Greek Yogurt',
-    caloriesPer100g: 59,
-    proteinPer100g: 10,
-    carbsPer100g: 3.6,
-    fatPer100g: 0.4,
-    source: 'JimBro seed',
-  ),
-  FoodSuggestion(
-    foodId: 'mock-rice',
-    name: 'Cooked Rice',
-    caloriesPer100g: 130,
-    proteinPer100g: 2.7,
-    carbsPer100g: 28,
-    fatPer100g: 0.3,
-    source: 'JimBro seed',
-  ),
-  FoodSuggestion(
-    foodId: 'mock-oats',
-    name: 'Oats',
-    caloriesPer100g: 389,
-    proteinPer100g: 16.9,
-    carbsPer100g: 66.3,
-    fatPer100g: 6.9,
-    source: 'JimBro seed',
-  ),
-];
-
 List<FoodSuggestion> _localFoodSuggestions(String query) {
   return _localFoodEstimateSuggestions
       .where((food) => food.name.toLowerCase().contains(query))
@@ -1560,14 +2634,259 @@ const _localFoodEstimateSuggestions = [
   ),
 ];
 
+class FrontendCachePolicy {
+  const FrontendCachePolicy._();
+
+  static const profile = Duration(minutes: 30);
+  static const templates = Duration(minutes: 10);
+  static const exerciseSearch = Duration(minutes: 5);
+  static const foodSearch = Duration(minutes: 5);
+  static const todayFoodLog = Duration(minutes: 2);
+  static const dashboard = Duration(minutes: 2);
+}
+
 class _CacheEntry<T> {
-  _CacheEntry(this.value) : createdAt = DateTime.now();
+  _CacheEntry(
+    this.value, {
+    this.ttl = const Duration(minutes: 5),
+  }) : createdAt = DateTime.now();
 
   final T value;
+  final Duration ttl;
   final DateTime createdAt;
 
-  bool get isFresh =>
-      DateTime.now().difference(createdAt) < const Duration(minutes: 5);
+  bool get isFresh => DateTime.now().difference(createdAt) < ttl;
+}
+
+class OfflineOutboxItem {
+  const OfflineOutboxItem({
+    required this.localId,
+    required this.operationType,
+    required this.payload,
+    required this.createdAt,
+    required this.retryCount,
+    this.lastErrorCode,
+    this.lastErrorMessage,
+    this.dependencyId,
+    this.needsReview = false,
+  });
+
+  final String localId;
+  final String operationType;
+  final Map<String, dynamic> payload;
+  final DateTime createdAt;
+  final int retryCount;
+  final String? lastErrorCode;
+  final String? lastErrorMessage;
+  final String? dependencyId;
+  final bool needsReview;
+
+  OfflineOutboxItem copyWith({
+    int? retryCount,
+    String? lastErrorCode,
+    String? lastErrorMessage,
+    bool? needsReview,
+  }) {
+    return OfflineOutboxItem(
+      localId: localId,
+      operationType: operationType,
+      payload: payload,
+      createdAt: createdAt,
+      retryCount: retryCount ?? this.retryCount,
+      lastErrorCode: lastErrorCode ?? this.lastErrorCode,
+      lastErrorMessage: lastErrorMessage ?? this.lastErrorMessage,
+      dependencyId: dependencyId,
+      needsReview: needsReview ?? this.needsReview,
+    );
+  }
+
+  Map<String, Object?> toJson() {
+    return {
+      'local_id': localId,
+      'operation_type': operationType,
+      'payload': payload,
+      'created_at': createdAt.toIso8601String(),
+      'retry_count': retryCount,
+      'last_error_code': lastErrorCode,
+      'last_error_message': lastErrorMessage,
+      'dependency_id': dependencyId,
+      'needs_review': needsReview,
+    };
+  }
+
+  static OfflineOutboxItem? fromJson(dynamic raw) {
+    final map = _asMap(raw);
+    final localId = map['local_id']?.toString() ?? '';
+    final operationType = map['operation_type']?.toString() ?? '';
+    final payload = _asMap(map['payload']);
+    final createdAt = DateTime.tryParse(
+          map['created_at']?.toString() ?? '',
+        ) ??
+        DateTime.now();
+    if (localId.isEmpty || operationType.isEmpty || payload.isEmpty) {
+      return null;
+    }
+    return OfflineOutboxItem(
+      localId: localId,
+      operationType: operationType,
+      payload: payload,
+      createdAt: createdAt,
+      retryCount: _toInt(map['retry_count'], 0),
+      lastErrorCode: map['last_error_code']?.toString(),
+      lastErrorMessage: map['last_error_message']?.toString(),
+      dependencyId: map['dependency_id']?.toString(),
+      needsReview: map['needs_review'] == true,
+    );
+  }
+}
+
+class OfflineOutboxStore {
+  const OfflineOutboxStore();
+
+  Future<List<OfflineOutboxItem>> load(AuthSession? session) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_key(session));
+    if (raw == null || raw.isEmpty) {
+      return const [];
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) {
+        return const [];
+      }
+      return decoded
+          .map(OfflineOutboxItem.fromJson)
+          .whereType<OfflineOutboxItem>()
+          .toList(growable: false);
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<void> enqueue(AuthSession? session, OfflineOutboxItem item) async {
+    final current = await load(session);
+    if (current.any((existing) => existing.localId == item.localId)) {
+      return;
+    }
+    await replace(session, [...current, item]);
+  }
+
+  Future<void> replace(
+    AuthSession? session,
+    List<OfflineOutboxItem> items,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _key(session),
+      jsonEncode(items.map((item) => item.toJson()).toList()),
+    );
+  }
+
+  Future<void> remove(AuthSession? session, String localId) async {
+    final current = await load(session);
+    await replace(
+      session,
+      current.where((item) => item.localId != localId).toList(),
+    );
+  }
+
+  Future<void> update(AuthSession? session, OfflineOutboxItem item) async {
+    final current = await load(session);
+    await replace(
+      session,
+      current
+          .map((existing) => existing.localId == item.localId ? item : existing)
+          .toList(),
+    );
+  }
+
+  String _key(AuthSession? session) {
+    return 'offline_outbox_${session?.userId ?? 'anonymous'}';
+  }
+}
+
+class LocalWorkoutScheduleStore {
+  const LocalWorkoutScheduleStore();
+
+  Future<List<WorkoutScheduleEntry>> load(AuthSession? session) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_key(session));
+    if (raw == null || raw.isEmpty) {
+      return const [];
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) {
+        return const [];
+      }
+      return decoded
+          .map<WorkoutScheduleEntry?>((item) {
+            final map = _asMap(item);
+            if (map.isEmpty) {
+              return null;
+            }
+            return WorkoutScheduleEntry.fromJson(map);
+          })
+          .whereType<WorkoutScheduleEntry>()
+          .toList(growable: false);
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<void> replace(
+    AuthSession? session,
+    List<WorkoutScheduleEntry> schedule,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _key(session),
+      jsonEncode(schedule.map((entry) => entry.toJson()).toList()),
+    );
+  }
+
+  Future<WorkoutScheduleEntry> save(
+    AuthSession? session,
+    WorkoutScheduleEntry entry,
+  ) async {
+    final current = await load(session);
+    final saved = entry.copyWith(
+      scheduleId: entry.scheduleId ?? _localScheduleId(entry),
+      userId: entry.userId ?? session?.userId,
+    );
+    final updated = _upsertLocalWorkoutSchedule(current, saved);
+    await replace(session, updated);
+    return saved;
+  }
+
+  Future<void> delete(
+    AuthSession? session,
+    WorkoutScheduleEntry entry,
+  ) async {
+    final current = await load(session);
+    final updated = current
+        .where(
+          (item) =>
+              item.scheduleId != entry.scheduleId &&
+              item.weekday != entry.weekday,
+        )
+        .toList(growable: false);
+    await replace(session, updated);
+  }
+
+  String _key(AuthSession? session) {
+    final userId = session?.userId.trim();
+    return 'jimbro.workout_schedule.${userId == null || userId.isEmpty ? 'local' : userId}';
+  }
+
+  String _localScheduleId(WorkoutScheduleEntry entry) {
+    final templateKey = entry.templateId?.toString() ??
+        entry.templateName
+            .trim()
+            .toLowerCase()
+            .replaceAll(RegExp(r'[^a-z0-9]+'), '-');
+    return 'local-${entry.weekday}-$templateKey';
+  }
 }
 
 final authRepositoryProvider = Provider<AuthRepository>((ref) {
@@ -1614,6 +2933,22 @@ final atlasRepositoryProvider = Provider<AtlasRepository>(
   (ref) => MockAtlasRepository(),
 );
 
+final agentContextRepositoryProvider = Provider<AgentContextRepository>((ref) {
+  final config = ref.watch(appConfigProvider);
+  if (!config.useLiveBackend) {
+    return MockAgentContextRepository();
+  }
+  return FastApiAgentContextRepository(ref.watch(dioProvider));
+});
+
+final jimChatRepositoryProvider = Provider<JimChatRepository>((ref) {
+  final config = ref.watch(appConfigProvider);
+  if (!config.useLiveBackend) {
+    return MockJimChatRepository();
+  }
+  return FastApiJimChatRepository(ref.watch(dioProvider));
+});
+
 final searchRepositoryProvider = Provider<SearchRepository>(
   (ref) => MockSearchRepository(),
 );
@@ -1621,6 +2956,14 @@ final searchRepositoryProvider = Provider<SearchRepository>(
 Future<String?> _getValidToken() async {
   final refreshed = await Supabase.instance.client.auth.refreshSession();
   return refreshed.session?.accessToken;
+}
+
+Session? _safeCurrentSupabaseSession() {
+  try {
+    return Supabase.instance.client.auth.currentSession;
+  } catch (_) {
+    return null;
+  }
 }
 
 Map<String, String> _tokenDiagnostics(String? token) {
@@ -1635,37 +2978,63 @@ Map<String, String> _tokenDiagnostics(String? token) {
   return {
     'token_state': 'present',
     'token_parts': '${parts.length}',
-    'token_prefix': token.substring(0, token.length < 12 ? token.length : 12),
     if (payload['iss'] != null) 'jwt_iss': payload['iss'].toString(),
     if (payload['aud'] != null) 'jwt_aud': payload['aud'].toString(),
-    if (payload['sub'] != null) 'jwt_sub': payload['sub'].toString(),
-    if (payload['email'] != null) 'jwt_email': payload['email'].toString(),
     if (exp != null) 'jwt_exp': '$exp',
     if (expiresIn != null) 'jwt_expires_in_seconds': '$expiresIn',
   };
 }
 
 Future<Map<String, String>> _authHeaders(AuthSession session) async {
+  if (session.provider != 'supabase') {
+    if (session.accessToken.trim().isEmpty) {
+      throw Exception(
+        'Authentication token missing before protected backend request.\n'
+        'source: lib/core/repositories/app_repositories.dart -> _authHeaders\n'
+        'provider: ${session.provider}\n'
+        'backend_request_sent: false\n'
+        'fix: Sign in again so the app can attach a bearer token.',
+      );
+    }
+    return session.fastApiHeaders;
+  }
+
   try {
     final token = await _getValidToken();
     if (token != null && token.isNotEmpty) {
       return {'Authorization': 'Bearer $token'};
     }
-  } catch (_) {
-    if (Supabase.instance.client.auth.currentSession != null) {
+  } catch (error) {
+    if (_safeCurrentSupabaseSession() != null) {
       throw Exception(
-        'Supabase session exists but refreshSession() failed. Sign out and sign in again to get a valid access token.',
+        'Supabase session refresh failed while creating auth headers.\n'
+        'source: lib/core/repositories/app_repositories.dart -> _authHeaders\n'
+        'provider: ${session.provider}\n'
+        'problem: Supabase had a current session, but refreshSession() failed before the backend request.\n'
+        'backend_request_sent: false\n'
+        '${kDebugMode ? 'debug_error_type: ${error.runtimeType}\n' : ''}'
+        'fix: Sign out/in once. If it repeats, verify Supabase.initialize() is called and .env has SUPABASE_ANON_KEY on one line.',
       );
     }
-  }
-
-  if (session.provider == 'supabase' ||
-      Supabase.instance.client.auth.currentSession != null) {
     throw Exception(
-      'Supabase session refresh did not return a usable access token. Sign out and sign in again; the app refused to send a stale token to FastAPI.',
+      'Supabase is not initialized while creating auth headers.\n'
+      'source: lib/core/repositories/app_repositories.dart -> _authHeaders\n'
+      'provider: ${session.provider}\n'
+      'problem: The active session is marked supabase, but Supabase.instance is unavailable.\n'
+      'backend_request_sent: false\n'
+      'likely_cause: .env SUPABASE_ANON_KEY is missing/blank/malformed, so main.dart skipped Supabase.initialize().\n'
+      'fix: Put SUPABASE_ANON_KEY=<anon key> on one line in Flutter .env, hot restart the app, then sign in again.\n'
+      '${kDebugMode ? 'debug_error_type: ${error.runtimeType}' : ''}',
     );
   }
-  return session.fastApiHeaders;
+
+  throw Exception(
+    'Supabase session refresh returned no usable access token.\n'
+    'source: lib/core/repositories/app_repositories.dart -> _authHeaders\n'
+    'provider: ${session.provider}\n'
+    'backend_request_sent: false\n'
+    'fix: Sign out and sign in again; the app refused to send a stale token to FastAPI.',
+  );
 }
 
 Future<Response<dynamic>> _requestWithSessionRetry(
@@ -1734,6 +3103,367 @@ bool _isRecoverableLoadFailure(DioException error) {
   };
 }
 
+bool _shouldQueueOffline(DioException error) {
+  return switch (error.type) {
+    DioExceptionType.connectionTimeout ||
+    DioExceptionType.sendTimeout ||
+    DioExceptionType.receiveTimeout ||
+    DioExceptionType.connectionError =>
+      true,
+    DioExceptionType.badResponse ||
+    DioExceptionType.badCertificate ||
+    DioExceptionType.cancel ||
+    DioExceptionType.unknown =>
+      false,
+  };
+}
+
+String _dioErrorCode(DioException error) {
+  final statusCode = error.response?.statusCode;
+  return statusCode == null ? error.type.name : 'http_$statusCode';
+}
+
+String _safeErrorSummary(DioException error) {
+  final statusCode = error.response?.statusCode;
+  if (statusCode != null) {
+    return 'HTTP $statusCode';
+  }
+  return switch (error.type) {
+    DioExceptionType.connectionTimeout => 'Connection timed out',
+    DioExceptionType.sendTimeout => 'Send timed out',
+    DioExceptionType.receiveTimeout => 'Receive timed out',
+    DioExceptionType.connectionError => 'Connection unavailable',
+    DioExceptionType.badCertificate => 'Bad TLS certificate',
+    DioExceptionType.cancel => 'Request cancelled',
+    DioExceptionType.badResponse => 'Backend rejected request',
+    DioExceptionType.unknown => 'Network request failed',
+  };
+}
+
+String _localMutationId(String prefix) {
+  return '$prefix-${DateTime.now().microsecondsSinceEpoch}';
+}
+
+bool _isMissingBackendSupabaseServiceKey(Response<dynamic> response) {
+  final bodyText = response.data?.toString() ?? '';
+  return response.statusCode != null &&
+      response.statusCode! >= 500 &&
+      bodyText.contains('SUPABASE_SERVICE_KEY') &&
+      (bodyText.contains('ENVIRONMENT_CONFIGURATION_ERROR') ||
+          bodyText.contains('missing_env_var'));
+}
+
+bool _routeLooksUnsupported(Response<dynamic>? response) {
+  final statusCode = response?.statusCode;
+  return statusCode == 404 || statusCode == 405;
+}
+
+Map<String, Object?> atlasOnboardingPayloadFromProfile(
+  UserProfile profile, {
+  required OnboardingAnswersDto answers,
+}) {
+  final payload = <String, Object?>{
+    'age': answers.age ?? profile.age,
+    'height_cm': answers.heightCm ?? profile.heightCm,
+    'weight_kg': answers.weightKg ?? profile.weightKg,
+    'activity_level': _atlasActivityLevel(
+      answers.activityLevel?.wireValue ?? profile.activityLevel,
+    ),
+    'fitness_goal': _atlasFitnessGoal(
+      answers.fitnessGoal?.wireValue ?? profile.goal,
+    ),
+    'experience_level': _atlasExperienceLevel(
+      answers.experienceLevel?.wireValue ?? profile.userLevel.name,
+    ),
+    'available_time_min':
+        answers.availableTimeMin ?? profile.availableTimeMinutes,
+    'equipment_access': _atlasEquipmentAccess(
+      answers.trainingPreference?.wireValue ?? profile.trainingPreference,
+    ),
+    'constraints': _atlasConstraints(answers),
+    'generate_program': true,
+  };
+  final sex = _atlasSex(answers.sex?.wireValue ?? profile.sex);
+  if (sex != null) {
+    payload['sex'] = sex;
+  }
+  return payload;
+}
+
+Map<String, Object?> atlasProfilePatchPayload({
+  required UserProfile previous,
+  required UserProfile next,
+}) {
+  final payload = <String, Object?>{};
+
+  void putIfChanged(String key, Object? previousValue, Object? nextValue) {
+    if (nextValue == null) {
+      return;
+    }
+    if ('$previousValue' == '$nextValue') {
+      return;
+    }
+    payload[key] = nextValue;
+  }
+
+  putIfChanged('age', previous.age, next.age);
+  putIfChanged('height_cm', previous.heightCm, next.heightCm);
+  putIfChanged('weight_kg', previous.weightKg, next.weightKg);
+  putIfChanged(
+    'activity_level',
+    _atlasActivityLevel(previous.activityLevel),
+    _atlasActivityLevel(next.activityLevel),
+  );
+  putIfChanged(
+    'fitness_goal',
+    _atlasFitnessGoal(previous.goal),
+    _atlasFitnessGoal(next.goal),
+  );
+  putIfChanged(
+    'experience_level',
+    previous.userLevel.name,
+    next.userLevel.name,
+  );
+  putIfChanged(
+    'available_time_min',
+    previous.availableTimeMinutes,
+    next.availableTimeMinutes,
+  );
+  putIfChanged(
+    'equipment_access',
+    _atlasEquipmentAccess(previous.trainingPreference),
+    _atlasEquipmentAccess(next.trainingPreference),
+  );
+  final nextSex = _atlasSex(next.sex);
+  if (nextSex != null && _atlasSex(previous.sex) != nextSex) {
+    payload['sex'] = nextSex;
+  }
+  return payload;
+}
+
+void _validateAtlasPayloadCanSync(Map<String, Object?> payload) {
+  final sex = payload['sex'];
+  if (sex == null) {
+    throw const AtlasProfileSyncException(
+      'Atlas metrics need sex set to Male or Female. Keeping local estimates for now.',
+    );
+  }
+}
+
+String? _atlasSex(String value) {
+  final normalized = _normalizeWire(value);
+  if (normalized == 'male' || normalized == 'm') {
+    return 'male';
+  }
+  if (normalized == 'female' || normalized == 'f') {
+    return 'female';
+  }
+  return null;
+}
+
+String _atlasActivityLevel(String value) {
+  final normalized = _normalizeWire(value);
+  if (normalized.contains('mostly_sitting') ||
+      normalized.contains('sedentary') ||
+      normalized.contains('mostly_sitting')) {
+    return 'sedentary';
+  }
+  if (normalized.contains('light')) {
+    return 'lightly_active';
+  }
+  if (normalized.contains('moderate')) {
+    return 'moderately_active';
+  }
+  if (normalized.contains('very')) {
+    return 'very_active';
+  }
+  return 'moderately_active';
+}
+
+String _atlasFitnessGoal(String value) {
+  final normalized = _normalizeWire(value);
+  if (normalized.contains('lose') ||
+      normalized.contains('fat') ||
+      normalized.contains('weight')) {
+    return 'lose_weight';
+  }
+  if (normalized.contains('strong')) {
+    return 'get_stronger';
+  }
+  if (normalized.contains('muscle') || normalized.contains('build')) {
+    return 'build_muscle';
+  }
+  if (normalized.contains('consistent')) {
+    return 'stay_consistent';
+  }
+  return 'feel_fitter';
+}
+
+String _atlasExperienceLevel(String value) {
+  final normalized = _normalizeWire(value);
+  if (normalized.contains('advanced') ||
+      normalized.contains('established') ||
+      normalized.contains('regular')) {
+    return normalized.contains('advanced') ? 'advanced' : 'intermediate';
+  }
+  if (normalized.contains('intermediate')) {
+    return 'intermediate';
+  }
+  return 'beginner';
+}
+
+String _atlasEquipmentAccess(String value) {
+  final normalized = _normalizeWire(value);
+  if (normalized.contains('gym')) {
+    return 'gym';
+  }
+  if (normalized.contains('bodyweight')) {
+    return 'bodyweight';
+  }
+  if (normalized.contains('home')) {
+    return 'home';
+  }
+  if (normalized.contains('mixed') || normalized.contains('flexible')) {
+    return 'mixed';
+  }
+  return 'unsure';
+}
+
+List<String> _atlasConstraints(OnboardingAnswersDto answers) {
+  final constraints = <String>[];
+  switch (answers.availableTimeMin) {
+    case final minutes? when minutes <= 30:
+      constraints.add('short_sessions');
+  }
+  switch (answers.trainingPreference) {
+    case OnboardingTrainingPreference.home:
+      constraints.add('home_equipment');
+    case OnboardingTrainingPreference.bodyweight:
+      constraints.add('bodyweight_only');
+    case OnboardingTrainingPreference.unsure:
+      constraints.add('needs_simple_start');
+    case _:
+      break;
+  }
+  switch (answers.dietaryPreference) {
+    case OnboardingDietaryPreference.notNow:
+      constraints.add('minimal_nutrition_tracking');
+    case OnboardingDietaryPreference.simple:
+      constraints.add('simple_meals');
+    case _:
+      break;
+  }
+  return constraints;
+}
+
+UserStaticMetrics _mapAtlasMetrics(dynamic raw) {
+  final root = _asMap(_unwrapData(raw));
+  final metrics =
+      _asMap(root['metrics']).isNotEmpty ? _asMap(root['metrics']) : root;
+  final macros = _asMap(metrics['macros']);
+  final hydration = _asMap(metrics['hydration']);
+  final targetCalories = _firstDouble(
+    metrics,
+    const ['target_calories', 'calorie_target', 'calories_target'],
+    fallback: _firstDouble(metrics, const ['maintenance_calories', 'tdee']),
+  );
+  final tdee = _firstDouble(metrics, const ['tdee', 'total_daily_energy']);
+  final maintenance = _firstDouble(
+    metrics,
+    const ['maintenance_calories', 'maintenance_kcal'],
+    fallback: tdee,
+  );
+  return UserStaticMetrics(
+    bmr: _firstDouble(metrics, const ['bmr', 'basal_metabolic_rate']),
+    tdee: tdee,
+    targetCalories: targetCalories,
+    maintenanceCalories: maintenance,
+    cutCalories: _firstDouble(
+      metrics,
+      const ['cut_calories', 'deficit_calories'],
+      fallback: targetCalories,
+    ),
+    bulkCalories: _firstDouble(
+      metrics,
+      const ['bulk_calories', 'surplus_calories'],
+      fallback: targetCalories,
+    ),
+    proteinG: _firstDouble(
+      metrics,
+      const ['protein_g', 'protein_target', 'protein'],
+      fallback: _firstDouble(macros, const ['protein_g', 'protein']),
+    ),
+    carbsG: _firstDouble(
+      metrics,
+      const ['carbs_g', 'carbs_target', 'carbs'],
+      fallback: _firstDouble(macros, const ['carbs_g', 'carbs']),
+    ),
+    fatG: _firstDouble(
+      metrics,
+      const ['fat_g', 'fat_target', 'fat'],
+      fallback: _firstDouble(macros, const ['fat_g', 'fat']),
+    ),
+    hydrationL: _firstDouble(
+      metrics,
+      const ['hydration_l', 'hydration_target_l', 'hydration_target'],
+      fallback: _firstDouble(hydration, const ['liters', 'target_liters']),
+    ),
+    cutIntensity: metrics['assumption_summary']?.toString() ??
+        metrics['summary']?.toString() ??
+        'Atlas metrics',
+  );
+}
+
+bool _metricsAreUsable(UserStaticMetrics metrics) {
+  return metrics.bmr > 0 ||
+      metrics.tdee > 0 ||
+      metrics.targetCalories > 0 ||
+      metrics.proteinG > 0 ||
+      metrics.hydrationL > 0;
+}
+
+UserStaticMetrics _localMetricsForProfile(UserProfile profile) {
+  final estimate = NutritionTargetCalculator.estimate(profile);
+  return estimate.hasRequiredProfile
+      ? estimate.toMetrics()
+      : const UserStaticMetrics(
+          bmr: 0,
+          tdee: 0,
+          targetCalories: 0,
+          maintenanceCalories: 0,
+          cutCalories: 0,
+          bulkCalories: 0,
+          proteinG: 0,
+          carbsG: 0,
+          fatG: 0,
+          hydrationL: 0,
+          cutIntensity: '',
+        );
+}
+
+double _firstDouble(
+  Map<String, dynamic> map,
+  List<String> keys, {
+  double fallback = 0,
+}) {
+  for (final key in keys) {
+    final parsed = _toDouble(map[key], double.nan);
+    if (parsed.isFinite) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+String _normalizeWire(String value) {
+  return value
+      .trim()
+      .toLowerCase()
+      .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
+      .replaceAll(RegExp(r'_+'), '_')
+      .replaceAll(RegExp(r'^_|_$'), '');
+}
+
 void _throwIfRequestFailed(
   Response<dynamic> response, {
   required String source,
@@ -1762,29 +3492,29 @@ void _throwIfRequestFailed(
   final fallback = statusCode == 401 && errorCode == 'AUTH_INVALID_CREDENTIALS'
       ? 'Backend rejected the Supabase bearer token.'
       : 'Backend request failed.';
-  throw Exception(
-    _buildAuthDiagnosticMessage(
-      source: source,
-      requestUrl:
-          '${response.requestOptions.baseUrl}${response.requestOptions.path}',
-      requestMethod: response.requestOptions.method,
-      fallback: fallback,
-      requestPayloadShape: response.requestOptions.data?.toString() ?? 'n/a',
-      statusCode: statusCode,
-      responseHeaders: response.headers.map,
-      responseBody: response.data,
-      tokenDiagnostics: _tokenDiagnostics(
-        response.requestOptions.headers['Authorization']
-            ?.toString()
-            .replaceFirst(RegExp(r'^Bearer\s+'), ''),
-      ),
-      sessionDiagnostics: {
-        if (session != null) 'session_provider': session.provider,
-        if (session != null) 'session_user_id': session.userId,
-        if (session != null) 'session_email': session.email,
-      },
+  final message = _buildAuthDiagnosticMessage(
+    source: source,
+    requestUrl:
+        '${response.requestOptions.baseUrl}${response.requestOptions.path}',
+    requestMethod: response.requestOptions.method,
+    fallback: fallback,
+    requestPayloadShape: response.requestOptions.data?.toString() ?? 'n/a',
+    statusCode: statusCode,
+    responseHeaders: response.headers.map,
+    responseBody: response.data,
+    tokenDiagnostics: _tokenDiagnostics(
+      response.requestOptions.headers['Authorization']
+          ?.toString()
+          .replaceFirst(RegExp(r'^Bearer\s+'), ''),
     ),
+    sessionDiagnostics: {
+      if (session != null) 'session_provider': session.provider,
+    },
   );
+  if (statusCode == 401) {
+    throw AuthSessionExpiredException(message);
+  }
+  throw Exception(message);
 }
 
 Map<String, dynamic> _asMap(dynamic value) {
@@ -1920,7 +3650,18 @@ String? _stringifyDetailList(dynamic detail) {
     final parts = detail
         .map((item) {
           final entry = _asMap(item);
-          return entry['msg']?.toString() ?? item.toString();
+          final loc = entry['loc'];
+          final msg = entry['msg']?.toString();
+          final type = entry['type']?.toString();
+          if (entry.isNotEmpty && msg != null) {
+            final locText = loc is List ? loc.join('.') : loc?.toString();
+            return [
+              if (locText != null && locText.isNotEmpty) 'loc=$locText',
+              'msg=$msg',
+              if (type != null && type.isNotEmpty) 'type=$type',
+            ].join(' ');
+          }
+          return item.toString();
         })
         .where((item) => item.trim().isNotEmpty)
         .toList();
@@ -1929,6 +3670,698 @@ String? _stringifyDetailList(dynamic detail) {
     }
   }
   return null;
+}
+
+Map<String, Object?> workoutTemplateRichPayload(
+  WorkoutTemplateDraft template,
+  List<WorkoutExerciseDraft> exercises,
+) {
+  return ApiRequestDto(
+    name: 'workout_template_rich',
+    requiredFields: const ['name', 'exercises'],
+    payload: {
+      'name': template.name,
+      'description': template.description.isEmpty ? null : template.description,
+      'exercises': exercises.asMap().entries.map((entry) {
+        final exercise = entry.value;
+        return {
+          'exercise_id': exercise.exerciseId,
+          'order_index': entry.key + 1,
+          'target_sets': exercise.targetSets,
+          'target_reps': exercise.targetReps,
+          'notes': exercise.notes.isEmpty ? null : exercise.notes,
+          if (exercise.sets.isNotEmpty)
+            'sets': exercise.sets.map((setDraft) {
+              return {
+                'set_number': setDraft.setNumber,
+                'reps': setDraft.reps,
+                'weight_kg': setDraft.weightKg,
+                if (setDraft.rpe > 0) 'rpe': setDraft.rpe,
+              };
+            }).toList(),
+        };
+      }).toList(),
+    },
+  ).toJson();
+}
+
+Map<String, Object?> workoutTemplateDocumentedPayload(
+  WorkoutTemplateDraft template,
+  List<WorkoutExerciseDraft> exercises,
+) {
+  return ApiRequestDto(
+    name: 'workout_template_documented',
+    requiredFields: const ['name', 'days'],
+    payload: {
+      'name': template.name,
+      'description': template.description.isEmpty ? null : template.description,
+      'days': [
+        {
+          'day_label': 'Day 1',
+          'exercises': exercises.map((exercise) {
+            final firstSet = exercise.sets.isEmpty ? null : exercise.sets.first;
+            final plannedSets = exercise.sets.isNotEmpty
+                ? exercise.sets.length
+                : exercise.targetSets;
+            final plannedReps = firstSet != null && firstSet.reps > 0
+                ? firstSet.reps
+                : exercise.targetReps;
+            return {
+              'exercise_id': exercise.exerciseId,
+              'sets': plannedSets <= 0 ? 1 : plannedSets,
+              'reps': plannedReps <= 0 ? 1 : plannedReps,
+              'notes': exercise.notes.isEmpty ? null : exercise.notes,
+            };
+          }).toList(),
+        },
+      ],
+    },
+  ).toJson();
+}
+
+Map<String, Object?> workoutLogRichPayload(
+  WorkoutLogDraft log,
+  List<WorkoutExerciseDraft> exercises,
+) {
+  final timing = _workoutTiming(log);
+  final workoutExercises = exercises.asMap().entries.map((entry) {
+    final exercise = entry.value;
+    if (exercise.sets.isEmpty) {
+      throw Exception(
+        'workout_log payload exercise ${entry.key + 1} has no sets.',
+      );
+    }
+    return {
+      'exercise_id': exercise.exerciseId,
+      'order_index': entry.key + 1,
+      'notes': exercise.notes.isEmpty ? null : exercise.notes,
+      'sets': exercise.sets.map((setDraft) {
+        return {
+          'set_number': setDraft.setNumber,
+          'reps': setDraft.reps,
+          'weight_kg': setDraft.weightKg,
+          'is_warmup': setDraft.isWarmup,
+          'rpe': setDraft.rpe,
+        };
+      }).toList(),
+    };
+  }).toList();
+  return ApiRequestDto(
+    name: 'workout_log_rich',
+    requiredFields: const [
+      'name',
+      'started_at',
+      'ended_at',
+      'workout_exercises',
+    ],
+    payload: {
+      'name': log.name,
+      'template_id': log.templateId,
+      'notes': log.notes.isEmpty ? null : log.notes,
+      'started_at': timing.startedAt.toIso8601String(),
+      'ended_at': timing.endedAt.toIso8601String(),
+      'duration_minutes': timing.durationMinutes,
+      'workout_exercises': workoutExercises,
+      'exercises': workoutExercises,
+    },
+  ).toJson();
+}
+
+Map<String, Object?> workoutLogDocumentedPayload(
+  WorkoutLogDraft log,
+  List<WorkoutExerciseDraft> exercises,
+) {
+  final timing = _workoutTiming(log);
+  return ApiRequestDto(
+    name: 'workout_log_documented',
+    requiredFields: const ['workout_name', 'date', 'exercises'],
+    payload: {
+      'workout_name': log.name,
+      'date': _formatDate(timing.startedAt),
+      'duration_min': timing.durationMinutes,
+      'notes': log.notes.isEmpty ? null : log.notes,
+      'exercises': exercises.map((exercise) {
+        return {
+          'exercise_id': exercise.exerciseId,
+          'sets': exercise.sets.map((setDraft) {
+            return {
+              'set_number': setDraft.setNumber,
+              'reps': setDraft.reps,
+              'weight_kg': setDraft.weightKg,
+              'is_warmup': setDraft.isWarmup,
+            };
+          }).toList(),
+        };
+      }).toList(),
+    },
+  ).toJson();
+}
+
+bool _shouldRetryDocumentedPayload(Response<dynamic> response) {
+  final statusCode = response.statusCode ?? 0;
+  return statusCode == 400 || statusCode == 422;
+}
+
+void _debugPayloadRetry({
+  required String route,
+  required int? statusCode,
+  required Map<String, Object?> attemptedPayload,
+  required Map<String, Object?> retryPayload,
+}) {
+  if (!kDebugMode) {
+    return;
+  }
+  debugPrint(
+    'JimBro backend payload retry route=$route status=${statusCode ?? 'unknown'} '
+    'attempted_keys=${attemptedPayload.keys.join(',')} '
+    'retry_keys=${retryPayload.keys.join(',')}',
+  );
+}
+
+_WorkoutTiming _workoutTiming(WorkoutLogDraft log) {
+  final now = DateTime.now();
+  final startedAt = DateTime.tryParse(log.startedAtLabel) ?? now;
+  var endedAt = DateTime.tryParse(log.endedAtLabel) ?? now;
+  if (endedAt.isBefore(startedAt)) {
+    endedAt = startedAt;
+  }
+  final duration = endedAt.difference(startedAt).inMinutes;
+  return _WorkoutTiming(
+    startedAt: startedAt,
+    endedAt: endedAt,
+    durationMinutes: duration < 0 ? 0 : duration,
+  );
+}
+
+class _WorkoutTiming {
+  const _WorkoutTiming({
+    required this.startedAt,
+    required this.endedAt,
+    required this.durationMinutes,
+  });
+
+  final DateTime startedAt;
+  final DateTime endedAt;
+  final int durationMinutes;
+}
+
+class ApiRequestDto {
+  const ApiRequestDto({
+    required this.name,
+    required this.payload,
+    this.requiredFields = const [],
+  });
+
+  final String name;
+  final Map<String, Object?> payload;
+  final List<String> requiredFields;
+
+  Map<String, Object?> toJson() {
+    final missing = requiredFields.where((field) {
+      final value = payload[field];
+      if (value == null) {
+        return true;
+      }
+      if (value is String) {
+        return value.trim().isEmpty;
+      }
+      if (value is Iterable) {
+        return value.isEmpty;
+      }
+      return false;
+    }).toList(growable: false);
+    if (missing.isNotEmpty) {
+      throw Exception('$name payload is missing: ${missing.join(', ')}.');
+    }
+    return payload;
+  }
+}
+
+Map<String, Object?> profileBackendPayload(UserProfile profile) {
+  return ApiRequestDto(
+    name: 'profile',
+    requiredFields: const ['username'],
+    payload: {
+      'username': profile.name,
+      'age': profile.age,
+      'sex': profile.sex,
+      'height_cm': profile.heightCm,
+      'weight_kg': profile.weightKg,
+      'fitness_goal': profile.goal,
+      'goal': profile.goal,
+      'activity_level': profile.activityLevel,
+      'experience_level': profile.userLevel.name,
+      'user_level': profile.userLevel.name,
+      'dietary_preference': profile.dietaryPreference,
+      'available_time_min': profile.availableTimeMinutes,
+      'training_preference': profile.trainingPreference,
+      'coaching_preference': profile.coachingPreference,
+      'goal_timeframe': profile.goalTimeframe,
+      'prefers_voice_logging': profile.prefersVoiceLogging,
+    },
+  ).toJson();
+}
+
+Map<String, dynamic> workoutLogDraftToJson(WorkoutLogDraft log) {
+  return {
+    'workout_log_id': log.workoutLogId,
+    'template_id': log.templateId,
+    'name': log.name,
+    'notes': log.notes,
+    'started_at_label': log.startedAtLabel,
+    'ended_at_label': log.endedAtLabel,
+    'exercises': log.exercises.map(workoutExerciseDraftToJson).toList(),
+  };
+}
+
+WorkoutLogDraft workoutLogDraftFromJson(dynamic raw) {
+  final map = _asMap(raw);
+  final exercises = map['exercises'];
+  return WorkoutLogDraft(
+    workoutLogId: _toNullableInt(map['workout_log_id']),
+    templateId: _toNullableInt(map['template_id']),
+    name: map['name']?.toString() ?? 'Workout Session',
+    notes: map['notes']?.toString() ?? '',
+    startedAtLabel: map['started_at_label']?.toString() ?? '',
+    endedAtLabel: map['ended_at_label']?.toString() ?? '',
+    exercises: exercises is List
+        ? exercises.map(workoutExerciseDraftFromJson).toList(growable: false)
+        : const [],
+  );
+}
+
+Map<String, dynamic> workoutExerciseDraftToJson(WorkoutExerciseDraft exercise) {
+  return {
+    'exercise_id': exercise.exerciseId,
+    'exercise_name': exercise.exerciseName,
+    'notes': exercise.notes,
+    'target_sets': exercise.targetSets,
+    'target_reps': exercise.targetReps,
+    'sets': exercise.sets.map(setDraftToJson).toList(),
+  };
+}
+
+WorkoutExerciseDraft workoutExerciseDraftFromJson(dynamic raw) {
+  final map = _asMap(raw);
+  final rawSets = map['sets'];
+  return WorkoutExerciseDraft(
+    exerciseId: _toNullableInt(map['exercise_id']),
+    exerciseName: map['exercise_name']?.toString() ?? '',
+    notes: map['notes']?.toString() ?? '',
+    targetSets: _toNonNegativeInt(map['target_sets'], 0, max: 100),
+    targetReps: _toNonNegativeInt(map['target_reps'], 0, max: 1000),
+    sets: rawSets is List
+        ? rawSets.map(setDraftFromJson).toList(growable: false)
+        : const [],
+  );
+}
+
+Map<String, dynamic> setDraftToJson(SetDraft setDraft) {
+  return {
+    'set_number': setDraft.setNumber,
+    'weight_kg': setDraft.weightKg,
+    'reps': setDraft.reps,
+    'is_warmup': setDraft.isWarmup,
+    'is_completed': setDraft.isCompleted,
+    'rpe': setDraft.rpe,
+  };
+}
+
+SetDraft setDraftFromJson(dynamic raw) {
+  final map = _asMap(raw);
+  return SetDraft(
+    setNumber: _toNonNegativeInt(map['set_number'], 1, max: 1000),
+    weightKg: _toNutritionDouble(map['weight_kg'], 0, max: 10000),
+    reps: _toNonNegativeInt(map['reps'], 0, max: 1000),
+    isWarmup: map['is_warmup'] == true,
+    isCompleted: map['is_completed'] == true,
+    rpe: _toNutritionDouble(map['rpe'], 0, max: 10),
+  );
+}
+
+Map<String, dynamic> foodLogDraftToJson(FoodLogDraft log) {
+  return {
+    'food_log_id': log.foodLogId,
+    'food_id': log.foodId,
+    'log_date': log.logDate?.toIso8601String(),
+    'quantity_source': _quantitySourceWire(log.quantitySource),
+    'calories_per_100g': log.caloriesPer100g,
+    'protein_per_100g': log.proteinPer100g,
+    'carbs_per_100g': log.carbsPer100g,
+    'fat_per_100g': log.fatPer100g,
+    'food_name': log.foodName,
+    'quantity_g': log.quantityGrams,
+    'meal_type': _mealTypeWire(log.mealType),
+    'calories': log.calories,
+    'protein': log.protein,
+    'carbs': log.carbs,
+    'fat': log.fat,
+  };
+}
+
+FoodLogDraft foodLogDraftFromJson(dynamic raw) {
+  final map = _asMap(raw);
+  return FoodLogDraft(
+    foodLogId: map['food_log_id']?.toString(),
+    foodId: map['food_id']?.toString(),
+    logDate: DateTime.tryParse(map['log_date']?.toString() ?? ''),
+    quantitySource: _parseQuantitySource(map['quantity_source']?.toString()),
+    caloriesPer100g: _nullableNutritionDouble(map['calories_per_100g']),
+    proteinPer100g: _nullableNutritionDouble(map['protein_per_100g']),
+    carbsPer100g: _nullableNutritionDouble(map['carbs_per_100g']),
+    fatPer100g: _nullableNutritionDouble(map['fat_per_100g']),
+    foodName: map['food_name']?.toString() ?? '',
+    quantityGrams: _toNutritionDouble(map['quantity_g'], 100, max: 50000),
+    mealType: _parseMealType(map['meal_type']?.toString()),
+    calories: _toNutritionDouble(map['calories'], 0, max: 20000),
+    protein: _toNutritionDouble(map['protein'], 0, max: 1000),
+    carbs: _toNutritionDouble(map['carbs'], 0, max: 2000),
+    fat: _toNutritionDouble(map['fat'], 0, max: 1000),
+  );
+}
+
+FoodSuggestion foodSuggestionFromBackend(Map<String, dynamic> map) {
+  return FoodSuggestion(
+    foodId: map['food_id']?.toString(),
+    name: map['name']?.toString() ?? '',
+    caloriesPer100g: _toNutritionDouble(
+      map['calories_per_100g'] ?? map['calories'],
+      0,
+      max: 2000,
+    ),
+    proteinPer100g: _toNutritionDouble(
+      map['protein_per_100g'] ?? map['protein_g'],
+      0,
+      max: 200,
+    ),
+    carbsPer100g: _toNutritionDouble(
+      map['carbs_per_100g'] ?? map['carbs_g'],
+      0,
+      max: 200,
+    ),
+    fatPer100g: _toNutritionDouble(
+      map['fat_per_100g'] ?? map['fat_g'],
+      0,
+      max: 200,
+    ),
+    source: map['source']?.toString() ?? 'Food catalog',
+  );
+}
+
+Map<String, Object?> customFoodBackendPayload(
+  FoodLogDraft log, {
+  required double factor,
+}) {
+  return ApiRequestDto(
+    name: 'custom_food',
+    requiredFields: const ['name'],
+    payload: {
+      'name': log.foodName,
+      'calories_per_100g': _roundNutrition(log.calories * factor),
+      'protein_per_100g': _roundNutrition(log.protein * factor),
+      'carbs_per_100g': _roundNutrition(log.carbs * factor),
+      'fat_per_100g': _roundNutrition(log.fat * factor),
+      'source': 'JimBro manual',
+    },
+  ).toJson();
+}
+
+Map<String, Object?> foodLogBackendPayload(
+  FoodLogDraft log, {
+  required String foodId,
+  required String date,
+}) {
+  return ApiRequestDto(
+    name: 'food_log',
+    requiredFields: const [
+      'food_id',
+      'quantity_g',
+      'meal_type',
+      'log_date',
+      'quantity_source',
+    ],
+    payload: {
+      'food_id': foodId,
+      'quantity_g': log.quantityGrams,
+      'meal_type': _mealTypeWire(log.mealType),
+      'log_date': date,
+      'quantity_source': _quantitySourceWire(log.quantitySource),
+    },
+  ).toJson();
+}
+
+DailyNutritionSummary dailyNutritionSummaryFromBackend(
+  Map<String, dynamic> data,
+) {
+  return DailyNutritionSummary(
+    targetCalories: _toNutritionDouble(
+      data['target_calories'] ?? data['calorie_target'],
+      0,
+      max: 20000,
+    ),
+    consumedCalories: _toNutritionDouble(
+      data['total_calories'] ?? data['consumed_calories'] ?? data['calories'],
+      0,
+      max: 20000,
+    ),
+    proteinTarget: _toNutritionDouble(
+      data['protein_target'] ?? data['target_protein'],
+      0,
+      max: 1000,
+    ),
+    proteinConsumed: _toNutritionDouble(
+      data['total_protein'] ?? data['protein_consumed'] ?? data['protein_g'],
+      0,
+      max: 1000,
+    ),
+    carbsTarget: _toNutritionDouble(
+      data['carbs_target'] ?? data['target_carbs'],
+      0,
+      max: 2000,
+    ),
+    carbsConsumed: _toNutritionDouble(
+      data['total_carbs'] ?? data['carbs_consumed'] ?? data['carbs_g'],
+      0,
+      max: 2000,
+    ),
+    fatTarget: _toNutritionDouble(
+      data['fat_target'] ?? data['target_fat'],
+      0,
+      max: 1000,
+    ),
+    fatConsumed: _toNutritionDouble(
+      data['total_fat'] ?? data['fat_consumed'] ?? data['fat_g'],
+      0,
+      max: 1000,
+    ),
+    hydrationTargetLiters: _toNutritionDouble(
+      data['hydration_target'] ?? data['hydration_target_l'],
+      0,
+      max: 20,
+    ),
+    hydrationConsumedLiters: _toNutritionDouble(
+      data['hydration_consumed'] ?? data['hydration_consumed_l'],
+      0,
+      max: 20,
+    ),
+  );
+}
+
+AgentContextSnapshot agentContextFromBackend(dynamic raw) {
+  final root = _asMap(_unwrapData(raw));
+  final profileData = _asMap(root['user_profile'] ?? root['profile']);
+  final metricsData = root['atlas_metrics'] ?? root['metrics'];
+  final templateData = root['active_template'] ?? root['workout_template'];
+  final recentData = root['recent_workouts'] ?? root['workout_logs'];
+  final trendsData = root['workout_trends'] ?? root['trends'];
+  final nutritionData =
+      root['todays_nutrition'] ?? root['today_nutrition'] ?? root['nutrition'];
+
+  return AgentContextSnapshot(
+    userProfile:
+        profileData.isEmpty ? null : _mapContextUserProfile(profileData),
+    atlasMetrics: metricsData == null ? null : _mapAtlasMetrics(metricsData),
+    activeTemplate:
+        templateData == null ? null : _mapWorkoutTemplate(templateData),
+    recentWorkouts: _mapWorkoutLogList(recentData),
+    workoutTrends: _mapWorkoutTrends(trendsData),
+    todaysNutrition:
+        nutritionData == null ? null : _mapContextNutrition(nutritionData),
+  );
+}
+
+UserProfile _mapContextUserProfile(Map<String, dynamic> data) {
+  return UserProfile(
+    name: data['username']?.toString() ?? data['name']?.toString() ?? '',
+    goal: data['goal']?.toString() ?? data['fitness_goal']?.toString() ?? '',
+    coachingPreference: data['coaching_preference']?.toString() ?? '',
+    userLevel: _parseUserLevel(
+      (data['user_level'] ?? data['experience_level'])?.toString(),
+    ),
+    age: _toInt(data['age'], 0),
+    heightCm: _toDouble(data['height_cm'], 0),
+    weightKg: _toDouble(data['weight_kg'], 0),
+    sex: data['sex']?.toString() ?? '',
+    availableTimeMinutes: _toInt(
+      data['available_time_min'] ?? data['available_time_minutes'],
+      0,
+    ),
+    trainingPreference: data['training_preference']?.toString() ?? '',
+    activityLevel: data['activity_level']?.toString() ?? '',
+    dietaryPreference: data['dietary_preference']?.toString() ?? '',
+    goalTimeframe: data['goal_timeframe']?.toString() ?? '',
+    weeksActive: _toInt(data['weeks_active'], 0),
+    prefersVoiceLogging: data['prefers_voice_logging'] == true,
+  );
+}
+
+DailyNutritionSummary _mapContextNutrition(dynamic raw) {
+  final root = _asMap(_unwrapData(raw));
+  final summary = _asMap(root['summary']);
+  final totals = _asMap(root['totals']);
+  return dailyNutritionSummaryFromBackend({
+    ...root,
+    ...summary,
+    ...totals,
+  });
+}
+
+WorkoutTrendSummary _mapWorkoutTrends(dynamic raw) {
+  final unwrapped = _unwrapData(raw);
+  final root = _asMap(unwrapped);
+  final rawPoints = unwrapped is List
+      ? unwrapped
+      : root['points'] ?? root['series'] ?? root['daily'] ?? root['data'];
+  final points = rawPoints is List
+      ? rawPoints.map((item) {
+          final point = _asMap(item);
+          return WorkoutTrendPoint(
+            label: (point['date'] ?? point['label'] ?? point['period'])
+                    ?.toString() ??
+                '',
+            volumeKg: _firstDouble(
+              point,
+              const ['volume_kg', 'total_volume_kg', 'volume'],
+            ),
+            workoutCount: _toInt(
+              point['workout_count'] ?? point['count'] ?? point['workouts'],
+              0,
+            ),
+          );
+        }).toList(growable: false)
+      : const <WorkoutTrendPoint>[];
+  return WorkoutTrendSummary(
+    rollingDays: _toInt(root['rolling_days'] ?? root['window_days'], 28),
+    workoutCount: _toInt(
+      root['workout_count'] ?? root['total_workouts'] ?? root['count'],
+      points.fold<int>(0, (total, point) => total + point.workoutCount),
+    ),
+    totalVolumeKg: _firstDouble(
+      root,
+      const ['total_volume_kg', 'volume_kg', 'total_volume'],
+      fallback:
+          points.fold<double>(0, (total, point) => total + point.volumeKg),
+    ),
+    completedSets: _toInt(
+      root['completed_sets'] ?? root['total_sets'] ?? root['set_count'],
+      0,
+    ),
+    points: points,
+  );
+}
+
+List<WorkoutLogDraft> _mapWorkoutLogList(dynamic raw) {
+  final unwrapped = _unwrapData(raw);
+  final map = _asMap(unwrapped);
+  final list = unwrapped is List
+      ? unwrapped
+      : map['items'] ?? map['logs'] ?? map['recent_workouts'];
+  if (list is! List) {
+    return const [];
+  }
+  return list.map(_mapWorkoutLog).toList(growable: false);
+}
+
+WorkoutTemplateDraft? _mapActiveTemplate(dynamic raw) {
+  final unwrapped = _unwrapData(raw);
+  if (unwrapped is List) {
+    if (unwrapped.isEmpty) {
+      return null;
+    }
+    return _pickMostRecentTemplate(
+      unwrapped.map(_mapWorkoutTemplate).toList(growable: false),
+    );
+  }
+  final map = _asMap(unwrapped);
+  return map.isEmpty ? null : _mapWorkoutTemplate(map);
+}
+
+DailyNutritionSummary nutritionSummaryFromFoodLogs(
+  List<FoodLogDraft> logs, {
+  DailyNutritionSummary base = DailyNutritionSummary.empty,
+}) {
+  double calories = 0;
+  double protein = 0;
+  double carbs = 0;
+  double fat = 0;
+  for (final log in logs) {
+    calories += log.calories;
+    protein += log.protein;
+    carbs += log.carbs;
+    fat += log.fat;
+  }
+  return base.copyWith(
+    consumedCalories: calories,
+    proteinConsumed: protein,
+    carbsConsumed: carbs,
+    fatConsumed: fat,
+  );
+}
+
+List<FoodLogDraft> foodLogsFromBackendSummary(Map<String, dynamic> data) {
+  final rawMeals = data['meals'] ?? data['grouped_meals'] ?? data['entries'];
+  if (rawMeals is List) {
+    return rawMeals.expand<FoodLogDraft>((item) {
+      final meal = _asMap(item);
+      final mealType = meal['meal_type']?.toString();
+      final entries = meal['entries'] ?? meal['foods'] ?? meal['logs'];
+      if (entries is! List) {
+        return const <FoodLogDraft>[];
+      }
+      return entries.map((entry) {
+        final map = _asMap(entry);
+        return _mapFoodLog({
+          ...map,
+          if (mealType != null && map['meal_type'] == null)
+            'meal_type': mealType,
+        });
+      });
+    }).toList();
+  }
+  if (rawMeals is Map) {
+    final logs = <FoodLogDraft>[];
+    for (final entry in rawMeals.entries) {
+      final items = entry.value;
+      if (items is! List) {
+        continue;
+      }
+      for (final item in items) {
+        final map = _asMap(item);
+        logs.add(
+          _mapFoodLog({
+            ...map,
+            if (map['meal_type'] == null) 'meal_type': entry.key.toString(),
+          }),
+        );
+      }
+    }
+    return logs;
+  }
+  return const [];
+}
+
+double _roundNutrition(double value) {
+  return double.parse(value.toStringAsFixed(2));
 }
 
 String _networkFallbackMessage(DioException error) {
@@ -1990,7 +4423,36 @@ MealType _parseMealType(String? raw) {
     'breakfast' => MealType.breakfast,
     'lunch' => MealType.lunch,
     'dinner' => MealType.dinner,
+    'pre_workout' => MealType.preWorkout,
+    'post_workout' => MealType.postWorkout,
     _ => MealType.snack,
+  };
+}
+
+String _mealTypeWire(MealType mealType) {
+  return switch (mealType) {
+    MealType.breakfast => 'breakfast',
+    MealType.lunch => 'lunch',
+    MealType.dinner => 'dinner',
+    MealType.snack => 'snack',
+    MealType.preWorkout => 'pre_workout',
+    MealType.postWorkout => 'post_workout',
+  };
+}
+
+QuantitySource _parseQuantitySource(String? raw) {
+  return switch (raw) {
+    'explicit' => QuantitySource.explicit,
+    'inferred' => QuantitySource.inferred,
+    _ => QuantitySource.default100g,
+  };
+}
+
+String _quantitySourceWire(QuantitySource source) {
+  return switch (source) {
+    QuantitySource.explicit => 'explicit',
+    QuantitySource.default100g => 'default_100g',
+    QuantitySource.inferred => 'inferred',
   };
 }
 
@@ -2017,6 +4479,14 @@ double _toNutritionDouble(
     return max;
   }
   return parsed;
+}
+
+double? _nullableNutritionDouble(dynamic value) {
+  if (value == null) {
+    return null;
+  }
+  final parsed = _toDouble(value, double.nan);
+  return parsed.isFinite ? parsed : null;
 }
 
 int _toInt(dynamic value, int fallback) {
@@ -2052,29 +4522,77 @@ Map<String, dynamic> _pickMostRecentMap(List<dynamic> raw, String field) {
   return maps.first;
 }
 
+WorkoutTemplateDraft _pickMostRecentTemplate(
+  List<WorkoutTemplateDraft> templates,
+) {
+  return templates.reduce((current, candidate) {
+    final currentId = current.templateId ?? 0;
+    final candidateId = candidate.templateId ?? 0;
+    return candidateId >= currentId ? candidate : current;
+  });
+}
+
 WorkoutTemplateDraft _mapWorkoutTemplate(dynamic raw) {
   final template = _asMap(raw);
+  final rawExercises = template['template_exercises'] ??
+      template['exercises'] ??
+      _exercisesFromTemplateDays(template['days']);
   return WorkoutTemplateDraft(
     templateId: _toNullableInt(template['template_id']),
     name: template['name']?.toString() ?? '',
     description: template['description']?.toString() ?? '',
     durationMinutes: _toInt(template['duration_minutes'], 0),
     goal: template['goal']?.toString() ?? '',
-    exercises: _mapTemplateExercises(
-      template['template_exercises'] ?? template['exercises'],
-    ),
+    exercises: _mapTemplateExercises(rawExercises),
   );
+}
+
+List<dynamic> _exercisesFromTemplateDays(dynamic raw) {
+  if (raw is! List || raw.isEmpty) {
+    return const [];
+  }
+  final exercises = <dynamic>[];
+  for (final item in raw) {
+    final day = _asMap(item);
+    final dayExercises = day['exercises'];
+    if (dayExercises is List) {
+      exercises.addAll(dayExercises);
+    }
+  }
+  return exercises;
+}
+
+WorkoutScheduleEntry _mapWorkoutScheduleEntry(dynamic raw) {
+  final map = _asMap(raw);
+  return WorkoutScheduleEntry.fromJson(map);
+}
+
+Map<String, Object?> _workoutSchedulePayload(
+  AuthSession session,
+  WorkoutScheduleEntry entry,
+) {
+  return {
+    'template_id': entry.templateId,
+    'user_id': session.userId,
+    'weekday': entry.weekday,
+    'time': entry.timeLabel,
+    'repeat_weekly': entry.repeatWeekly,
+    'active': entry.active,
+  };
 }
 
 WorkoutLogDraft _mapWorkoutLog(dynamic raw) {
   final log = _asMap(raw);
   final startedAt = log['started_at']?.toString() ?? '';
+  final endedAt = log['ended_at']?.toString() ?? '';
+  final date = log['date']?.toString() ?? '';
   return WorkoutLogDraft(
     workoutLogId: _toNullableInt(log['workout_log_id']),
     templateId: _toNullableInt(log['template_id']),
-    name: log['name']?.toString() ?? '',
+    name: log['name']?.toString() ?? log['workout_name']?.toString() ?? '',
     notes: log['notes']?.toString() ?? '',
-    startedAtLabel: startedAt.isEmpty ? '' : startedAt,
+    startedAtLabel: startedAt.isEmpty ? date : startedAt,
+    endedAtLabel: endedAt.isEmpty ? '' : endedAt,
     exercises: _mapLoggedExercises(
       log['workout_exercises'] ?? log['exercises'],
     ),
@@ -2083,17 +4601,44 @@ WorkoutLogDraft _mapWorkoutLog(dynamic raw) {
 
 FoodLogDraft _mapFoodLog(dynamic raw) {
   final map = _asMap(raw);
-  final quantity = _toNutritionDouble(map['quantity_grams'], 0, max: 50000);
-  final calories = _toNutritionDouble(map['calories_snapshot'], 0, max: 20000);
-  final protein = _toNutritionDouble(map['protein_snapshot'], 0, max: 1000);
-  final carbs = _toNutritionDouble(map['carbs_snapshot'], 0, max: 2000);
-  final fat = _toNutritionDouble(map['fat_snapshot'], 0, max: 1000);
+  final food = _asMap(map['food']);
+  final quantity = _toNutritionDouble(
+    map['quantity_g'] ?? map['quantity_grams'],
+    0,
+    max: 50000,
+  );
+  final calories = _toNutritionDouble(
+    map['calories_snapshot'] ?? map['calories'] ?? map['total_calories'],
+    0,
+    max: 20000,
+  );
+  final protein = _toNutritionDouble(
+    map['protein_snapshot'] ?? map['protein'] ?? map['protein_g'],
+    0,
+    max: 1000,
+  );
+  final carbs = _toNutritionDouble(
+    map['carbs_snapshot'] ?? map['carbs'] ?? map['carbs_g'],
+    0,
+    max: 2000,
+  );
+  final fat = _toNutritionDouble(
+    map['fat_snapshot'] ?? map['fat'] ?? map['fat_g'],
+    0,
+    max: 1000,
+  );
   final multiplier = quantity <= 0 ? 0 : 100 / quantity;
   return FoodLogDraft(
-    foodLogId: map['food_log_id']?.toString(),
-    foodId: map['food_id']?.toString(),
-    logDate: DateTime.tryParse(map['date']?.toString() ?? ''),
-    foodName: map['food_name']?.toString() ?? map['name']?.toString() ?? '',
+    foodLogId: (map['food_log_id'] ?? map['id'])?.toString(),
+    foodId: (map['food_id'] ?? food['food_id'] ?? food['id'])?.toString(),
+    logDate: DateTime.tryParse(
+      (map['log_date'] ?? map['date'])?.toString() ?? '',
+    ),
+    quantitySource: _parseQuantitySource(map['quantity_source']?.toString()),
+    foodName: map['food_name']?.toString() ??
+        map['name']?.toString() ??
+        food['name']?.toString() ??
+        '',
     quantityGrams: quantity,
     mealType: _parseMealType(map['meal_type']?.toString()),
     calories: calories,
@@ -2286,19 +4831,17 @@ Future<String?> _resolveFoodId(Dio dio, FoodLogDraft log) async {
     if (data is! List) {
       return null;
     }
-    String? firstResultId;
     for (final item in data) {
       final map = _asMap(item);
       final foodId = map['food_id']?.toString();
       final foodName = map['name']?.toString() ?? '';
-      firstResultId ??= foodId;
       if (foodId != null &&
           foodId.isNotEmpty &&
           foodName.toLowerCase() == name.toLowerCase()) {
         return foodId;
       }
     }
-    return firstResultId;
+    return null;
   } catch (_) {
     return null;
   }
@@ -2337,14 +4880,72 @@ List<WorkoutExerciseDraft> _mapTemplateExercises(dynamic raw) {
   }
   return raw.map<WorkoutExerciseDraft>((item) {
     final map = _asMap(item);
+    final rawSets = map['sets'] ?? map['planned_sets'];
+    final documentedSetCount =
+        rawSets is List ? 0 : _toNonNegativeInt(rawSets, 0, max: 100);
+    final documentedReps = _toNonNegativeInt(
+      map['reps'] ?? map['target_reps'],
+      0,
+      max: 1000,
+    );
+    final sets = rawSets is List
+        ? rawSets.map<SetDraft>((setItem) {
+            final setMap = _asMap(setItem);
+            return SetDraft(
+              setNumber: _toNonNegativeInt(
+                setMap['set_number'],
+                1,
+                max: 1000,
+              ),
+              weightKg: _toNutritionDouble(
+                setMap['weight_kg'],
+                0,
+                max: 10000,
+              ),
+              reps: _toNonNegativeInt(setMap['reps'], 0, max: 1000),
+              isWarmup: setMap['is_warmup'] == true,
+              isCompleted: setMap['is_completed'] == true,
+              rpe: _toNutritionDouble(setMap['rpe'], 0, max: 10),
+            );
+          }).toList()
+        : documentedSetCount > 0 || documentedReps > 0
+            ? [
+                SetDraft(
+                  setNumber: 1,
+                  weightKg: 0,
+                  reps: documentedReps,
+                  isWarmup: false,
+                  isCompleted: false,
+                  rpe: 0,
+                ),
+              ]
+            : const <SetDraft>[];
+    final targetSets = _toNonNegativeInt(
+      map['target_sets'],
+      documentedSetCount > 0
+          ? documentedSetCount
+          : sets.isEmpty
+              ? 3
+              : sets.length,
+      max: 100,
+    );
+    final targetReps = _toNonNegativeInt(
+      map['target_reps'],
+      documentedReps > 0
+          ? documentedReps
+          : sets.isEmpty
+              ? 10
+              : sets.first.reps,
+      max: 1000,
+    );
     return WorkoutExerciseDraft(
       exerciseId: _toNullableInt(map['exercise_id']),
       exerciseName:
           map['exercise_name']?.toString() ?? map['name']?.toString() ?? '',
       notes: map['notes']?.toString() ?? '',
-      targetSets: _toNonNegativeInt(map['target_sets'], 3, max: 100),
-      targetReps: _toNonNegativeInt(map['target_reps'], 10, max: 1000),
-      sets: const [],
+      targetSets: targetSets,
+      targetReps: targetReps,
+      sets: sets,
     );
   }).toList();
 }
@@ -2387,4 +4988,27 @@ List<WorkoutExerciseDraft> _mapLoggedExercises(dynamic raw) {
       sets: sets,
     );
   }).toList();
+}
+
+List<WorkoutScheduleEntry> _upsertLocalWorkoutSchedule(
+  List<WorkoutScheduleEntry> schedule,
+  WorkoutScheduleEntry saved,
+) {
+  final existingIndex = schedule.indexWhere(
+    (entry) =>
+        entry.scheduleId == saved.scheduleId || entry.weekday == saved.weekday,
+  );
+  if (existingIndex == -1) {
+    return [...schedule, saved]..sort(_compareWorkoutScheduleEntries);
+  }
+  final updated = [...schedule];
+  updated[existingIndex] = saved;
+  return updated..sort(_compareWorkoutScheduleEntries);
+}
+
+int _compareWorkoutScheduleEntries(
+  WorkoutScheduleEntry left,
+  WorkoutScheduleEntry right,
+) {
+  return left.weekday.compareTo(right.weekday);
 }

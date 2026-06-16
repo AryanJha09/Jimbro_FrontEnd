@@ -21,6 +21,9 @@ dependencies:
   # Networking
   dio: ^5.4.0
 
+  # Local persistence
+  shared_preferences: ^2.5.5
+
   # Model generation
   freezed_annotation: ^2.4.1
   json_annotation: ^4.9.0

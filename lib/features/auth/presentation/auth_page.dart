@@ -150,7 +150,7 @@ class _AuthPageState extends ConsumerState<AuthPage> {
                     title: 'Continue with Google',
                     subtitle: useLiveBackend
                         ? 'Not configured yet in Supabase'
-                        : 'Fastest way to jump into the prototype',
+                        : 'Continue with your coaching setup',
                     onTap:
                         useLiveBackend ? null : () => _completeAuth('google'),
                   ),
@@ -160,7 +160,7 @@ class _AuthPageState extends ConsumerState<AuthPage> {
                     title: 'Continue with Apple',
                     subtitle: useLiveBackend
                         ? 'Not configured yet in Supabase'
-                        : 'Clean iOS-first sign in shell',
+                        : 'Continue with your JimBro profile',
                     onTap: useLiveBackend ? null : () => _completeAuth('apple'),
                   ),
                   const SizedBox(height: 18),
@@ -218,7 +218,7 @@ class _AuthPageState extends ConsumerState<AuthPage> {
                                           ? useSupabaseAuth
                                               ? 'Supabase email sign in'
                                               : 'Email sign in'
-                                          : 'Email prototype sign in',
+                                          : 'Email sign in',
                                       style: theme.textTheme.titleMedium,
                                     ),
                                   ),

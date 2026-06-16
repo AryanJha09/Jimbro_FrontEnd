@@ -7,11 +7,13 @@ class SectionHeader extends StatelessWidget {
     super.key,
     required this.eyebrow,
     required this.title,
+    this.subtitle,
     this.trailing,
   });
 
   final String eyebrow;
   final String title;
+  final String? subtitle;
   final Widget? trailing;
 
   @override
@@ -28,12 +30,22 @@ class SectionHeader extends StatelessWidget {
               Text(
                 eyebrow,
                 style: theme.textTheme.labelLarge?.copyWith(
-                  letterSpacing: 1.2,
+                  letterSpacing: .8,
                   color: JimColors.inkMuted,
                 ),
               ),
               const SizedBox(height: 6),
               Text(title, style: theme.textTheme.headlineSmall),
+              if (subtitle != null) ...[
+                const SizedBox(height: JimSpacing.xs),
+                Text(
+                  subtitle!,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: JimColors.inkSoft,
+                    height: 1.45,
+                  ),
+                ),
+              ],
             ],
           ),
         ),

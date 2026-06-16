@@ -17,6 +17,14 @@ enum MealType {
   lunch,
   dinner,
   snack,
+  preWorkout,
+  postWorkout,
+}
+
+enum QuantitySource {
+  explicit,
+  default100g,
+  inferred,
 }
 
 enum SearchCategory {
@@ -59,6 +67,12 @@ class UserProfile {
     required this.age,
     required this.heightCm,
     required this.weightKg,
+    required this.sex,
+    required this.availableTimeMinutes,
+    required this.trainingPreference,
+    required this.activityLevel,
+    required this.dietaryPreference,
+    required this.goalTimeframe,
     required this.weeksActive,
     required this.prefersVoiceLogging,
   });
@@ -70,6 +84,12 @@ class UserProfile {
   final int age;
   final double heightCm;
   final double weightKg;
+  final String sex;
+  final int availableTimeMinutes;
+  final String trainingPreference;
+  final String activityLevel;
+  final String dietaryPreference;
+  final String goalTimeframe;
   final int weeksActive;
   final bool prefersVoiceLogging;
 
@@ -81,6 +101,12 @@ class UserProfile {
     int? age,
     double? heightCm,
     double? weightKg,
+    String? sex,
+    int? availableTimeMinutes,
+    String? trainingPreference,
+    String? activityLevel,
+    String? dietaryPreference,
+    String? goalTimeframe,
     int? weeksActive,
     bool? prefersVoiceLogging,
   }) {
@@ -92,6 +118,12 @@ class UserProfile {
       age: age ?? this.age,
       heightCm: heightCm ?? this.heightCm,
       weightKg: weightKg ?? this.weightKg,
+      sex: sex ?? this.sex,
+      availableTimeMinutes: availableTimeMinutes ?? this.availableTimeMinutes,
+      trainingPreference: trainingPreference ?? this.trainingPreference,
+      activityLevel: activityLevel ?? this.activityLevel,
+      dietaryPreference: dietaryPreference ?? this.dietaryPreference,
+      goalTimeframe: goalTimeframe ?? this.goalTimeframe,
       weeksActive: weeksActive ?? this.weeksActive,
       prefersVoiceLogging: prefersVoiceLogging ?? this.prefersVoiceLogging,
     );
@@ -102,6 +134,7 @@ class UserStaticMetrics {
   const UserStaticMetrics({
     required this.bmr,
     required this.tdee,
+    required this.targetCalories,
     required this.maintenanceCalories,
     required this.cutCalories,
     required this.bulkCalories,
@@ -114,6 +147,7 @@ class UserStaticMetrics {
 
   final double bmr;
   final double tdee;
+  final double targetCalories;
   final double maintenanceCalories;
   final double cutCalories;
   final double bulkCalories;
@@ -126,6 +160,7 @@ class UserStaticMetrics {
   UserStaticMetrics copyWith({
     double? bmr,
     double? tdee,
+    double? targetCalories,
     double? maintenanceCalories,
     double? cutCalories,
     double? bulkCalories,
@@ -138,6 +173,7 @@ class UserStaticMetrics {
     return UserStaticMetrics(
       bmr: bmr ?? this.bmr,
       tdee: tdee ?? this.tdee,
+      targetCalories: targetCalories ?? this.targetCalories,
       maintenanceCalories: maintenanceCalories ?? this.maintenanceCalories,
       cutCalories: cutCalories ?? this.cutCalories,
       bulkCalories: bulkCalories ?? this.bulkCalories,
@@ -268,6 +304,120 @@ class WorkoutTemplateDraft {
   );
 }
 
+class WorkoutScheduleEntry {
+  const WorkoutScheduleEntry({
+    this.scheduleId,
+    this.userId,
+    this.templateId,
+    required this.templateName,
+    required this.weekday,
+    required this.timeLabel,
+    this.repeatWeekly = true,
+    this.active = true,
+  });
+
+  final String? scheduleId;
+  final String? userId;
+  final int? templateId;
+  final String templateName;
+  final int weekday;
+  final String timeLabel;
+  final bool repeatWeekly;
+  final bool active;
+
+  WorkoutScheduleEntry copyWith({
+    Object? scheduleId = _unset,
+    Object? userId = _unset,
+    Object? templateId = _unset,
+    String? templateName,
+    int? weekday,
+    String? timeLabel,
+    bool? repeatWeekly,
+    bool? active,
+  }) {
+    return WorkoutScheduleEntry(
+      scheduleId: identical(scheduleId, _unset)
+          ? this.scheduleId
+          : scheduleId as String?,
+      userId: identical(userId, _unset) ? this.userId : userId as String?,
+      templateId:
+          identical(templateId, _unset) ? this.templateId : templateId as int?,
+      templateName: templateName ?? this.templateName,
+      weekday: weekday ?? this.weekday,
+      timeLabel: timeLabel ?? this.timeLabel,
+      repeatWeekly: repeatWeekly ?? this.repeatWeekly,
+      active: active ?? this.active,
+    );
+  }
+
+  Map<String, Object?> toJson() {
+    return {
+      'schedule_id': scheduleId,
+      'user_id': userId,
+      'template_id': templateId,
+      'template_name': templateName,
+      'weekday': weekday,
+      'time': timeLabel,
+      'repeat_weekly': repeatWeekly,
+      'active': active,
+    };
+  }
+
+  static WorkoutScheduleEntry fromJson(Map<String, dynamic> json) {
+    return WorkoutScheduleEntry(
+      scheduleId: json['schedule_id']?.toString() ?? json['id']?.toString(),
+      userId: json['user_id']?.toString(),
+      templateId: _nullableInt(json['template_id']),
+      templateName: json['template_name']?.toString() ??
+          _nestedName(json['template']) ??
+          '',
+      weekday: _boundedWeekday(json['weekday']),
+      timeLabel: _normalizeTimeLabel(json['time']?.toString()),
+      repeatWeekly: json['repeat_weekly'] != false,
+      active: json['active'] != false,
+    );
+  }
+
+  static int _boundedWeekday(dynamic value) {
+    final parsed = value is num ? value.toInt() : int.tryParse('$value');
+    if (parsed == null ||
+        parsed < DateTime.monday ||
+        parsed > DateTime.sunday) {
+      return DateTime.monday;
+    }
+    return parsed;
+  }
+
+  static int? _nullableInt(dynamic value) {
+    if (value == null) {
+      return null;
+    }
+    if (value is num) {
+      return value.toInt();
+    }
+    return int.tryParse(value.toString());
+  }
+
+  static String _normalizeTimeLabel(String? value) {
+    final raw = value?.trim() ?? '';
+    final match = RegExp(r'^(\d{1,2}):(\d{2})').firstMatch(raw);
+    if (match == null) {
+      return '18:00';
+    }
+    final hour = int.tryParse(match.group(1) ?? '') ?? 18;
+    final minute = int.tryParse(match.group(2) ?? '') ?? 0;
+    return '${hour.clamp(0, 23).toString().padLeft(2, '0')}:'
+        '${minute.clamp(0, 59).toString().padLeft(2, '0')}';
+  }
+
+  static String? _nestedName(dynamic value) {
+    if (value is Map) {
+      return value['name']?.toString();
+    }
+    return null;
+  }
+}
+
 class WorkoutLogDraft {
   const WorkoutLogDraft({
     this.workoutLogId,
@@ -275,6 +425,7 @@ class WorkoutLogDraft {
     required this.name,
     required this.notes,
     required this.startedAtLabel,
+    this.endedAtLabel = '',
     required this.exercises,
   });
 
@@ -283,7 +434,11 @@ class WorkoutLogDraft {
   final String name;
   final String notes;
   final String startedAtLabel;
+  final String endedAtLabel;
   final List<WorkoutExerciseDraft> exercises;
+
+  bool get isInProgress =>
+      startedAtLabel.trim().isNotEmpty && endedAtLabel.trim().isEmpty;
 
   WorkoutLogDraft copyWith({
     Object? workoutLogId = _unset,
@@ -291,6 +446,7 @@ class WorkoutLogDraft {
     String? name,
     String? notes,
     String? startedAtLabel,
+    String? endedAtLabel,
     List<WorkoutExerciseDraft>? exercises,
   }) {
     return WorkoutLogDraft(
@@ -302,6 +458,7 @@ class WorkoutLogDraft {
       name: name ?? this.name,
       notes: notes ?? this.notes,
       startedAtLabel: startedAtLabel ?? this.startedAtLabel,
+      endedAtLabel: endedAtLabel ?? this.endedAtLabel,
       exercises: exercises ?? this.exercises,
     );
   }
@@ -310,6 +467,7 @@ class WorkoutLogDraft {
     name: '',
     notes: '',
     startedAtLabel: '',
+    endedAtLabel: '',
     exercises: [],
   );
 }
@@ -319,6 +477,7 @@ class FoodLogDraft {
     this.foodLogId,
     this.foodId,
     this.logDate,
+    this.quantitySource = QuantitySource.default100g,
     this.caloriesPer100g,
     this.proteinPer100g,
     this.carbsPer100g,
@@ -335,6 +494,7 @@ class FoodLogDraft {
   final String? foodLogId;
   final String? foodId;
   final DateTime? logDate;
+  final QuantitySource quantitySource;
   final double? caloriesPer100g;
   final double? proteinPer100g;
   final double? carbsPer100g;
@@ -351,6 +511,7 @@ class FoodLogDraft {
     Object? foodLogId = _unset,
     Object? foodId = _unset,
     Object? logDate = _unset,
+    QuantitySource? quantitySource,
     Object? caloriesPer100g = _unset,
     Object? proteinPer100g = _unset,
     Object? carbsPer100g = _unset,
@@ -368,6 +529,7 @@ class FoodLogDraft {
           identical(foodLogId, _unset) ? this.foodLogId : foodLogId as String?,
       foodId: identical(foodId, _unset) ? this.foodId : foodId as String?,
       logDate: identical(logDate, _unset) ? this.logDate : logDate as DateTime?,
+      quantitySource: quantitySource ?? this.quantitySource,
       caloriesPer100g: identical(caloriesPer100g, _unset)
           ? this.caloriesPer100g
           : caloriesPer100g as double?,
@@ -428,6 +590,7 @@ class DailyNutritionSummary {
   final double hydrationConsumedLiters;
 
   double get remainingCalories => targetCalories - consumedCalories;
+  double get remainingProtein => proteinTarget - proteinConsumed;
 
   DailyNutritionSummary copyWith({
     double? targetCalories,
@@ -469,6 +632,78 @@ class DailyNutritionSummary {
     hydrationTargetLiters: 0,
     hydrationConsumedLiters: 0,
   );
+}
+
+class WorkoutTrendPoint {
+  const WorkoutTrendPoint({
+    required this.label,
+    required this.volumeKg,
+    required this.workoutCount,
+  });
+
+  final String label;
+  final double volumeKg;
+  final int workoutCount;
+}
+
+class WorkoutTrendSummary {
+  const WorkoutTrendSummary({
+    required this.rollingDays,
+    required this.workoutCount,
+    required this.totalVolumeKg,
+    required this.completedSets,
+    required this.points,
+  });
+
+  final int rollingDays;
+  final int workoutCount;
+  final double totalVolumeKg;
+  final int completedSets;
+  final List<WorkoutTrendPoint> points;
+
+  bool get hasData =>
+      workoutCount > 0 ||
+      totalVolumeKg > 0 ||
+      completedSets > 0 ||
+      points.isNotEmpty;
+
+  static const empty = WorkoutTrendSummary(
+    rollingDays: 28,
+    workoutCount: 0,
+    totalVolumeKg: 0,
+    completedSets: 0,
+    points: [],
+  );
+}
+
+class AgentContextSnapshot {
+  const AgentContextSnapshot({
+    this.userProfile,
+    this.atlasMetrics,
+    this.activeTemplate,
+    this.recentWorkouts = const [],
+    this.workoutTrends = WorkoutTrendSummary.empty,
+    this.todaysNutrition,
+    this.usedFallbackEndpoints = false,
+  });
+
+  final UserProfile? userProfile;
+  final UserStaticMetrics? atlasMetrics;
+  final WorkoutTemplateDraft? activeTemplate;
+  final List<WorkoutLogDraft> recentWorkouts;
+  final WorkoutTrendSummary workoutTrends;
+  final DailyNutritionSummary? todaysNutrition;
+  final bool usedFallbackEndpoints;
+
+  bool get hasLiveData =>
+      userProfile != null ||
+      atlasMetrics != null ||
+      activeTemplate != null ||
+      recentWorkouts.isNotEmpty ||
+      workoutTrends.hasData ||
+      todaysNutrition != null;
+
+  static const empty = AgentContextSnapshot();
 }
 
 class ExerciseSuggestion {
@@ -611,6 +846,8 @@ class AppDraftState {
     required this.profile,
     required this.metrics,
     required this.template,
+    required this.templates,
+    required this.workoutSchedule,
     required this.workoutLog,
     required this.foodLogs,
     required this.nutritionSummary,
@@ -622,6 +859,8 @@ class AppDraftState {
   final UserProfile profile;
   final UserStaticMetrics metrics;
   final WorkoutTemplateDraft template;
+  final List<WorkoutTemplateDraft> templates;
+  final List<WorkoutScheduleEntry> workoutSchedule;
   final WorkoutLogDraft workoutLog;
   final List<FoodLogDraft> foodLogs;
   final DailyNutritionSummary nutritionSummary;
@@ -633,6 +872,8 @@ class AppDraftState {
     UserProfile? profile,
     UserStaticMetrics? metrics,
     WorkoutTemplateDraft? template,
+    List<WorkoutTemplateDraft>? templates,
+    List<WorkoutScheduleEntry>? workoutSchedule,
     WorkoutLogDraft? workoutLog,
     List<FoodLogDraft>? foodLogs,
     DailyNutritionSummary? nutritionSummary,
@@ -644,6 +885,8 @@ class AppDraftState {
       profile: profile ?? this.profile,
       metrics: metrics ?? this.metrics,
       template: template ?? this.template,
+      templates: templates ?? this.templates,
+      workoutSchedule: workoutSchedule ?? this.workoutSchedule,
       workoutLog: workoutLog ?? this.workoutLog,
       foodLogs: foodLogs ?? this.foodLogs,
       nutritionSummary: nutritionSummary ?? this.nutritionSummary,

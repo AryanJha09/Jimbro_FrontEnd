@@ -8,31 +8,34 @@ class JimPrimaryButton extends StatelessWidget {
     required this.label,
     required this.onPressed,
     this.icon,
+    this.expand = false,
   });
 
   final String label;
   final VoidCallback onPressed;
   final IconData? icon;
+  final bool expand;
 
   @override
   Widget build(BuildContext context) {
     return FilledButton(
       onPressed: onPressed,
       style: FilledButton.styleFrom(
-        backgroundColor: JimColors.plaque,
-        foregroundColor: JimColors.ink,
+        backgroundColor: JimColors.accentStrong,
+        foregroundColor: Colors.white,
         padding: const EdgeInsets.symmetric(
           horizontal: JimSpacing.lg,
-          vertical: JimSpacing.md,
+          vertical: 17,
         ),
-        side: const BorderSide(color: JimColors.insetLine),
+        side: BorderSide.none,
         elevation: 0,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(JimRadius.pill),
         ),
       ),
       child: Row(
-        mainAxisSize: MainAxisSize.min,
+        mainAxisSize: expand ? MainAxisSize.max : MainAxisSize.min,
+        mainAxisAlignment: MainAxisAlignment.center,
         children: [
           if (icon != null) ...[
             Icon(icon, size: 18),
@@ -50,10 +53,14 @@ class JimSecondaryButton extends StatelessWidget {
     super.key,
     required this.label,
     required this.onPressed,
+    this.icon,
+    this.expand = false,
   });
 
   final String label;
   final VoidCallback onPressed;
+  final IconData? icon;
+  final bool expand;
 
   @override
   Widget build(BuildContext context) {
@@ -64,14 +71,50 @@ class JimSecondaryButton extends StatelessWidget {
         side: const BorderSide(color: JimColors.accentLine),
         padding: const EdgeInsets.symmetric(
           horizontal: JimSpacing.lg,
-          vertical: JimSpacing.md,
+          vertical: 17,
         ),
-        backgroundColor: JimColors.accentSoft.withValues(alpha: .28),
+        backgroundColor: JimColors.plaque,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(JimRadius.pill),
         ),
       ),
-      child: Text(label),
+      child: Row(
+        mainAxisSize: expand ? MainAxisSize.max : MainAxisSize.min,
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 18),
+            const SizedBox(width: 10),
+          ],
+          Text(label),
+        ],
+      ),
+    );
+  }
+}
+
+class JimTextButton extends StatelessWidget {
+  const JimTextButton({
+    super.key,
+    required this.label,
+    required this.onPressed,
+    this.icon,
+  });
+
+  final String label;
+  final VoidCallback onPressed;
+  final IconData? icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return TextButton.icon(
+      onPressed: onPressed,
+      icon: Icon(icon ?? Icons.arrow_forward_rounded, size: 18),
+      label: Text(label),
+      style: TextButton.styleFrom(
+        foregroundColor: JimColors.accentStrong,
+        textStyle: Theme.of(context).textTheme.labelLarge,
+      ),
     );
   }
 }
