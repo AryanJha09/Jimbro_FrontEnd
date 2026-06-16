@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/navigation/app_state.dart';
+import '../../../core/repositories/app_repositories.dart';
 import '../../../core/theme/jim_tokens.dart';
 import '../../../shared/components/backend_state_view.dart';
 import '../../../shared/components/jim_companion.dart';
@@ -258,13 +259,14 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
       if (!mounted) {
         return;
       }
+      final message = error is AtlasOnboardingCredentialException
+          ? error.message
+          : 'I could not save the plan yet. Your setup is still here.';
       await showDialog<void>(
         context: context,
         builder: (context) => AlertDialog(
           title: const Text('Your answers are safe'),
-          content: Text(
-            'I could not save the plan yet. Your setup is still here.\n\n$error',
-          ),
+          content: Text(message),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(context).pop(),

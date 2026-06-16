@@ -27,9 +27,13 @@ void main() {
         trainingPreference: OnboardingTrainingPreference.home,
         dietaryPreference: OnboardingDietaryPreference.simple,
       ),
+      account: _account,
     );
 
     expect(payload, {
+      'username': 'Test Athlete',
+      'email': 'test@example.com',
+      'password': 'test-password',
       'age': 31,
       'height_cm': 181.0,
       'weight_kg': 82.0,
@@ -38,10 +42,15 @@ void main() {
       'experience_level': 'intermediate',
       'available_time_min': 30,
       'equipment_access': 'home',
-      'constraints': ['short_sessions', 'home_equipment', 'simple_meals'],
-      'generate_program': true,
+      'constraints_json': [
+        'short_sessions',
+        'home_equipment',
+        'simple_meals',
+      ],
       'sex': 'male',
     });
+    expect(payload.containsKey('constraints'), isFalse);
+    expect(payload.containsKey('generate_program'), isFalse);
   });
 
   test('unsupported sex is not sent as invalid Atlas enum', () {
@@ -58,12 +67,49 @@ void main() {
         availableTimeMin: 45,
         trainingPreference: OnboardingTrainingPreference.mixed,
       ),
+      account: _account,
     );
 
     expect(payload.containsKey('sex'), isFalse);
   });
 
   test('successful Atlas onboarding stores returned metrics', () async {
+    final adapter = _AtlasAdapter();
+    final container = _containerWithAtlas(adapter);
+    addTearDown(container.dispose);
+    await container.read(appDraftProvider.future);
+    await container.read(appDraftProvider.notifier).signInWithEmailPassword(
+          email: 'test@example.com',
+          password: 'test-password',
+        );
+
+    final result = await container
+        .read(appDraftProvider.notifier)
+        .completeOnboardingProfile(
+          profile: _profile,
+          answers: _answers,
+        );
+
+    final state = container.read(appDraftProvider).value!;
+    expect(adapter.lastOnboardPayload?['username'], 'Test Athlete');
+    expect(adapter.lastOnboardPayload?['email'], 'test@example.com');
+    expect(adapter.lastOnboardPayload?['password'], 'test-password');
+    expect(adapter.lastOnboardPayload?['constraints_json'], isA<List>());
+    expect(
+        adapter.lastOnboardPayload?.containsKey('generate_program'), isFalse);
+    expect(adapter.lastOnboardPayload?.containsKey('constraints'), isFalse);
+    expect(adapter.lastOnboardPayload?['sex'], 'male');
+    expect(result?.warning, isNull);
+    expect(state.profile.goal, _profile.goal);
+    expect(state.metrics.bmr, 1800);
+    expect(state.metrics.tdee, 2700);
+    expect(state.metrics.targetCalories, 2850);
+    expect(state.metrics.proteinG, 160);
+    expect(state.nutritionSummary.targetCalories, 2850);
+    expect(state.nutritionSummary.proteinTarget, 160);
+  });
+
+  test('live onboarding saves locally when password is unavailable', () async {
     final adapter = _AtlasAdapter();
     final container = _containerWithAtlas(adapter);
     addTearDown(container.dispose);
@@ -76,17 +122,35 @@ void main() {
           answers: _answers,
         );
 
+    expect(adapter.lastOnboardPayload, isNull);
     final state = container.read(appDraftProvider).value!;
-    expect(adapter.lastOnboardPayload?['generate_program'], isTrue);
-    expect(adapter.lastOnboardPayload?['sex'], 'male');
-    expect(result?.warning, isNull);
-    expect(state.profile.goal, _profile.goal);
-    expect(state.metrics.bmr, 1800);
-    expect(state.metrics.tdee, 2700);
-    expect(state.metrics.targetCalories, 2850);
-    expect(state.metrics.proteinG, 160);
-    expect(state.nutritionSummary.targetCalories, 2850);
-    expect(state.nutritionSummary.proteinTarget, 160);
+    expect(result?.warning, contains('saved on this device'));
+    expect(state.profile.name, _profile.name);
+    expect(state.metrics.targetCalories, greaterThan(0));
+    expect(state.nutritionSummary.targetCalories, greaterThan(0));
+  });
+
+  test('Atlas metrics 404 falls back without failing app load', () async {
+    final adapter = _AtlasAdapter(metricsNotFound: true);
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://api.example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiProfileRepository(dio, MockProfileRepository());
+
+    final metrics = await repository.loadAtlasMetrics(
+      const AuthSession(
+        userId: 'test-user',
+        displayName: 'Test User',
+        email: 'test@example.com',
+        accessToken: 'test-token',
+        provider: 'fastapi',
+      ),
+    );
+
+    expect(metrics.targetCalories, 0);
   });
 
   test('profile PATCH sends changed Atlas fields and refreshes metrics',
@@ -161,6 +225,12 @@ const _answers = OnboardingAnswersDto(
   trainingPreference: OnboardingTrainingPreference.gym,
 );
 
+const _account = AtlasOnboardingAccount(
+  username: 'Test Athlete',
+  email: 'test@example.com',
+  password: 'test-password',
+);
+
 const _profile = UserProfile(
   name: 'Test Athlete',
   goal: 'Get stronger',
@@ -179,7 +249,10 @@ const _profile = UserProfile(
   prefersVoiceLogging: false,
 );
 
-ProviderContainer _containerWithAtlas(_AtlasAdapter adapter) {
+ProviderContainer _containerWithAtlas(
+  _AtlasAdapter adapter, {
+  _ReadyAuthRepository authRepository = const _ReadyAuthRepository('fastapi'),
+}) {
   final dio = Dio(
     BaseOptions(
       baseUrl: 'https://api.example.test/api/v1',
@@ -188,7 +261,7 @@ ProviderContainer _containerWithAtlas(_AtlasAdapter adapter) {
   )..httpClientAdapter = adapter;
   return ProviderContainer(
     overrides: [
-      authRepositoryProvider.overrideWithValue(_ReadyAuthRepository('fastapi')),
+      authRepositoryProvider.overrideWithValue(authRepository),
       profileRepositoryProvider.overrideWithValue(
         FastApiProfileRepository(dio, MockProfileRepository()),
       ),
@@ -254,6 +327,9 @@ class _NoopWorkoutNotificationService implements WorkoutNotificationService {
 }
 
 class _AtlasAdapter implements HttpClientAdapter {
+  _AtlasAdapter({this.metricsNotFound = false});
+
+  final bool metricsNotFound;
   Map<String, dynamic>? lastOnboardPayload;
   Map<String, dynamic>? lastPatchPayload;
 
@@ -289,15 +365,24 @@ class _AtlasAdapter implements HttpClientAdapter {
       return _json({'success': true, 'data': {}});
     }
     if (options.method == 'GET' && options.path == '/atlas/metrics') {
+      if (metricsNotFound) {
+        return _json({
+          'success': false,
+          'error': {'code': 'ATLAS_METRICS_NOT_FOUND'},
+        }, statusCode: 404);
+      }
       return _json({'success': true, 'data': _metrics});
     }
     return _json({'success': true, 'data': []});
   }
 
-  ResponseBody _json(Map<String, Object?> body) {
+  ResponseBody _json(
+    Map<String, Object?> body, {
+    int statusCode = 200,
+  }) {
     return ResponseBody.fromString(
       jsonEncode(body),
-      200,
+      statusCode,
       headers: {
         Headers.contentTypeHeader: [Headers.jsonContentType],
       },

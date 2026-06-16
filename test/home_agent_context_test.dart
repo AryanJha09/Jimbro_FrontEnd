@@ -106,6 +106,7 @@ void main() {
       ProviderScope(
         overrides: [
           appDraftProvider.overrideWith(_HomeDraftController.new),
+          authSessionProvider.overrideWith((ref) => _session),
           agentContextRepositoryProvider.overrideWithValue(
             const _FixedContextRepository(),
           ),

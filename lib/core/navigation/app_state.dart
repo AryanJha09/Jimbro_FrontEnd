@@ -66,11 +66,11 @@ final agentContextProvider = FutureProvider<AgentContextSnapshot>((ref) async {
   if (repository is MockAgentContextRepository) {
     return AgentContextSnapshot.empty;
   }
-  final draft = await ref.watch(appDraftProvider.future);
-  if (draft.session == null || draft.session?.provider == 'mock') {
+  final session = ref.watch(authSessionProvider);
+  if (session == null || session.provider == 'mock') {
     return AgentContextSnapshot.empty;
   }
-  return repository.load(draft.session);
+  return repository.load(session);
 });
 
 class WorkoutScheduleSaveResult {
@@ -97,7 +97,26 @@ class ProfileSyncResult {
   bool get hasWarning => warning != null && warning!.trim().isNotEmpty;
 }
 
+class _TransientOnboardingPassword {
+  const _TransientOnboardingPassword({
+    required this.email,
+    required this.password,
+  });
+
+  final String email;
+  final String password;
+
+  String? passwordFor(String sessionEmail) {
+    if (email.trim().toLowerCase() != sessionEmail.trim().toLowerCase()) {
+      return null;
+    }
+    return password;
+  }
+}
+
 class AppDraftController extends AsyncNotifier<AppDraftState> {
+  _TransientOnboardingPassword? _transientOnboardingPassword;
+
   AuthRepository get _authRepository => ref.read(authRepositoryProvider);
   ProfileRepository get _profileRepository =>
       ref.read(profileRepositoryProvider);
@@ -153,6 +172,7 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
   }
 
   Future<void> signInWithMockProvider(String provider) async {
+    _transientOnboardingPassword = null;
     final session = await _authRepository.signInWithMockProvider(provider);
     await _replaceSession(session);
   }
@@ -165,10 +185,15 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       email: email,
       password: password,
     );
+    _transientOnboardingPassword = _TransientOnboardingPassword(
+      email: email,
+      password: password,
+    );
     await _replaceSession(session);
   }
 
   Future<void> signOut() async {
+    _transientOnboardingPassword = null;
     await _authRepository.signOut();
     ref.read(authSessionProvider.notifier).state = null;
     ref.read(isAuthenticatedProvider.notifier).state = false;
@@ -1260,12 +1285,58 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     );
   }
 
+  AtlasOnboardingAccount _atlasOnboardingAccount({
+    required AuthSession? session,
+    required UserProfile profile,
+  }) {
+    final email = session?.email.trim() ?? '';
+    final password = _transientOnboardingPassword?.passwordFor(email);
+    if (email.isEmpty || password == null || password.isEmpty) {
+      // /atlas/onboard currently requires a password even though live requests
+      // already use an authenticated Supabase/FastAPI bearer session.
+      if (kDebugMode) {
+        debugPrint(
+          'Atlas onboarding blocked: required account credential is missing. '
+          'password_missing=${password == null || password.isEmpty} '
+          'email_missing=${email.isEmpty}. No secret values logged.',
+        );
+      }
+      throw const AtlasOnboardingCredentialException(
+        'Your setup is saved on this device. Jim will sync it when the coaching service is available.',
+      );
+    }
+    return AtlasOnboardingAccount(
+      username: _atlasUsername(session: session!, profile: profile),
+      email: email,
+      password: password,
+    );
+  }
+
+  String _atlasUsername({
+    required AuthSession session,
+    required UserProfile profile,
+  }) {
+    for (final candidate in [
+      profile.name,
+      session.displayName,
+      session.email.split('@').first,
+    ]) {
+      final trimmed = candidate.trim();
+      if (trimmed.isNotEmpty && trimmed != 'JimBro User') {
+        return trimmed;
+      }
+    }
+    return session.email.trim();
+  }
+
   Future<ProfileSyncResult> _syncOnboardingProfile({
     required AppDraftState current,
     required UserProfile profile,
     required OnboardingAnswersDto answers,
   }) async {
-    if (current.session == null || current.session?.provider == 'mock') {
+    if (current.session == null ||
+        current.session?.provider == 'mock' ||
+        _profileRepository is MockProfileRepository) {
       final saved = await _profileRepository.saveProfile(
         current.session,
         profile,
@@ -1278,32 +1349,56 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       return ProfileSyncResult(profile: saved, metrics: savedMetrics);
     }
 
+    var canonicalProfile = profile;
     try {
+      canonicalProfile = await _profileRepository.saveProfile(
+        current.session,
+        profile,
+      );
+    } on AuthSessionExpiredException {
+      rethrow;
+    } on Exception catch (error) {
+      if (kDebugMode) {
+        debugPrint(
+          'Atlas onboarding profile pre-save unavailable; keeping local canonical profile. '
+          'error_type=${error.runtimeType}. No secret values logged.',
+        );
+      }
+    }
+
+    try {
+      final account = _atlasOnboardingAccount(
+        session: current.session,
+        profile: canonicalProfile,
+      );
       final metrics = await _runProtectedAction(
         () => _profileRepository.submitAtlasOnboarding(
           current.session,
-          profile,
+          canonicalProfile,
           answers,
+          account,
         ),
       );
-      return ProfileSyncResult(profile: profile, metrics: metrics);
+      return ProfileSyncResult(profile: canonicalProfile, metrics: metrics);
+    } on AtlasOnboardingCredentialException catch (error) {
+      return _fallbackProfileSync(canonicalProfile, error.message);
     } on AtlasProfileSyncException catch (error) {
-      return _fallbackProfileSync(profile, error.message);
+      return _fallbackProfileSync(canonicalProfile, error.message);
     } on DioException catch (error) {
       if (!_isRecoverableStartupFailure(error)) {
         rethrow;
       }
       return _fallbackProfileSync(
-        profile,
-        'Atlas is unavailable right now, so Jim kept local estimates. Try saving your profile again later.',
+        canonicalProfile,
+        'Your setup is saved on this device. Jim will sync it when the coaching service is available.',
       );
     } on AuthSessionExpiredException {
       rethrow;
     } on Exception catch (error) {
       return _fallbackProfileSync(
-        profile,
-        'Atlas could not refresh metrics yet. Jim kept local estimates.\n'
-        '${kDebugMode ? error.toString() : ''}',
+        canonicalProfile,
+        'Your setup is saved on this device. Jim will sync it when the coaching service is available.'
+        '${kDebugMode ? '\nAtlas sync detail: ${error.runtimeType}' : ''}',
       );
     }
   }

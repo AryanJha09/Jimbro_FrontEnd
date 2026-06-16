@@ -450,7 +450,11 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
         return;
       }
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not save profile: $error')),
+        const SnackBar(
+          content: Text(
+            'Could not save profile. Your latest edits are still here.',
+          ),
+        ),
       );
     } finally {
       if (mounted) {

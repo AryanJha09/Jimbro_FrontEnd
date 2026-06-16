@@ -99,6 +99,7 @@ JIMBRO_SMOKE_BEARER_TOKEN='<supabase-or-fastapi-jwt>' dart run tool/live_smoke_c
 ```
 
 The helper prints endpoint status codes and response key names only. It does not print tokens, `.env` values, or response bodies. Protected checks are skipped when `JIMBRO_SMOKE_BEARER_TOKEN` is absent.
+Its reachability check uses the service origin root; protected application endpoints still use `FASTAPI_BASE_URL` under `/api/v1`.
 
 ## Native Notifications
 

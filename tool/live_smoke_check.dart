@@ -20,7 +20,7 @@ Future<void> main() async {
 
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
   final checks = <_SmokeCheck>[
-    const _SmokeCheck('health', '/health', protected: false),
+    const _SmokeCheck('service root', '/', protected: false, useOrigin: true),
     const _SmokeCheck('auth/me', '/auth/me'),
     const _SmokeCheck('atlas metrics', '/atlas/metrics'),
     _SmokeCheck('food summary', '/food-log/summary/${_todayIso()}'),
@@ -39,6 +39,7 @@ Future<void> main() async {
         baseUrl,
         check.path,
         bearerToken: check.protected ? token : null,
+        useOrigin: check.useOrigin,
       );
       stdout.writeln(
         '${check.name}: status=${result.statusCode} keys=${result.keys}',
@@ -116,8 +117,11 @@ Future<_SmokeResult> _get(
   String baseUrl,
   String path, {
   String? bearerToken,
+  bool useOrigin = false,
 }) async {
-  final request = await client.getUrl(Uri.parse('${_trimSlash(baseUrl)}$path'));
+  final request = await client.getUrl(
+    Uri.parse('${useOrigin ? _origin(baseUrl) : _trimSlash(baseUrl)}$path'),
+  );
   request.headers.set(HttpHeaders.acceptHeader, 'application/json');
   if (bearerToken != null && bearerToken.trim().isNotEmpty) {
     request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $bearerToken');
@@ -147,6 +151,11 @@ List<String> _jsonKeys(String body) {
 String _trimSlash(String value) =>
     value.endsWith('/') ? value.substring(0, value.length - 1) : value;
 
+String _origin(String value) {
+  final uri = Uri.parse(value);
+  return '${uri.scheme}://${uri.authority}';
+}
+
 String _todayIso() {
   final now = DateTime.now();
   return '${now.year.toString().padLeft(4, '0')}-'
@@ -159,11 +168,13 @@ class _SmokeCheck {
     this.name,
     this.path, {
     this.protected = true,
+    this.useOrigin = false,
   });
 
   final String name;
   final String path;
   final bool protected;
+  final bool useOrigin;
 }
 
 class _SmokeResult {

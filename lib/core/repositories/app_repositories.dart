@@ -43,6 +43,27 @@ class AtlasProfileSyncException implements Exception {
   String toString() => message;
 }
 
+class AtlasOnboardingCredentialException implements Exception {
+  const AtlasOnboardingCredentialException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+class AtlasOnboardingAccount {
+  const AtlasOnboardingAccount({
+    required this.username,
+    required this.email,
+    required this.password,
+  });
+
+  final String username;
+  final String email;
+  final String password;
+}
+
 abstract class ProfileRepository {
   Future<UserProfile> loadProfile(AuthSession? session);
   Future<UserStaticMetrics> loadMetrics(AuthSession? session);
@@ -55,6 +76,7 @@ abstract class ProfileRepository {
     AuthSession? session,
     UserProfile profile,
     OnboardingAnswersDto answers,
+    AtlasOnboardingAccount? account,
   );
   Future<UserStaticMetrics> loadAtlasMetrics(AuthSession? session);
   Future<UserStaticMetrics> patchAtlasProfile(
@@ -449,6 +471,7 @@ class MockProfileRepository implements ProfileRepository {
     AuthSession? session,
     UserProfile profile,
     OnboardingAnswersDto answers,
+    AtlasOnboardingAccount? account,
   ) async {
     _profile = profile;
     _metrics = _localMetricsForProfile(profile);
@@ -638,13 +661,25 @@ class FastApiProfileRepository implements ProfileRepository {
     AuthSession? session,
     UserProfile profile,
     OnboardingAnswersDto answers,
+    AtlasOnboardingAccount? account,
   ) async {
     if (session == null) {
-      return _fallback.submitAtlasOnboarding(session, profile, answers);
+      return _fallback.submitAtlasOnboarding(
+        session,
+        profile,
+        answers,
+        account,
+      );
+    }
+    if (account == null) {
+      throw const AtlasOnboardingCredentialException(
+        'Your setup is saved on this device. Jim will sync it when the coaching service is available.',
+      );
     }
     final payload = atlasOnboardingPayloadFromProfile(
       profile,
       answers: answers,
+      account: account,
     );
     _validateAtlasPayloadCanSync(payload);
     final response = await _requestWithSessionRetry(
@@ -3161,8 +3196,12 @@ bool _routeLooksUnsupported(Response<dynamic>? response) {
 Map<String, Object?> atlasOnboardingPayloadFromProfile(
   UserProfile profile, {
   required OnboardingAnswersDto answers,
+  required AtlasOnboardingAccount account,
 }) {
   final payload = <String, Object?>{
+    'username': account.username,
+    'email': account.email,
+    'password': account.password,
     'age': answers.age ?? profile.age,
     'height_cm': answers.heightCm ?? profile.heightCm,
     'weight_kg': answers.weightKg ?? profile.weightKg,
@@ -3180,8 +3219,7 @@ Map<String, Object?> atlasOnboardingPayloadFromProfile(
     'equipment_access': _atlasEquipmentAccess(
       answers.trainingPreference?.wireValue ?? profile.trainingPreference,
     ),
-    'constraints': _atlasConstraints(answers),
-    'generate_program': true,
+    'constraints_json': _atlasConstraints(answers),
   };
   final sex = _atlasSex(answers.sex?.wireValue ?? profile.sex);
   if (sex != null) {
@@ -3242,6 +3280,14 @@ Map<String, Object?> atlasProfilePatchPayload({
 }
 
 void _validateAtlasPayloadCanSync(Map<String, Object?> payload) {
+  for (final key in const ['username', 'email', 'password']) {
+    final value = payload[key]?.toString().trim();
+    if (value == null || value.isEmpty) {
+      throw const AtlasOnboardingCredentialException(
+        'Your setup is saved on this device. Jim will sync it when the coaching service is available.',
+      );
+    }
+  }
   final sex = payload['sex'];
   if (sex == null) {
     throw const AtlasProfileSyncException(
