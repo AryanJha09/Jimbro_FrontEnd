@@ -99,6 +99,35 @@ void main() {
     expect(adapter.paths.first, '/agent/context');
   });
 
+  test('agent context 500 is recoverable and returns an empty snapshot',
+      () async {
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://api.example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = _UnavailableContextAdapter();
+
+    final snapshot = await FastApiAgentContextRepository(dio).load(_session);
+
+    expect(snapshot.hasLiveData, isFalse);
+    expect(snapshot.usedFallbackEndpoints, isTrue);
+  });
+
+  test('agent context with null static metrics remains usable', () {
+    final snapshot = agentContextFromBackend({
+      'data': {
+        'user_profile': {'username': 'Live Athlete'},
+        'static_metrics': null,
+        'active_template': {'template_id': 9, 'name': 'Upper A'},
+      },
+    });
+
+    expect(snapshot.userProfile?.name, 'Live Athlete');
+    expect(snapshot.atlasMetrics, isNull);
+    expect(snapshot.activeTemplate?.name, 'Upper A');
+  });
+
   testWidgets(
       'Home prefers backend metrics and daily summary without demo copy',
       (tester) async {
@@ -345,6 +374,26 @@ class _ContextFallbackAdapter implements HttpClientAdapter {
     return ResponseBody.fromString(
       jsonEncode(body),
       statusCode,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
+}
+
+class _UnavailableContextAdapter implements HttpClientAdapter {
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<List<int>>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    return ResponseBody.fromString(
+      '{"detail":"temporarily unavailable"}',
+      500,
       headers: {
         Headers.contentTypeHeader: [Headers.jsonContentType],
       },

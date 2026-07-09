@@ -152,6 +152,26 @@ abstract class AgentContextRepository {
   Future<AgentContextSnapshot> load(AuthSession? session);
 }
 
+class ProgramGenerationResult {
+  const ProgramGenerationResult._({
+    required this.isSuccess,
+    this.message,
+  });
+
+  const ProgramGenerationResult.success([String? message])
+      : this._(isSuccess: true, message: message);
+
+  const ProgramGenerationResult.failure(String message)
+      : this._(isSuccess: false, message: message);
+
+  final bool isSuccess;
+  final String? message;
+}
+
+abstract class ProgramRepository {
+  Future<ProgramGenerationResult> generateProgram(AuthSession? session);
+}
+
 abstract class JimChatRepository {
   Future<JimChatResponse> send(
     AuthSession? session, {
@@ -508,6 +528,9 @@ class FastApiProfileRepository implements ProfileRepository {
       return _fallback.loadProfile(session);
     }
     final cached = _profileCache[session.userId];
+    if (cached != null && cached.isFresh) {
+      return cached.value;
+    }
     final response = await _requestWithSessionRetry(
       _dio,
       session,
@@ -539,14 +562,26 @@ class FastApiProfileRepository implements ProfileRepository {
         'actual_response: ${_responseSnippet(response.data) ?? 'empty'}',
       );
     }
+    final backendUpdatedAt = DateTime.tryParse(
+      data['updated_at']?.toString() ?? '',
+    );
+    if (cached != null &&
+        (backendUpdatedAt == null ||
+            !backendUpdatedAt.isAfter(cached.createdAt))) {
+      return cached.value;
+    }
     final profile = UserProfile(
       name: data['username']?.toString() ??
           data['name']?.toString() ??
           session.displayName,
-      goal: data['goal']?.toString() ?? 'Lean muscle gain',
+      goal: _profileGoalLabel(
+        data['goal'] ?? data['fitness_goal'] ?? 'Build muscle',
+      ),
       coachingPreference:
           data['coaching_preference']?.toString() ?? 'Contextual + concise',
-      userLevel: _parseUserLevel(data['user_level']?.toString()),
+      userLevel: _parseUserLevel(
+        (data['user_level'] ?? data['experience_level'])?.toString(),
+      ),
       age: _toInt(data['age'], 0),
       heightCm: _toDouble(data['height_cm'], 0),
       weightKg: _toDouble(data['weight_kg'], 0),
@@ -555,8 +590,10 @@ class FastApiProfileRepository implements ProfileRepository {
         data['available_time_min'] ?? data['available_time_minutes'],
         0,
       ),
-      trainingPreference: data['training_preference']?.toString() ?? '',
-      activityLevel: data['activity_level']?.toString() ?? '',
+      trainingPreference: _profileEquipmentLabel(
+        data['training_preference'] ?? data['equipment_access'],
+      ),
+      activityLevel: _profileActivityLabel(data['activity_level']),
       dietaryPreference: data['dietary_preference']?.toString() ?? '',
       goalTimeframe: data['goal_timeframe']?.toString() ?? '',
       weeksActive: _toInt(data['weeks_active'], 0),
@@ -809,12 +846,15 @@ class MockWorkoutRepository implements WorkoutRepository {
   @override
   Future<List<ExerciseSuggestion>> searchExercises(String query) async {
     final normalized = query.trim().toLowerCase();
-    if (normalized.length < 2) {
+    if (normalized.isEmpty) {
       return const [];
     }
-    return _mockExerciseSuggestions
-        .where((exercise) => exercise.name.toLowerCase().contains(normalized))
-        .toList();
+    return _mockExerciseSuggestions.where((exercise) {
+      final name = exercise.name.toLowerCase();
+      return normalized.length < 3
+          ? name.startsWith(normalized)
+          : name.contains(normalized);
+    }).toList();
   }
 
   @override
@@ -1029,13 +1069,12 @@ class FastApiWorkoutRepository implements WorkoutRepository {
   @override
   Future<List<ExerciseSuggestion>> searchExercises(String query) async {
     final normalized = query.trim().toLowerCase();
-    if (normalized.length < 2) {
+    if (normalized.isEmpty) {
       return const [];
     }
-    final local = _localExerciseSuggestions(normalized);
     final cached = _exerciseSearchCache[normalized];
     if (cached != null && cached.isFresh) {
-      return _mergeExerciseSuggestions(cached.value, local);
+      return cached.value;
     }
     try {
       final response = await _dio.get<dynamic>(
@@ -1043,11 +1082,11 @@ class FastApiWorkoutRepository implements WorkoutRepository {
         queryParameters: {'q': normalized},
       ).timeout(const Duration(milliseconds: 1500));
       if (response.statusCode == null || response.statusCode! >= 400) {
-        return cached?.value ?? local;
+        return cached?.value ?? const [];
       }
       final data = _unwrapData(response.data);
       if (data is! List) {
-        return cached?.value ?? local;
+        return cached?.value ?? const [];
       }
       final suggestions = data
           .map<ExerciseSuggestion?>((item) {
@@ -1074,9 +1113,9 @@ class FastApiWorkoutRepository implements WorkoutRepository {
         suggestions,
         ttl: FrontendCachePolicy.exerciseSearch,
       );
-      return _mergeExerciseSuggestions(suggestions, local);
+      return suggestions;
     } catch (_) {
-      return cached?.value ?? local;
+      return cached?.value ?? const [];
     }
   }
 
@@ -1108,28 +1147,11 @@ class FastApiWorkoutRepository implements WorkoutRepository {
       normalized,
       resolvedExercises,
     );
-    final documentedPayload = workoutTemplateDocumentedPayload(
-      normalized,
-      resolvedExercises,
-    );
-    var response = await _sendWorkoutTemplatePayload(
+    final response = await _sendWorkoutTemplatePayload(
       session,
       normalized.templateId,
       richPayload,
     );
-    if (_shouldRetryDocumentedPayload(response)) {
-      _debugPayloadRetry(
-        route: '/workout-templates',
-        statusCode: response.statusCode,
-        attemptedPayload: richPayload,
-        retryPayload: documentedPayload,
-      );
-      response = await _sendWorkoutTemplatePayload(
-        session,
-        normalized.templateId,
-        documentedPayload,
-      );
-    }
     _throwIfRequestFailed(
       response,
       source:
@@ -1428,37 +1450,16 @@ class FastApiWorkoutRepository implements WorkoutRepository {
       );
     }
     final richPayload = workoutLogRichPayload(normalized, resolvedExercises);
-    final documentedPayload = workoutLogDocumentedPayload(
-      normalized,
-      resolvedExercises,
-    );
     if (normalized.workoutLogId != null) {
-      var response = await _requestWithSessionRetry(
+      final response = await _requestWithSessionRetry(
         _dio,
         session,
         (headers) => _dio.patch<dynamic>(
           '/workout-logs/${normalized.workoutLogId}',
-          data: richPayload,
+          data: workoutLogMetadataPatchPayload(normalized),
           options: Options(headers: headers),
         ),
       );
-      if (_shouldRetryDocumentedPayload(response)) {
-        _debugPayloadRetry(
-          route: '/workout-logs/${normalized.workoutLogId}',
-          statusCode: response.statusCode,
-          attemptedPayload: richPayload,
-          retryPayload: documentedPayload,
-        );
-        response = await _requestWithSessionRetry(
-          _dio,
-          session,
-          (headers) => _dio.patch<dynamic>(
-            '/workout-logs/${normalized.workoutLogId}',
-            data: documentedPayload,
-            options: Options(headers: headers),
-          ),
-        );
-      }
       _throwIfRequestFailed(
         response,
         source:
@@ -1467,7 +1468,7 @@ class FastApiWorkoutRepository implements WorkoutRepository {
       final mapped = _mapWorkoutLog(_unwrapData(response.data));
       return mapped.exercises.isEmpty ? normalized : mapped;
     }
-    var response = await _requestWithSessionRetry(
+    final response = await _requestWithSessionRetry(
       _dio,
       session,
       (headers) => _dio.post<dynamic>(
@@ -1476,23 +1477,6 @@ class FastApiWorkoutRepository implements WorkoutRepository {
         options: Options(headers: headers),
       ),
     );
-    if (_shouldRetryDocumentedPayload(response)) {
-      _debugPayloadRetry(
-        route: '/workout-logs',
-        statusCode: response.statusCode,
-        attemptedPayload: richPayload,
-        retryPayload: documentedPayload,
-      );
-      response = await _requestWithSessionRetry(
-        _dio,
-        session,
-        (headers) => _dio.post<dynamic>(
-          '/workout-logs',
-          data: documentedPayload,
-          options: Options(headers: headers),
-        ),
-      );
-    }
     _throwIfRequestFailed(
       response,
       source:
@@ -1589,7 +1573,7 @@ class MockNutritionRepository implements NutritionRepository {
   @override
   Future<List<FoodSuggestion>> searchFoods(String query) async {
     final normalized = query.trim().toLowerCase();
-    if (normalized.length < 2) {
+    if (normalized.isEmpty) {
       return const [];
     }
     return _localFoodSuggestions(normalized);
@@ -1659,7 +1643,7 @@ class FastApiNutritionRepository implements NutritionRepository {
         session,
         (headers) => _dio.get<dynamic>(
           '/food-log',
-          queryParameters: {'log_date': _todayIso(), 'limit': 100},
+          queryParameters: {'date': _todayIso(), 'limit': 100},
           options: Options(headers: headers),
         ),
       ),
@@ -1734,7 +1718,7 @@ class FastApiNutritionRepository implements NutritionRepository {
   @override
   Future<List<FoodSuggestion>> searchFoods(String query) async {
     final normalized = query.trim().toLowerCase();
-    if (normalized.length < 2) {
+    if (normalized.isEmpty) {
       return const [];
     }
     final cached = _foodSearchCache[normalized];
@@ -1875,10 +1859,7 @@ class FastApiNutritionRepository implements NutritionRepository {
           (headers) => _dio.patch<dynamic>(
             '/food-log/${normalized.foodLogId}',
             data: {
-              'quantity_g': normalized.quantityGrams,
-              'quantity_source': _quantitySourceWire(
-                normalized.quantitySource,
-              ),
+              'quantity_grams': normalized.quantityGrams,
             },
             options: Options(headers: headers),
           ),
@@ -2032,6 +2013,51 @@ class MockAgentContextRepository implements AgentContextRepository {
   }
 }
 
+class MockProgramRepository implements ProgramRepository {
+  @override
+  Future<ProgramGenerationResult> generateProgram(AuthSession? session) async {
+    return const ProgramGenerationResult.success('Mock program generated.');
+  }
+}
+
+class FastApiProgramRepository implements ProgramRepository {
+  FastApiProgramRepository(this._dio);
+
+  final Dio _dio;
+
+  @override
+  Future<ProgramGenerationResult> generateProgram(AuthSession? session) async {
+    if (session == null || session.provider == 'mock') {
+      return const ProgramGenerationResult.success();
+    }
+    try {
+      final response = await _requestWithSessionRetry(
+        _dio,
+        session,
+        (headers) => _dio.post<dynamic>(
+          '/programs/generate',
+          options: Options(headers: headers),
+        ),
+      );
+      if ((response.statusCode ?? 0) >= 200 &&
+          (response.statusCode ?? 0) < 300) {
+        return ProgramGenerationResult.success(
+          _programGenerationMessage(response.data),
+        );
+      }
+      return const ProgramGenerationResult.failure(
+        'Jim could not build your split yet. You can retry or skip for now.',
+      );
+    } on AuthSessionExpiredException {
+      rethrow;
+    } catch (_) {
+      return const ProgramGenerationResult.failure(
+        'Jim could not build your split yet. You can retry or skip for now.',
+      );
+    }
+  }
+}
+
 class FastApiAgentContextRepository implements AgentContextRepository {
   FastApiAgentContextRepository(this._dio);
 
@@ -2046,7 +2072,8 @@ class FastApiAgentContextRepository implements AgentContextRepository {
     final contextResponse = await _get(session, '/agent/context');
     if (contextResponse != null &&
         contextResponse.statusCode != 404 &&
-        contextResponse.statusCode != 405) {
+        contextResponse.statusCode != 405 &&
+        (contextResponse.statusCode ?? 0) < 500) {
       _throwIfRequestFailed(
         contextResponse,
         source:
@@ -2064,6 +2091,9 @@ class FastApiAgentContextRepository implements AgentContextRepository {
       _get(session, '/workout-templates'),
     ]);
     for (final response in responses.whereType<Response<dynamic>>()) {
+      if ((response.statusCode ?? 0) >= 500) {
+        continue;
+      }
       _throwIfRequestFailed(
         response,
         source:
@@ -2224,7 +2254,7 @@ class FastApiJimChatRepository implements JimChatRepository {
     if (body is! ResponseBody) {
       throw Exception('Chat stream returned no event stream.');
     }
-    yield* parseJimChatSse(body.stream);
+    yield* parseJimChatSse(body.stream.map((chunk) => chunk.toList()));
   }
 
   @override
@@ -2271,12 +2301,16 @@ Map<String, Object?> jimChatRequestPayload({
 
 JimChatResponse jimChatResponseFromBackend(dynamic raw) {
   final data = _asMap(_unwrapData(raw));
-  final options = data['clarification_options'];
+  final options = data['options'] ?? data['clarification_options'];
+  final responseType = data['type']?.toString().toLowerCase();
   return JimChatResponse(
     sessionId: data['session_id']?.toString() ?? '',
     message:
-        (data['message'] ?? data['response'] ?? data['text'])?.toString() ?? '',
-    requiresClarification: data['requires_clarification'] == true,
+        (data['reply'] ?? data['message'] ?? data['response'] ?? data['text'])
+                ?.toString() ??
+            '',
+    requiresClarification: data['requires_clarification'] == true ||
+        responseType == 'clarification',
     clarificationPrompt:
         (data['prompt'] ?? data['clarification_prompt'])?.toString(),
     clarificationOptions: options is List
@@ -2316,6 +2350,9 @@ Stream<JimChatStreamEvent> parseJimChatSse(Stream<List<int>> bytes) async* {
       eventName = line.substring(6).trim();
     } else if (line.startsWith('data:')) {
       dataLines.add(line.substring(5).trimLeft());
+    } else {
+      // Some deployments stream plain text or JSON chunks without SSE fields.
+      dataLines.add(line);
     }
   }
   if (dataLines.isNotEmpty) {
@@ -2324,6 +2361,11 @@ Stream<JimChatStreamEvent> parseJimChatSse(Stream<List<int>> bytes) async* {
 }
 
 JimChatStreamEvent _jimChatEventFromSse(String eventName, String rawData) {
+  if (rawData.trim() == '[DONE]') {
+    return JimChatStreamEvent.done(
+      const JimChatResponse(sessionId: '', message: ''),
+    );
+  }
   dynamic decoded;
   try {
     decoded = jsonDecode(rawData);
@@ -2344,7 +2386,13 @@ JimChatStreamEvent _jimChatEventFromSse(String eventName, String rawData) {
     );
   }
   return JimChatStreamEvent.textDelta(
-    (data['text_delta'] ?? data['delta'] ?? data['text'] ?? decoded).toString(),
+    (data['text_delta'] ??
+            data['delta'] ??
+            data['text'] ??
+            data['reply'] ??
+            data['message'] ??
+            decoded)
+        .toString(),
   );
 }
 
@@ -2602,23 +2650,6 @@ const _mockExerciseSuggestions = [
     subtitle: 'Bodyweight • triceps',
   ),
 ];
-
-List<ExerciseSuggestion> _localExerciseSuggestions(String query) {
-  return _mockExerciseSuggestions
-      .where((exercise) => exercise.name.toLowerCase().contains(query))
-      .toList();
-}
-
-List<ExerciseSuggestion> _mergeExerciseSuggestions(
-  List<ExerciseSuggestion> primary,
-  List<ExerciseSuggestion> fallback,
-) {
-  final byId = <int, ExerciseSuggestion>{};
-  for (final suggestion in [...primary, ...fallback]) {
-    byId.putIfAbsent(suggestion.exerciseId, () => suggestion);
-  }
-  return byId.values.toList();
-}
 
 List<FoodSuggestion> _localFoodSuggestions(String query) {
   return _localFoodEstimateSuggestions
@@ -2976,6 +3007,14 @@ final agentContextRepositoryProvider = Provider<AgentContextRepository>((ref) {
   return FastApiAgentContextRepository(ref.watch(dioProvider));
 });
 
+final programRepositoryProvider = Provider<ProgramRepository>((ref) {
+  final config = ref.watch(appConfigProvider);
+  if (!config.useLiveBackend) {
+    return MockProgramRepository();
+  }
+  return FastApiProgramRepository(ref.watch(dioProvider));
+});
+
 final jimChatRepositoryProvider = Provider<JimChatRepository>((ref) {
   final config = ref.watch(appConfigProvider);
   if (!config.useLiveBackend) {
@@ -3198,6 +3237,7 @@ Map<String, Object?> atlasOnboardingPayloadFromProfile(
   required OnboardingAnswersDto answers,
   required AtlasOnboardingAccount account,
 }) {
+  final enums = BackendProfileEnums.fromOnboarding(profile, answers);
   final payload = <String, Object?>{
     'username': account.username,
     'email': account.email,
@@ -3205,20 +3245,12 @@ Map<String, Object?> atlasOnboardingPayloadFromProfile(
     'age': answers.age ?? profile.age,
     'height_cm': answers.heightCm ?? profile.heightCm,
     'weight_kg': answers.weightKg ?? profile.weightKg,
-    'activity_level': _atlasActivityLevel(
-      answers.activityLevel?.wireValue ?? profile.activityLevel,
-    ),
-    'fitness_goal': _atlasFitnessGoal(
-      answers.fitnessGoal?.wireValue ?? profile.goal,
-    ),
-    'experience_level': _atlasExperienceLevel(
-      answers.experienceLevel?.wireValue ?? profile.userLevel.name,
-    ),
+    'activity_level': enums.activityLevel,
+    'fitness_goal': enums.fitnessGoal,
+    'experience_level': enums.experienceLevel,
     'available_time_min':
         answers.availableTimeMin ?? profile.availableTimeMinutes,
-    'equipment_access': _atlasEquipmentAccess(
-      answers.trainingPreference?.wireValue ?? profile.trainingPreference,
-    ),
+    'equipment_access': enums.equipmentAccess,
     'constraints_json': _atlasConstraints(answers),
   };
   final sex = _atlasSex(answers.sex?.wireValue ?? profile.sex);
@@ -3233,6 +3265,8 @@ Map<String, Object?> atlasProfilePatchPayload({
   required UserProfile next,
 }) {
   final payload = <String, Object?>{};
+  final previousEnums = BackendProfileEnums.fromProfile(previous);
+  final nextEnums = BackendProfileEnums.fromProfile(next);
 
   void putIfChanged(String key, Object? previousValue, Object? nextValue) {
     if (nextValue == null) {
@@ -3249,18 +3283,18 @@ Map<String, Object?> atlasProfilePatchPayload({
   putIfChanged('weight_kg', previous.weightKg, next.weightKg);
   putIfChanged(
     'activity_level',
-    _atlasActivityLevel(previous.activityLevel),
-    _atlasActivityLevel(next.activityLevel),
+    previousEnums.activityLevel,
+    nextEnums.activityLevel,
   );
   putIfChanged(
     'fitness_goal',
-    _atlasFitnessGoal(previous.goal),
-    _atlasFitnessGoal(next.goal),
+    previousEnums.fitnessGoal,
+    nextEnums.fitnessGoal,
   );
   putIfChanged(
     'experience_level',
-    previous.userLevel.name,
-    next.userLevel.name,
+    previousEnums.experienceLevel,
+    nextEnums.experienceLevel,
   );
   putIfChanged(
     'available_time_min',
@@ -3269,8 +3303,8 @@ Map<String, Object?> atlasProfilePatchPayload({
   );
   putIfChanged(
     'equipment_access',
-    _atlasEquipmentAccess(previous.trainingPreference),
-    _atlasEquipmentAccess(next.trainingPreference),
+    previousEnums.equipmentAccess,
+    nextEnums.equipmentAccess,
   );
   final nextSex = _atlasSex(next.sex);
   if (nextSex != null && _atlasSex(previous.sex) != nextSex) {
@@ -3307,7 +3341,58 @@ String? _atlasSex(String value) {
   return null;
 }
 
-String _atlasActivityLevel(String value) {
+class BackendProfileEnums {
+  const BackendProfileEnums({
+    required this.fitnessGoal,
+    required this.activityLevel,
+    required this.equipmentAccess,
+    required this.experienceLevel,
+  });
+
+  final String fitnessGoal;
+  final String activityLevel;
+  final String equipmentAccess;
+  final String experienceLevel;
+
+  factory BackendProfileEnums.fromProfile(UserProfile profile) {
+    return BackendProfileEnums.fromValues(
+      goal: profile.goal,
+      activityLevel: profile.activityLevel,
+      equipmentAccess: profile.trainingPreference,
+      experienceLevel: profile.userLevel.name,
+    );
+  }
+
+  factory BackendProfileEnums.fromOnboarding(
+    UserProfile profile,
+    OnboardingAnswersDto answers,
+  ) {
+    return BackendProfileEnums.fromValues(
+      goal: answers.fitnessGoal?.wireValue ?? profile.goal,
+      activityLevel: answers.activityLevel?.wireValue ?? profile.activityLevel,
+      equipmentAccess:
+          answers.trainingPreference?.wireValue ?? profile.trainingPreference,
+      experienceLevel:
+          answers.experienceLevel?.wireValue ?? profile.userLevel.name,
+    );
+  }
+
+  factory BackendProfileEnums.fromValues({
+    required String goal,
+    required String activityLevel,
+    required String equipmentAccess,
+    required String experienceLevel,
+  }) {
+    return BackendProfileEnums(
+      fitnessGoal: _backendFitnessGoal(goal),
+      activityLevel: _backendActivityLevel(activityLevel),
+      equipmentAccess: _backendEquipmentAccess(equipmentAccess),
+      experienceLevel: _backendExperienceLevel(experienceLevel),
+    );
+  }
+}
+
+String _backendActivityLevel(String value) {
   final normalized = _normalizeWire(value);
   if (normalized.contains('mostly_sitting') ||
       normalized.contains('sedentary') ||
@@ -3326,53 +3411,66 @@ String _atlasActivityLevel(String value) {
   return 'moderately_active';
 }
 
-String _atlasFitnessGoal(String value) {
+String _backendFitnessGoal(String value) {
   final normalized = _normalizeWire(value);
+  if (normalized.contains('recomp')) {
+    return 'recomp';
+  }
   if (normalized.contains('lose') ||
       normalized.contains('fat') ||
       normalized.contains('weight')) {
-    return 'lose_weight';
+    return 'lose_fat';
   }
-  if (normalized.contains('strong')) {
-    return 'get_stronger';
+  if (normalized.contains('maintain') || normalized.contains('consistent')) {
+    return 'maintain';
   }
   if (normalized.contains('muscle') || normalized.contains('build')) {
-    return 'build_muscle';
+    return 'gain_muscle';
   }
-  if (normalized.contains('consistent')) {
-    return 'stay_consistent';
+  if (normalized.contains('strong') ||
+      normalized.contains('fit') ||
+      normalized.contains('athletic') ||
+      normalized.contains('performance')) {
+    return 'athletic_performance';
   }
-  return 'feel_fitter';
+  return 'maintain';
 }
 
-String _atlasExperienceLevel(String value) {
+String _backendExperienceLevel(String value) {
   final normalized = _normalizeWire(value);
-  if (normalized.contains('advanced') ||
-      normalized.contains('established') ||
-      normalized.contains('regular')) {
-    return normalized.contains('advanced') ? 'advanced' : 'intermediate';
+  if (normalized.contains('advanced_beginner') ||
+      normalized.contains('inconsistent')) {
+    return 'advanced_beginner';
   }
-  if (normalized.contains('intermediate')) {
+  if (normalized.contains('expert') ||
+      normalized.contains('advanced') ||
+      normalized.contains('established')) {
+    return 'expert';
+  }
+  if (normalized.contains('intermediate') || normalized.contains('regular')) {
     return 'intermediate';
   }
-  return 'beginner';
+  return 'novice';
 }
 
-String _atlasEquipmentAccess(String value) {
+String _backendEquipmentAccess(String value) {
   final normalized = _normalizeWire(value);
-  if (normalized.contains('gym')) {
-    return 'gym';
-  }
   if (normalized.contains('bodyweight')) {
-    return 'bodyweight';
+    return 'bodyweight_only';
+  }
+  if (normalized.contains('dumbbell') ||
+      normalized.contains('mixed') ||
+      normalized.contains('flexible') ||
+      normalized.contains('unsure')) {
+    return 'dumbbells_bench';
   }
   if (normalized.contains('home')) {
-    return 'home';
+    return 'home_gym';
   }
-  if (normalized.contains('mixed') || normalized.contains('flexible')) {
-    return 'mixed';
+  if (normalized.contains('gym')) {
+    return 'full_gym';
   }
-  return 'unsure';
+  return 'bodyweight_only';
 }
 
 List<String> _atlasConstraints(OnboardingAnswersDto answers) {
@@ -3583,6 +3681,25 @@ dynamic _unwrapData(dynamic raw) {
   return raw;
 }
 
+String? _programGenerationMessage(dynamic raw) {
+  if (raw == null) {
+    return null;
+  }
+  if (raw is String) {
+    final value = raw.trim();
+    return value.isEmpty ? null : value;
+  }
+  final unwrapped = _unwrapData(raw);
+  if (unwrapped is String) {
+    final value = unwrapped.trim();
+    return value.isEmpty ? null : value;
+  }
+  final map = _asMap(unwrapped).isEmpty ? _asMap(raw) : _asMap(unwrapped);
+  final message =
+      (map['message'] ?? map['status'] ?? map['result'])?.toString().trim();
+  return message == null || message.isEmpty ? null : message;
+}
+
 String _extractErrorMessage(
   dynamic body, {
   int? statusCode,
@@ -3733,18 +3850,7 @@ Map<String, Object?> workoutTemplateRichPayload(
         return {
           'exercise_id': exercise.exerciseId,
           'order_index': entry.key + 1,
-          'target_sets': exercise.targetSets,
-          'target_reps': exercise.targetReps,
           'notes': exercise.notes.isEmpty ? null : exercise.notes,
-          if (exercise.sets.isNotEmpty)
-            'sets': exercise.sets.map((setDraft) {
-              return {
-                'set_number': setDraft.setNumber,
-                'reps': setDraft.reps,
-                'weight_kg': setDraft.weightKg,
-                if (setDraft.rpe > 0) 'rpe': setDraft.rpe,
-              };
-            }).toList(),
         };
       }).toList(),
     },
@@ -3757,30 +3863,18 @@ Map<String, Object?> workoutTemplateDocumentedPayload(
 ) {
   return ApiRequestDto(
     name: 'workout_template_documented',
-    requiredFields: const ['name', 'days'],
+    requiredFields: const ['name', 'exercises'],
     payload: {
       'name': template.name,
       'description': template.description.isEmpty ? null : template.description,
-      'days': [
-        {
-          'day_label': 'Day 1',
-          'exercises': exercises.map((exercise) {
-            final firstSet = exercise.sets.isEmpty ? null : exercise.sets.first;
-            final plannedSets = exercise.sets.isNotEmpty
-                ? exercise.sets.length
-                : exercise.targetSets;
-            final plannedReps = firstSet != null && firstSet.reps > 0
-                ? firstSet.reps
-                : exercise.targetReps;
-            return {
-              'exercise_id': exercise.exerciseId,
-              'sets': plannedSets <= 0 ? 1 : plannedSets,
-              'reps': plannedReps <= 0 ? 1 : plannedReps,
-              'notes': exercise.notes.isEmpty ? null : exercise.notes,
-            };
-          }).toList(),
-        },
-      ],
+      'exercises': exercises.asMap().entries.map((entry) {
+        final exercise = entry.value;
+        return {
+          'exercise_id': exercise.exerciseId,
+          'order_index': entry.key + 1,
+          'notes': exercise.notes.isEmpty ? null : exercise.notes,
+        };
+      }).toList(),
     },
   ).toJson();
 }
@@ -3789,7 +3883,6 @@ Map<String, Object?> workoutLogRichPayload(
   WorkoutLogDraft log,
   List<WorkoutExerciseDraft> exercises,
 ) {
-  final timing = _workoutTiming(log);
   final workoutExercises = exercises.asMap().entries.map((entry) {
     final exercise = entry.value;
     if (exercise.sets.isEmpty) {
@@ -3814,20 +3907,11 @@ Map<String, Object?> workoutLogRichPayload(
   }).toList();
   return ApiRequestDto(
     name: 'workout_log_rich',
-    requiredFields: const [
-      'name',
-      'started_at',
-      'ended_at',
-      'workout_exercises',
-    ],
+    requiredFields: const ['name', 'exercises'],
     payload: {
       'name': log.name,
       'template_id': log.templateId,
       'notes': log.notes.isEmpty ? null : log.notes,
-      'started_at': timing.startedAt.toIso8601String(),
-      'ended_at': timing.endedAt.toIso8601String(),
-      'duration_minutes': timing.durationMinutes,
-      'workout_exercises': workoutExercises,
       'exercises': workoutExercises,
     },
   ).toJson();
@@ -3837,24 +3921,25 @@ Map<String, Object?> workoutLogDocumentedPayload(
   WorkoutLogDraft log,
   List<WorkoutExerciseDraft> exercises,
 ) {
-  final timing = _workoutTiming(log);
   return ApiRequestDto(
     name: 'workout_log_documented',
-    requiredFields: const ['workout_name', 'date', 'exercises'],
+    requiredFields: const ['name', 'exercises'],
     payload: {
-      'workout_name': log.name,
-      'date': _formatDate(timing.startedAt),
-      'duration_min': timing.durationMinutes,
+      'name': log.name,
+      'template_id': log.templateId,
       'notes': log.notes.isEmpty ? null : log.notes,
-      'exercises': exercises.map((exercise) {
+      'exercises': exercises.asMap().entries.map((entry) {
+        final exercise = entry.value;
         return {
           'exercise_id': exercise.exerciseId,
+          'order_index': entry.key + 1,
           'sets': exercise.sets.map((setDraft) {
             return {
               'set_number': setDraft.setNumber,
               'reps': setDraft.reps,
               'weight_kg': setDraft.weightKg,
               'is_warmup': setDraft.isWarmup,
+              'rpe': setDraft.rpe,
             };
           }).toList(),
         };
@@ -3863,53 +3948,10 @@ Map<String, Object?> workoutLogDocumentedPayload(
   ).toJson();
 }
 
-bool _shouldRetryDocumentedPayload(Response<dynamic> response) {
-  final statusCode = response.statusCode ?? 0;
-  return statusCode == 400 || statusCode == 422;
-}
-
-void _debugPayloadRetry({
-  required String route,
-  required int? statusCode,
-  required Map<String, Object?> attemptedPayload,
-  required Map<String, Object?> retryPayload,
-}) {
-  if (!kDebugMode) {
-    return;
-  }
-  debugPrint(
-    'JimBro backend payload retry route=$route status=${statusCode ?? 'unknown'} '
-    'attempted_keys=${attemptedPayload.keys.join(',')} '
-    'retry_keys=${retryPayload.keys.join(',')}',
-  );
-}
-
-_WorkoutTiming _workoutTiming(WorkoutLogDraft log) {
-  final now = DateTime.now();
-  final startedAt = DateTime.tryParse(log.startedAtLabel) ?? now;
-  var endedAt = DateTime.tryParse(log.endedAtLabel) ?? now;
-  if (endedAt.isBefore(startedAt)) {
-    endedAt = startedAt;
-  }
-  final duration = endedAt.difference(startedAt).inMinutes;
-  return _WorkoutTiming(
-    startedAt: startedAt,
-    endedAt: endedAt,
-    durationMinutes: duration < 0 ? 0 : duration,
-  );
-}
-
-class _WorkoutTiming {
-  const _WorkoutTiming({
-    required this.startedAt,
-    required this.endedAt,
-    required this.durationMinutes,
-  });
-
-  final DateTime startedAt;
-  final DateTime endedAt;
-  final int durationMinutes;
-}
+Map<String, Object?> workoutLogMetadataPatchPayload(WorkoutLogDraft log) => {
+      'name': log.name,
+      'notes': log.notes.isEmpty ? null : log.notes,
+    };
 
 class ApiRequestDto {
   const ApiRequestDto({
@@ -3944,6 +3986,7 @@ class ApiRequestDto {
 }
 
 Map<String, Object?> profileBackendPayload(UserProfile profile) {
+  final enums = BackendProfileEnums.fromProfile(profile);
   return ApiRequestDto(
     name: 'profile',
     requiredFields: const ['username'],
@@ -3953,19 +3996,48 @@ Map<String, Object?> profileBackendPayload(UserProfile profile) {
       'sex': profile.sex,
       'height_cm': profile.heightCm,
       'weight_kg': profile.weightKg,
-      'fitness_goal': profile.goal,
-      'goal': profile.goal,
-      'activity_level': profile.activityLevel,
-      'experience_level': profile.userLevel.name,
-      'user_level': profile.userLevel.name,
+      'fitness_goal': enums.fitnessGoal,
+      'activity_level': enums.activityLevel,
+      'experience_level': enums.experienceLevel,
       'dietary_preference': profile.dietaryPreference,
       'available_time_min': profile.availableTimeMinutes,
-      'training_preference': profile.trainingPreference,
+      'equipment_access': enums.equipmentAccess,
       'coaching_preference': profile.coachingPreference,
       'goal_timeframe': profile.goalTimeframe,
       'prefers_voice_logging': profile.prefersVoiceLogging,
     },
   ).toJson();
+}
+
+String _profileGoalLabel(Object? raw) {
+  return switch (_normalizeWire(raw?.toString() ?? '')) {
+    'lose_fat' || 'lose_weight' => 'Lose fat',
+    'gain_muscle' || 'build_muscle' => 'Build muscle',
+    'athletic_performance' || 'get_stronger' => 'Get stronger',
+    'maintain' || 'stay_consistent' => 'Stay consistent',
+    'recomp' => 'Recomp',
+    _ => raw?.toString() ?? '',
+  };
+}
+
+String _profileActivityLabel(Object? raw) {
+  return switch (_normalizeWire(raw?.toString() ?? '')) {
+    'sedentary' || 'mostly_sitting' => 'Mostly sitting',
+    'lightly_active' => 'Lightly active',
+    'moderately_active' || 'changes_a_lot' => 'Moderately active',
+    'very_active' => 'Very active',
+    _ => raw?.toString() ?? '',
+  };
+}
+
+String _profileEquipmentLabel(Object? raw) {
+  return switch (_normalizeWire(raw?.toString() ?? '')) {
+    'full_gym' || 'gym' => 'Gym workouts',
+    'home_gym' || 'home' => 'Home workouts',
+    'dumbbells_bench' || 'mixed' => 'A flexible mix',
+    'bodyweight_only' || 'bodyweight' => 'Bodyweight',
+    _ => raw?.toString() ?? '',
+  };
 }
 
 Map<String, dynamic> workoutLogDraftToJson(WorkoutLogDraft log) {
@@ -4049,14 +4121,14 @@ Map<String, dynamic> foodLogDraftToJson(FoodLogDraft log) {
   return {
     'food_log_id': log.foodLogId,
     'food_id': log.foodId,
-    'log_date': log.logDate?.toIso8601String(),
+    'date': log.logDate?.toIso8601String(),
     'quantity_source': _quantitySourceWire(log.quantitySource),
     'calories_per_100g': log.caloriesPer100g,
     'protein_per_100g': log.proteinPer100g,
     'carbs_per_100g': log.carbsPer100g,
     'fat_per_100g': log.fatPer100g,
     'food_name': log.foodName,
-    'quantity_g': log.quantityGrams,
+    'quantity_grams': log.quantityGrams,
     'meal_type': _mealTypeWire(log.mealType),
     'calories': log.calories,
     'protein': log.protein,
@@ -4070,14 +4142,20 @@ FoodLogDraft foodLogDraftFromJson(dynamic raw) {
   return FoodLogDraft(
     foodLogId: map['food_log_id']?.toString(),
     foodId: map['food_id']?.toString(),
-    logDate: DateTime.tryParse(map['log_date']?.toString() ?? ''),
+    logDate: DateTime.tryParse(
+      (map['date'] ?? map['log_date'])?.toString() ?? '',
+    ),
     quantitySource: _parseQuantitySource(map['quantity_source']?.toString()),
     caloriesPer100g: _nullableNutritionDouble(map['calories_per_100g']),
     proteinPer100g: _nullableNutritionDouble(map['protein_per_100g']),
     carbsPer100g: _nullableNutritionDouble(map['carbs_per_100g']),
     fatPer100g: _nullableNutritionDouble(map['fat_per_100g']),
     foodName: map['food_name']?.toString() ?? '',
-    quantityGrams: _toNutritionDouble(map['quantity_g'], 100, max: 50000),
+    quantityGrams: _toNutritionDouble(
+      map['quantity_grams'] ?? map['quantity_g'],
+      100,
+      max: 50000,
+    ),
     mealType: _parseMealType(map['meal_type']?.toString()),
     calories: _toNutritionDouble(map['calories'], 0, max: 20000),
     protein: _toNutritionDouble(map['protein'], 0, max: 1000),
@@ -4141,17 +4219,15 @@ Map<String, Object?> foodLogBackendPayload(
     name: 'food_log',
     requiredFields: const [
       'food_id',
-      'quantity_g',
+      'quantity_grams',
       'meal_type',
-      'log_date',
-      'quantity_source',
+      'date',
     ],
     payload: {
       'food_id': foodId,
-      'quantity_g': log.quantityGrams,
+      'quantity_grams': log.quantityGrams,
       'meal_type': _mealTypeWire(log.mealType),
-      'log_date': date,
-      'quantity_source': _quantitySourceWire(log.quantitySource),
+      'date': date,
     },
   ).toJson();
 }
@@ -4216,7 +4292,8 @@ DailyNutritionSummary dailyNutritionSummaryFromBackend(
 AgentContextSnapshot agentContextFromBackend(dynamic raw) {
   final root = _asMap(_unwrapData(raw));
   final profileData = _asMap(root['user_profile'] ?? root['profile']);
-  final metricsData = root['atlas_metrics'] ?? root['metrics'];
+  final metricsData =
+      root['atlas_metrics'] ?? root['static_metrics'] ?? root['metrics'];
   final templateData = root['active_template'] ?? root['workout_template'];
   final recentData = root['recent_workouts'] ?? root['workout_logs'];
   final trendsData = root['workout_trends'] ?? root['trends'];
@@ -4458,8 +4535,8 @@ Map<String, dynamic> _decodeJwtPayload(String token) {
 
 UserLevel _parseUserLevel(String? raw) {
   return switch (raw) {
-    'beginner' => UserLevel.beginner,
-    'advanced' => UserLevel.advanced,
+    'novice' || 'advanced_beginner' || 'beginner' => UserLevel.beginner,
+    'expert' || 'advanced' => UserLevel.advanced,
     _ => UserLevel.intermediate,
   };
 }

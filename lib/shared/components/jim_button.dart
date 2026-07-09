@@ -23,10 +23,12 @@ class JimPrimaryButton extends StatelessWidget {
       style: FilledButton.styleFrom(
         backgroundColor: JimColors.accentStrong,
         foregroundColor: Colors.white,
+        minimumSize: const Size(0, 52),
         padding: const EdgeInsets.symmetric(
           horizontal: JimSpacing.lg,
-          vertical: 17,
+          vertical: 15,
         ),
+        textStyle: Theme.of(context).textTheme.labelLarge,
         side: BorderSide.none,
         elevation: 0,
         shape: RoundedRectangleBorder(
@@ -69,11 +71,13 @@ class JimSecondaryButton extends StatelessWidget {
       style: OutlinedButton.styleFrom(
         foregroundColor: JimColors.accent,
         side: const BorderSide(color: JimColors.accentLine),
+        minimumSize: const Size(0, 52),
         padding: const EdgeInsets.symmetric(
           horizontal: JimSpacing.lg,
-          vertical: 17,
+          vertical: 15,
         ),
         backgroundColor: JimColors.plaque,
+        textStyle: Theme.of(context).textTheme.labelLarge,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(JimRadius.pill),
         ),

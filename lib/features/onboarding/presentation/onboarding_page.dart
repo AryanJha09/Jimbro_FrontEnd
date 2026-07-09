@@ -7,6 +7,7 @@ import '../../../core/repositories/app_repositories.dart';
 import '../../../core/theme/jim_tokens.dart';
 import '../../../shared/components/backend_state_view.dart';
 import '../../../shared/components/jim_companion.dart';
+import '../../../shared/components/jim_button.dart';
 import '../../../shared/components/jim_surface.dart';
 import '../../../shared/models/app_models.dart';
 import '../../../shared/models/onboarding_models.dart';
@@ -143,6 +144,8 @@ class _InMemoryOnboardingPersistenceStore
 
 class _OnboardingPageState extends ConsumerState<OnboardingPage> {
   bool _isFinishing = false;
+  bool _showProgramChoice = false;
+  String? _programGenerationError;
 
   @override
   Widget build(BuildContext context) {
@@ -172,6 +175,14 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
         final draft = draftAsync.valueOrNull;
         if (draft == null) {
           return const BackendLoadingView(message: 'Loading your profile...');
+        }
+        if (_showProgramChoice) {
+          return _ProgramGenerationChoiceScreen(
+            status: draft.programGenerationStatus,
+            errorMessage: _programGenerationError,
+            onGenerate: _handleGenerateProgram,
+            onSkip: _handleSkipProgramGeneration,
+          );
         }
         return _OnboardingScaffold(
           onboarding: onboarding,
@@ -248,7 +259,12 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
       if (kDebugMode) {
         ref.read(forceShowOnboardingProvider.notifier).state = false;
       }
-      ref.read(hasCompletedOnboardingProvider.notifier).state = true;
+      if (mounted) {
+        setState(() {
+          _showProgramChoice = true;
+          _programGenerationError = null;
+        });
+      }
       final warning = syncResult?.warning;
       if (warning != null && warning.isNotEmpty && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -282,6 +298,40 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
     }
   }
 
+  Future<void> _handleGenerateProgram() async {
+    final draft = ref.read(appDraftProvider).valueOrNull;
+    if (draft?.programGenerationStatus == ProgramGenerationStatus.generating) {
+      return;
+    }
+    setState(() => _programGenerationError = null);
+    final result = await ref
+        .read(appDraftProvider.notifier)
+        .generateProgramAfterOnboarding();
+    if (!mounted) {
+      return;
+    }
+    if (result.isSuccess) {
+      await ref.read(onboardingControllerProvider.notifier).complete();
+      ref.read(hasCompletedOnboardingProvider.notifier).state = true;
+      return;
+    }
+    setState(() {
+      _programGenerationError =
+          'Your profile is saved. Jim couldn’t build the split yet.';
+    });
+  }
+
+  Future<void> _handleSkipProgramGeneration() async {
+    await ref
+        .read(appDraftProvider.notifier)
+        .skipProgramGenerationAfterOnboarding();
+    if (!mounted) {
+      return;
+    }
+    await ref.read(onboardingControllerProvider.notifier).complete();
+    ref.read(hasCompletedOnboardingProvider.notifier).state = true;
+  }
+
   String _resolvedProfileName(AppDraftState draft) {
     final existing = draft.profile.name.trim();
     if (existing.isNotEmpty && existing != 'JimBro User') {
@@ -292,6 +342,117 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
       return sessionName;
     }
     return 'JimBro User';
+  }
+}
+
+class _ProgramGenerationChoiceScreen extends StatelessWidget {
+  const _ProgramGenerationChoiceScreen({
+    required this.status,
+    required this.errorMessage,
+    required this.onGenerate,
+    required this.onSkip,
+  });
+
+  final ProgramGenerationStatus status;
+  final String? errorMessage;
+  final VoidCallback onGenerate;
+  final VoidCallback onSkip;
+
+  bool get _isGenerating => status == ProgramGenerationStatus.generating;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            JimColors.shell,
+            JimColors.galleryWhite,
+            JimColors.eggshell,
+          ],
+        ),
+      ),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          const Positioned.fill(child: JimLightTexture()),
+          SafeArea(
+            child: Center(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(24),
+                child: JimSurface(
+                  tone: errorMessage == null
+                      ? JimSurfaceTone.accent
+                      : JimSurfaceTone.warning,
+                  radius: JimRadius.xl,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Center(
+                        child: JimCompanionAvatar(
+                          stage: _isGenerating
+                              ? JimCompanionStage.activeBase
+                              : JimCompanionStage.softBase,
+                          size: 104,
+                          showLabel: false,
+                        ),
+                      ),
+                      const SizedBox(height: 22),
+                      Text(
+                        _isGenerating
+                            ? 'Building your week…'
+                            : 'Want Jim to generate your weekly workout split?',
+                        key: const ValueKey('program-generation-title'),
+                        style: theme.textTheme.displaySmall?.copyWith(
+                          height: 1.08,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        errorMessage ??
+                            'Your profile is saved. Jim can use it to draft a practical weekly training rhythm now, or you can skip and start from Home.',
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: JimColors.inkSoft,
+                          height: 1.45,
+                        ),
+                      ),
+                      if (_isGenerating) ...[
+                        const SizedBox(height: 24),
+                        const Center(
+                          child: CircularProgressIndicator(strokeWidth: 2.4),
+                        ),
+                      ] else ...[
+                        const SizedBox(height: 24),
+                        JimPrimaryButton(
+                          key: const ValueKey('generate-program-button'),
+                          label: errorMessage == null
+                              ? 'Generate my split'
+                              : 'Retry',
+                          onPressed: onGenerate,
+                          icon: Icons.auto_awesome_rounded,
+                          expand: true,
+                        ),
+                        const SizedBox(height: 10),
+                        JimSecondaryButton(
+                          key: const ValueKey('skip-program-button'),
+                          label: 'Skip for now',
+                          onPressed: onSkip,
+                          expand: true,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 

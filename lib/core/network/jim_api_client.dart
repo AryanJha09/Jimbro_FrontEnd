@@ -40,8 +40,8 @@ class DevSafeApiLogInterceptor extends Interceptor {
   void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
     debugPrint(
       'JimBro API -> ${options.method} ${options.path} '
-      'query=${_redactMap(options.queryParameters)} '
-      'payload=${_redactValue(options.data)}',
+      'queryKeys=${_mapKeys(options.queryParameters)} '
+      'payloadShape=${_valueShape(options.data)}',
     );
     handler.next(options);
   }
@@ -52,7 +52,7 @@ class DevSafeApiLogInterceptor extends Interceptor {
     debugPrint(
       'JimBro API <- ${response.statusCode ?? 'unknown'} '
       '${response.requestOptions.method} ${response.requestOptions.path} '
-      'body=${_redactValue(response.data)}',
+      'responseShape=${_valueShape(response.data)}',
     );
     handler.next(response);
   }
@@ -62,31 +62,22 @@ class DevSafeApiLogInterceptor extends Interceptor {
     debugPrint(
       'JimBro API !! ${err.response?.statusCode ?? err.type.name} '
       '${err.requestOptions.method} ${err.requestOptions.path} '
-      'body=${_redactValue(err.response?.data)}',
+      'responseShape=${_valueShape(err.response?.data)}',
     );
     handler.next(err);
   }
 }
 
-Object? _redactValue(Object? value) {
+String _valueShape(Object? value) {
   if (value is Map) {
-    return _redactMap(value);
+    return 'map(keys=${_mapKeys(value)})';
   }
   if (value is Iterable) {
-    return value.map(_redactValue).toList(growable: false);
+    return 'list(length=${value.length})';
   }
-  return value;
+  return value == null ? 'none' : value.runtimeType.toString();
 }
 
-Map<String, Object?> _redactMap(Map<dynamic, dynamic> map) {
-  return map.map((key, value) {
-    final name = key.toString();
-    final normalized = name.toLowerCase();
-    final sensitive = normalized.contains('password') ||
-        normalized.contains('token') ||
-        normalized.contains('authorization') ||
-        normalized.contains('secret') ||
-        normalized.contains('key');
-    return MapEntry(name, sensitive ? '<redacted>' : _redactValue(value));
-  });
+List<String> _mapKeys(Map<dynamic, dynamic> map) {
+  return map.keys.map((key) => key.toString()).toList(growable: false);
 }

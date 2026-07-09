@@ -754,6 +754,28 @@ class FoodSuggestion {
   }
 }
 
+/// Tracks the latest debounced search so older responses cannot replace it.
+class SearchRequestGate {
+  int _generation = 0;
+  String _activeQuery = '';
+
+  String get activeQuery => _activeQuery;
+
+  int begin(String normalizedQuery) {
+    _activeQuery = normalizedQuery;
+    return ++_generation;
+  }
+
+  void clear() {
+    _activeQuery = '';
+    _generation++;
+  }
+
+  bool isCurrent(int generation, String normalizedQuery) {
+    return generation == _generation && normalizedQuery == _activeQuery;
+  }
+}
+
 class ConsistencyState {
   const ConsistencyState({
     required this.currentStreak,
@@ -840,6 +862,17 @@ class SearchState {
   }
 }
 
+/// The local profile is canonical while a live sync is in progress. These
+/// states let UI describe a recoverable backend delay without discarding a
+/// member's just-completed onboarding answers.
+enum ProfileSyncStatus { synced, pending, failed }
+
+enum AtlasMetricsStatus { available, pending, unavailable, failed }
+
+enum ProgramGenerationChoice { pending, accepted, skipped }
+
+enum ProgramGenerationStatus { idle, generating, generated, failed }
+
 class AppDraftState {
   const AppDraftState({
     required this.session,
@@ -853,6 +886,13 @@ class AppDraftState {
     required this.nutritionSummary,
     required this.consistency,
     required this.search,
+    this.profileSyncStatus = ProfileSyncStatus.synced,
+    this.atlasMetricsStatus = AtlasMetricsStatus.unavailable,
+    this.lastLocalProfileUpdate,
+    this.lastBackendProfileUpdate,
+    this.lastSyncErrorCode,
+    this.programGenerationChoice = ProgramGenerationChoice.pending,
+    this.programGenerationStatus = ProgramGenerationStatus.idle,
   });
 
   final AuthSession? session;
@@ -866,6 +906,13 @@ class AppDraftState {
   final DailyNutritionSummary nutritionSummary;
   final ConsistencyState consistency;
   final SearchState search;
+  final ProfileSyncStatus profileSyncStatus;
+  final AtlasMetricsStatus atlasMetricsStatus;
+  final DateTime? lastLocalProfileUpdate;
+  final DateTime? lastBackendProfileUpdate;
+  final String? lastSyncErrorCode;
+  final ProgramGenerationChoice programGenerationChoice;
+  final ProgramGenerationStatus programGenerationStatus;
 
   AppDraftState copyWith({
     AuthSession? session,
@@ -879,6 +926,13 @@ class AppDraftState {
     DailyNutritionSummary? nutritionSummary,
     ConsistencyState? consistency,
     SearchState? search,
+    ProfileSyncStatus? profileSyncStatus,
+    AtlasMetricsStatus? atlasMetricsStatus,
+    Object? lastLocalProfileUpdate = _unset,
+    Object? lastBackendProfileUpdate = _unset,
+    Object? lastSyncErrorCode = _unset,
+    ProgramGenerationChoice? programGenerationChoice,
+    ProgramGenerationStatus? programGenerationStatus,
   }) {
     return AppDraftState(
       session: session ?? this.session,
@@ -892,6 +946,21 @@ class AppDraftState {
       nutritionSummary: nutritionSummary ?? this.nutritionSummary,
       consistency: consistency ?? this.consistency,
       search: search ?? this.search,
+      profileSyncStatus: profileSyncStatus ?? this.profileSyncStatus,
+      atlasMetricsStatus: atlasMetricsStatus ?? this.atlasMetricsStatus,
+      lastLocalProfileUpdate: identical(lastLocalProfileUpdate, _unset)
+          ? this.lastLocalProfileUpdate
+          : lastLocalProfileUpdate as DateTime?,
+      lastBackendProfileUpdate: identical(lastBackendProfileUpdate, _unset)
+          ? this.lastBackendProfileUpdate
+          : lastBackendProfileUpdate as DateTime?,
+      lastSyncErrorCode: identical(lastSyncErrorCode, _unset)
+          ? this.lastSyncErrorCode
+          : lastSyncErrorCode as String?,
+      programGenerationChoice:
+          programGenerationChoice ?? this.programGenerationChoice,
+      programGenerationStatus:
+          programGenerationStatus ?? this.programGenerationStatus,
     );
   }
 }

@@ -255,10 +255,7 @@ class JimChatController extends AutoDisposeNotifier<JimChatState> {
   }
 
   String _friendlyError(Object error) {
-    final text = error.toString().replaceFirst('Exception: ', '').trim();
-    return text.isEmpty
-        ? 'Jim could not respond. Your message was not logged.'
-        : text;
+    return 'Jim could not respond right now. Your message was not logged.';
   }
 
   String _messageId(String prefix) =>

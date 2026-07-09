@@ -21,10 +21,30 @@ Future<void> main() async {
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
   final checks = <_SmokeCheck>[
     const _SmokeCheck('service root', '/', protected: false, useOrigin: true),
+    const _SmokeCheck(
+      'API health',
+      '/health',
+      protected: false,
+      notFoundIsNonFatal: true,
+    ),
     const _SmokeCheck('auth/me', '/auth/me'),
-    const _SmokeCheck('atlas metrics', '/atlas/metrics'),
-    _SmokeCheck('food summary', '/food-log/summary/${_todayIso()}'),
+    const _SmokeCheck('profile', '/supabase/profile'),
+    const _SmokeCheck(
+      'atlas metrics',
+      '/atlas/metrics',
+      notFoundIsNonFatal: true,
+      notFoundMessage: 'metrics pending; continuing',
+    ),
     const _SmokeCheck('workout templates', '/workout-templates'),
+    const _SmokeCheck('workout logs', '/workout-logs?limit=5'),
+    const _SmokeCheck('food logs', '/food-log?limit=5'),
+    const _SmokeCheck('agent context', '/agent/context'),
+    const _SmokeCheck(
+      'workout schedule',
+      '/workout-schedule',
+      notFoundIsNonFatal: true,
+      notFoundMessage: 'route unavailable; continuing with local schedule',
+    ),
   ];
 
   var hadFailure = false;
@@ -44,7 +64,12 @@ Future<void> main() async {
       stdout.writeln(
         '${check.name}: status=${result.statusCode} keys=${result.keys}',
       );
-      if (result.statusCode >= 400) {
+      if (result.statusCode == HttpStatus.notFound &&
+          check.notFoundIsNonFatal) {
+        stdout.writeln(
+          '${check.name}: ${check.notFoundMessage ?? 'not available; continuing'}',
+        );
+      } else if (result.statusCode >= 400) {
         hadFailure = true;
       }
     } catch (error) {
@@ -130,10 +155,10 @@ Future<_SmokeResult> _get(
   final body = await utf8.decodeStream(response).timeout(
         const Duration(seconds: 12),
       );
-  return _SmokeResult(response.statusCode, _jsonKeys(body));
+  return _SmokeResult(response.statusCode, smokeResponseKeyNames(body));
 }
 
-List<String> _jsonKeys(String body) {
+List<String> smokeResponseKeyNames(String body) {
   try {
     final decoded = jsonDecode(body);
     if (decoded is Map) {
@@ -156,25 +181,22 @@ String _origin(String value) {
   return '${uri.scheme}://${uri.authority}';
 }
 
-String _todayIso() {
-  final now = DateTime.now();
-  return '${now.year.toString().padLeft(4, '0')}-'
-      '${now.month.toString().padLeft(2, '0')}-'
-      '${now.day.toString().padLeft(2, '0')}';
-}
-
 class _SmokeCheck {
   const _SmokeCheck(
     this.name,
     this.path, {
     this.protected = true,
     this.useOrigin = false,
+    this.notFoundIsNonFatal = false,
+    this.notFoundMessage,
   });
 
   final String name;
   final String path;
   final bool protected;
   final bool useOrigin;
+  final bool notFoundIsNonFatal;
+  final String? notFoundMessage;
 }
 
 class _SmokeResult {

@@ -126,13 +126,12 @@ void main() {
     expect(payload['name'], 'Push');
     expect(payload['template_id'], 20);
     expect(payload['notes'], 'Moved well. Add 2.5 kg next time.');
-    expect(payload['started_at'], '2026-06-06T10:00:00.000');
-    expect(payload['ended_at'], '2026-06-06T10:42:00.000');
-    expect(payload['duration_minutes'], 42);
     expect(payload, contains('exercises'));
-    expect(payload, contains('workout_exercises'));
+    expect(payload, isNot(contains('workout_exercises')));
+    expect(payload, isNot(contains('started_at')));
+    expect(payload, isNot(contains('duration_minutes')));
 
-    final exercises = payload['workout_exercises'] as List<dynamic>;
+    final exercises = payload['exercises'] as List<dynamic>;
     expect(exercises, hasLength(1));
     expect(exercises.single['exercise_id'], 111);
     expect(exercises.single['order_index'], 1);
@@ -195,10 +194,9 @@ void main() {
       ],
     );
 
-    expect(payload.keys, containsAll(['workout_name', 'date', 'duration_min']));
-    expect(payload['workout_name'], 'Push');
-    expect(payload['date'], '2026-06-06');
-    expect(payload['duration_min'], 42);
+    expect(payload.keys, containsAll(['name', 'template_id', 'exercises']));
+    expect(payload['name'], 'Push');
+    expect(payload['template_id'], 20);
     expect(payload, isNot(contains('workout_exercises')));
 
     final exercises = payload['exercises'] as Iterable<dynamic>;
@@ -209,7 +207,78 @@ void main() {
       'reps': 8,
       'weight_kg': 60.0,
       'is_warmup': false,
+      'rpe': 7.0,
     });
+  });
+
+  test('workout log PATCH contains metadata only', () {
+    final payload = workoutLogMetadataPatchPayload(
+      const WorkoutLogDraft(
+        workoutLogId: 10,
+        name: 'Updated Push',
+        notes: 'Keep one rep in reserve.',
+        startedAtLabel: '',
+        endedAtLabel: '',
+        exercises: [],
+      ),
+    );
+
+    expect(payload, {
+      'name': 'Updated Push',
+      'notes': 'Keep one rep in reserve.',
+    });
+  });
+
+  test('exercise search uses the documented query-only endpoint', () async {
+    final adapter = _ExerciseSearchDioAdapter();
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiWorkoutRepository(dio);
+
+    final results = await repository.searchExercises('bench');
+
+    expect(results.single.name, 'Bench Press');
+    expect(adapter.queryParameters, [
+      {'q': 'bench'}
+    ]);
+  });
+
+  test('short exercise query is sent as prefix suggestion query', () async {
+    final adapter = _ExerciseSearchDioAdapter();
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiWorkoutRepository(dio);
+
+    final suggestions = await repository.searchExercises('b');
+
+    expect(suggestions.single.name, 'Bench Press');
+    expect(adapter.queryParameters.single['q'], 'b');
+    expect(adapter.queryParameters.single.containsKey('limit'), isFalse);
+  });
+
+  test('exercise search caches normalized repeated queries', () async {
+    final adapter = _ExerciseSearchDioAdapter();
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiWorkoutRepository(dio);
+
+    await repository.searchExercises(' Bench ');
+    await repository.searchExercises('bench');
+
+    expect(adapter.queryParameters, hasLength(1));
+    expect(adapter.queryParameters.single['q'], 'bench');
   });
 
   test('workout log mapper rejects exercises without nested sets', () {
@@ -252,7 +321,7 @@ void main() {
     );
   });
 
-  test('workout log repository retries documented payload on 422', () async {
+  test('workout log does not duplicate a rejected documented submit', () async {
     final adapter = _CapturingDioAdapter()..rejectRichWorkoutLogOnce = true;
     final dio = Dio(
       BaseOptions(
@@ -262,40 +331,40 @@ void main() {
     )..httpClientAdapter = adapter;
     final repository = FastApiWorkoutRepository(dio);
 
-    await repository.saveWorkoutLog(
-      _ReadyAuthRepository._session,
-      const WorkoutLogDraft(
-        name: 'Push',
-        notes: '',
-        startedAtLabel: '2026-06-06T10:00:00.000',
-        endedAtLabel: '2026-06-06T10:42:00.000',
-        exercises: [
-          WorkoutExerciseDraft(
-            exerciseId: 111,
-            exerciseName: 'Bench Press (Barbell)',
-            notes: '',
-            targetSets: 1,
-            targetReps: 8,
-            sets: [
-              SetDraft(
-                setNumber: 1,
-                weightKg: 60,
-                reps: 8,
-                isWarmup: false,
-                isCompleted: true,
-                rpe: 7,
-              ),
-            ],
-          ),
-        ],
+    await expectLater(
+      repository.saveWorkoutLog(
+        _ReadyAuthRepository._session,
+        const WorkoutLogDraft(
+          name: 'Push',
+          notes: '',
+          startedAtLabel: '2026-06-06T10:00:00.000',
+          endedAtLabel: '2026-06-06T10:42:00.000',
+          exercises: [
+            WorkoutExerciseDraft(
+              exerciseId: 111,
+              exerciseName: 'Bench Press (Barbell)',
+              notes: '',
+              targetSets: 1,
+              targetReps: 8,
+              sets: [
+                SetDraft(
+                  setNumber: 1,
+                  weightKg: 60,
+                  reps: 8,
+                  isWarmup: false,
+                  isCompleted: true,
+                  rpe: 7,
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
+      throwsA(isA<Exception>()),
     );
 
-    expect(adapter.workoutLogPayloads, hasLength(2));
-    expect(adapter.workoutLogPayloads.first, contains('workout_exercises'));
-    expect(adapter.workoutLogPayloads.last, contains('workout_name'));
-    expect(
-        adapter.workoutLogPayloads.last, isNot(contains('workout_exercises')));
+    expect(adapter.workoutLogPayloads, hasLength(1));
+    expect(adapter.workoutLogPayloads.single, contains('exercises'));
   });
 
   test('workout log repository surfaces FastAPI 422 validation detail',
@@ -304,7 +373,7 @@ void main() {
       ..validationError = {
         'detail': [
           {
-            'loc': ['body', 'workout_exercises'],
+            'loc': ['body', 'exercises'],
             'msg': 'Field required',
             'type': 'missing',
           },
@@ -352,13 +421,13 @@ void main() {
               (error) => error.toString(),
               'message',
               contains(
-                'loc=body.workout_exercises msg=Field required type=missing',
+                'loc=body.exercises msg=Field required type=missing',
               ),
             )
             .having(
               (error) => error.toString(),
               'payload',
-              contains('duration_min'),
+              contains('exercises'),
             ),
       ),
     );
@@ -740,18 +809,13 @@ void main() {
     final exercises = payload['exercises'] as List<dynamic>;
     expect(exercises.single['exercise_id'], 111);
     expect(exercises.single['order_index'], 1);
-    expect(exercises.single['target_sets'], 3);
-    expect(exercises.single['target_reps'], 8);
     expect(exercises.single['notes'], 'Smooth reps.');
-
-    final sets = exercises.single['sets'] as List<dynamic>;
-    expect(sets.single['set_number'], 1);
-    expect(sets.single['reps'], 8);
-    expect(sets.single['weight_kg'], 60);
-    expect(sets.single['rpe'], 7);
+    expect(exercises.single, isNot(contains('target_sets')));
+    expect(exercises.single, isNot(contains('target_reps')));
+    expect(exercises.single, isNot(contains('sets')));
   });
 
-  test('workout template documented mapper emits days shape', () {
+  test('workout template documented mapper excludes performance data', () {
     final payload = workoutTemplateDocumentedPayload(
       const WorkoutTemplateDraft(
         name: 'Push Strength',
@@ -782,21 +846,16 @@ void main() {
     );
 
     expect(payload['name'], 'Push Strength');
-    final days = payload['days'] as Iterable<dynamic>;
-    final day = days.single as Map<String, dynamic>;
-    expect(day['day_label'], 'Day 1');
-    final exercises = day['exercises'] as Iterable<dynamic>;
+    final exercises = payload['exercises'] as Iterable<dynamic>;
     expect(exercises.single, {
       'exercise_id': 111,
-      'sets': 3,
-      'reps': 8,
+      'order_index': 1,
       'notes': 'Smooth reps.',
     });
   });
 
-  test('workout template repository retries documented payload on 422',
-      () async {
-    final adapter = _CapturingDioAdapter()..rejectRichTemplateOnce = true;
+  test('workout template submits the documented shape once', () async {
+    final adapter = _CapturingDioAdapter();
     final dio = Dio(
       BaseOptions(
         baseUrl: 'https://example.test/api/v1',
@@ -826,13 +885,9 @@ void main() {
     );
 
     expect(saved.name, 'Push Strength');
-    expect(adapter.templatePayloads, hasLength(2));
-    expect(adapter.templatePayloads.first, contains('exercises'));
-    expect(adapter.templatePayloads.last, contains('days'));
-    final days = adapter.templatePayloads.last['days'] as Iterable<dynamic>;
-    final exercises =
-        (days.single as Map<String, dynamic>)['exercises'] as Iterable<dynamic>;
-    expect((exercises.single as Map<String, dynamic>)['sets'], 3);
+    expect(adapter.templatePayloads, hasLength(1));
+    expect(adapter.templatePayloads.single, contains('exercises'));
+    expect(adapter.templatePayloads.single, isNot(contains('days')));
   });
 }
 
@@ -952,6 +1007,46 @@ class _FakeWorkoutNotificationService implements WorkoutNotificationService {
   }
 }
 
+class _ExerciseSearchDioAdapter implements HttpClientAdapter {
+  final queryParameters = <Map<String, dynamic>>[];
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<List<int>>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    if (options.method == 'GET' && options.path == '/exercises/search') {
+      queryParameters.add(Map<String, dynamic>.from(options.queryParameters));
+      return _json(200, {
+        'success': true,
+        'data': [
+          {
+            'exercise_id': 111,
+            'name': 'Bench Press',
+            'category': 'Barbell',
+            'primary_muscle': 'chest',
+          },
+        ],
+      });
+    }
+    return _json(404, {'detail': 'not found'});
+  }
+
+  ResponseBody _json(int statusCode, Object body) {
+    return ResponseBody.fromString(
+      jsonEncode(body),
+      statusCode,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
+}
+
 class _CapturingDioAdapter implements HttpClientAdapter {
   Map<String, dynamic>? lastPostPayload;
   Map<String, dynamic>? lastTemplatePayload;
@@ -1009,9 +1104,7 @@ class _CapturingDioAdapter implements HttpClientAdapter {
     if (options.method == 'POST' && options.path == '/workout-logs') {
       lastPostPayload = Map<String, dynamic>.from(options.data as Map);
       workoutLogPayloads.add(lastPostPayload!);
-      if (rejectRichWorkoutLogOnce &&
-          workoutLogPayloads.length == 1 &&
-          lastPostPayload!.containsKey('workout_exercises')) {
+      if (rejectRichWorkoutLogOnce && workoutLogPayloads.length == 1) {
         return ResponseBody.fromString(
           jsonEncode({
             'detail': [

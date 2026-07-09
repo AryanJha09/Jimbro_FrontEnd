@@ -27,36 +27,47 @@ class JimPageScaffold extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return DecoratedBox(
-      decoration: const BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [JimColors.shell, JimColors.galleryWhite, JimColors.eggshell],
-        ),
-      ),
-      child: SafeArea(
-        child: ListView(
-          key: scrollKey,
-          physics: const BouncingScrollPhysics(),
-          padding: EdgeInsets.fromLTRB(
-            JimSpacing.ml,
-            JimSpacing.ml,
-            JimSpacing.ml,
-            bottomPadding,
-          ),
-          children: [
-            SectionHeader(
-              eyebrow: eyebrow,
-              title: title,
-              subtitle: subtitle,
-              trailing: headerTrailing,
+    return Stack(
+      children: [
+        const Positioned.fill(
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  JimColors.shell,
+                  JimColors.galleryWhite,
+                  JimColors.eggshell,
+                ],
+              ),
             ),
-            const SizedBox(height: JimSpacing.ml),
-            ...children,
-          ],
+          ),
         ),
-      ),
+        const Positioned.fill(child: JimLightTexture()),
+        SafeArea(
+          child: ListView(
+            key: scrollKey,
+            physics: const BouncingScrollPhysics(),
+            padding: EdgeInsets.fromLTRB(
+              JimSpacing.ml,
+              JimSpacing.lg,
+              JimSpacing.ml,
+              bottomPadding,
+            ),
+            children: [
+              SectionHeader(
+                eyebrow: eyebrow,
+                title: title,
+                subtitle: subtitle,
+                trailing: headerTrailing,
+              ),
+              const SizedBox(height: JimSpacing.ml),
+              ...children,
+            ],
+          ),
+        ),
+      ],
     );
   }
 }
@@ -150,7 +161,28 @@ class JimStateCard extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          Icon(icon, color: JimColors.accentStrong, size: 34),
+          Container(
+            width: 56,
+            height: 56,
+            decoration: BoxDecoration(
+              color: tone == JimSurfaceTone.warning
+                  ? JimColors.terracotta.withValues(alpha: .12)
+                  : JimColors.accentSoft,
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: tone == JimSurfaceTone.warning
+                    ? JimColors.terracotta.withValues(alpha: .24)
+                    : JimColors.accentLine,
+              ),
+            ),
+            child: Icon(
+              icon,
+              color: tone == JimSurfaceTone.warning
+                  ? JimColors.terracotta
+                  : JimColors.accentStrong,
+              size: 28,
+            ),
+          ),
           const SizedBox(height: JimSpacing.sm),
           Text(
             title,
@@ -223,9 +255,15 @@ class JimLoadingState extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const SizedBox.square(
-            dimension: 26,
-            child: CircularProgressIndicator(strokeWidth: 2.6),
+          Container(
+            width: 52,
+            height: 52,
+            padding: const EdgeInsets.all(13),
+            decoration: const BoxDecoration(
+              color: JimColors.accentSoft,
+              shape: BoxShape.circle,
+            ),
+            child: const CircularProgressIndicator(strokeWidth: 2.6),
           ),
           const SizedBox(height: JimSpacing.md),
           Text(

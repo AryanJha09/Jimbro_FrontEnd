@@ -541,6 +541,8 @@ class _FoodLogEditorState extends ConsumerState<_FoodLogEditor> {
   late final TextEditingController _quantityController;
   List<FoodSuggestion> _suggestions = const [];
   bool _isSearching = false;
+  bool _searchFailed = false;
+  final _searchGate = SearchRequestGate();
 
   @override
   void initState() {
@@ -573,26 +575,48 @@ class _FoodLogEditorState extends ConsumerState<_FoodLogEditor> {
 
   void _queueFoodSearch(String query) {
     _debounce?.cancel();
-    final trimmed = query.trim();
-    if (trimmed.length < 2) {
+    final normalized = query.trim().toLowerCase();
+    if (normalized.isEmpty) {
+      _searchGate.clear();
       setState(() {
         _suggestions = const [];
         _isSearching = false;
+        _searchFailed = false;
       });
       return;
     }
-    setState(() => _isSearching = true);
-    _debounce = Timer(const Duration(milliseconds: 320), () async {
-      final results = await ref
-          .read(appDraftProvider.notifier)
-          .searchFoodSuggestions(trimmed);
-      if (!mounted) {
-        return;
+
+    if (normalized == _searchGate.activeQuery && !_isSearching) {
+      return;
+    }
+
+    final generation = _searchGate.begin(normalized);
+    setState(() {
+      _isSearching = true;
+      _searchFailed = false;
+    });
+    _debounce = Timer(const Duration(milliseconds: 420), () async {
+      try {
+        final results = await ref
+            .read(appDraftProvider.notifier)
+            .searchFoodSuggestions(normalized);
+        if (!mounted || !_searchGate.isCurrent(generation, normalized)) {
+          return;
+        }
+        setState(() {
+          _suggestions = results;
+          _isSearching = false;
+          _searchFailed = false;
+        });
+      } catch (_) {
+        if (!mounted || !_searchGate.isCurrent(generation, normalized)) {
+          return;
+        }
+        setState(() {
+          _isSearching = false;
+          _searchFailed = true;
+        });
       }
-      setState(() {
-        _suggestions = results;
-        _isSearching = false;
-      });
     });
   }
 
@@ -642,8 +666,34 @@ class _FoodLogEditorState extends ConsumerState<_FoodLogEditor> {
                   : null,
             ),
           ),
+          if (_isSearching) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Searching foods...',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: JimColors.inkMuted,
+                  ),
+            ),
+          ] else if (_searchFailed) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Couldn\'t refresh foods. You can still add food manually.',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: JimColors.terracotta,
+                  ),
+            ),
+          ],
           if (_suggestions.isNotEmpty) ...[
             const SizedBox(height: 10),
+            Text(
+              _searchGate.activeQuery.length < 3
+                  ? 'Suggestions'
+                  : 'Food matches',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: JimColors.inkMuted,
+                  ),
+            ),
+            const SizedBox(height: 8),
             ..._suggestions.take(4).map(
                   (suggestion) => Padding(
                     padding: const EdgeInsets.only(bottom: 8),

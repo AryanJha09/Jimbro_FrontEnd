@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../core/navigation/app_state.dart';
 import '../../../core/theme/jim_tokens.dart';
 import '../../../shared/components/jim_surface.dart';
 import '../../../shared/models/jim_chat_models.dart';
@@ -62,6 +63,14 @@ class _AtlasChatPageState extends ConsumerState<AtlasChatPage> {
   @override
   Widget build(BuildContext context) {
     final chat = ref.watch(jimChatControllerProvider);
+    final draft = ref.watch(appDraftProvider).valueOrNull;
+    final context = draft?.session == null || draft?.session?.provider == 'mock'
+        ? null
+        : ref.watch(agentContextProvider).valueOrNull;
+    final metricsPending = draft?.session != null &&
+        draft?.session?.provider != 'mock' &&
+        context != null &&
+        context.atlasMetrics == null;
     ref.listen(jimChatControllerProvider, (previous, next) {
       if (previous?.messages.length != next.messages.length ||
           previous?.messages.lastOrNull?.text !=
@@ -90,6 +99,20 @@ class _AtlasChatPageState extends ConsumerState<AtlasChatPage> {
                 onSelected:
                     ref.read(jimChatControllerProvider.notifier).setMode,
               ),
+              if (metricsPending)
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(
+                    JimSpacing.ml,
+                    JimSpacing.sm,
+                    JimSpacing.ml,
+                    0,
+                  ),
+                  child: JimSurface(
+                    child: Text(
+                      'Coaching metrics are still syncing. Jim can still help with your profile and plan.',
+                    ),
+                  ),
+                ),
               Expanded(
                 child: ListView(
                   controller: _scrollController,
@@ -146,20 +169,50 @@ class _ChatHeader extends StatelessWidget {
         JimSpacing.md,
         JimSpacing.xs,
       ),
-      child: Row(
-        children: [
-          IconButton(
-            tooltip: 'Back',
-            onPressed: onBack,
-            icon: const Icon(Icons.arrow_back_rounded),
-          ),
-          const SizedBox(width: JimSpacing.xs),
-          const Icon(Icons.auto_awesome_rounded, color: JimColors.accentStrong),
-          const SizedBox(width: JimSpacing.sm),
-          Expanded(
-            child: Text('Jim', style: Theme.of(context).textTheme.titleLarge),
-          ),
-        ],
+      child: JimSurface(
+        padding: const EdgeInsets.symmetric(
+          horizontal: JimSpacing.xs,
+          vertical: JimSpacing.xs,
+        ),
+        radius: JimRadius.lg,
+        child: Row(
+          children: [
+            IconButton(
+              tooltip: 'Back',
+              onPressed: onBack,
+              icon: const Icon(Icons.arrow_back_rounded),
+            ),
+            const SizedBox(width: JimSpacing.xs),
+            Container(
+              width: 36,
+              height: 36,
+              decoration: const BoxDecoration(
+                color: JimColors.accentSoft,
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(
+                Icons.auto_awesome_rounded,
+                color: JimColors.accentStrong,
+                size: 20,
+              ),
+            ),
+            const SizedBox(width: JimSpacing.sm),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Jim', style: Theme.of(context).textTheme.titleMedium),
+                  Text(
+                    'Your coaching companion',
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: JimColors.inkMuted,
+                        ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -224,7 +277,13 @@ class _MessageBubble extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(text, style: Theme.of(context).textTheme.bodyMedium),
+              Text(
+                text,
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: user ? JimColors.ink : null,
+                      height: 1.4,
+                    ),
+              ),
               if (message.isLocalMock && !user) ...[
                 const SizedBox(height: JimSpacing.xs),
                 Text(
@@ -281,7 +340,7 @@ class _ChatError extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return JimSurface(
-      tone: JimSurfaceTone.soft,
+      tone: JimSurfaceTone.warning,
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -309,11 +368,16 @@ class _ChatComposer extends StatelessWidget {
   Widget build(BuildContext context) {
     return DecoratedBox(
       decoration: const BoxDecoration(
-        color: JimColors.plaque,
+        color: JimColors.shell,
         border: Border(top: BorderSide(color: JimColors.insetLine)),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(JimSpacing.sm),
+        padding: const EdgeInsets.fromLTRB(
+          JimSpacing.ml,
+          JimSpacing.sm,
+          JimSpacing.ml,
+          JimSpacing.md,
+        ),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [

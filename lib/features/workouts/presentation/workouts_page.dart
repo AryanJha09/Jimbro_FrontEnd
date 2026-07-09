@@ -813,6 +813,8 @@ class _ExerciseEditorState extends ConsumerState<_ExerciseEditor> {
   late final TextEditingController _exerciseNameController;
   List<ExerciseSuggestion> _suggestions = const [];
   bool _isSearching = false;
+  bool _searchFailed = false;
+  final _searchGate = SearchRequestGate();
 
   @override
   void initState() {
@@ -838,31 +840,48 @@ class _ExerciseEditorState extends ConsumerState<_ExerciseEditor> {
 
   void _queueExerciseSearch(String query) {
     _debounce?.cancel();
-    final trimmed = query.trim();
-    if (trimmed.length < 2) {
+    final normalized = query.trim().toLowerCase();
+    if (normalized.isEmpty) {
+      _searchGate.clear();
       setState(() {
         _suggestions = const [];
         _isSearching = false;
+        _searchFailed = false;
       });
       return;
     }
-    final local = _instantExerciseSuggestions(trimmed);
+
+    if (normalized == _searchGate.activeQuery && !_isSearching) {
+      return;
+    }
+
+    final generation = _searchGate.begin(normalized);
     setState(() {
-      _suggestions = local;
       _isSearching = true;
+      _searchFailed = false;
     });
     _debounce = Timer(const Duration(milliseconds: 300), () async {
-      final results = await ref
-          .read(appDraftProvider.notifier)
-          .searchExerciseSuggestions(trimmed);
-      if (!mounted) {
-        return;
+      try {
+        final results = await ref
+            .read(appDraftProvider.notifier)
+            .searchExerciseSuggestions(normalized);
+        if (!mounted || !_searchGate.isCurrent(generation, normalized)) {
+          return;
+        }
+        setState(() {
+          _suggestions = results;
+          _isSearching = false;
+          _searchFailed = false;
+        });
+      } catch (_) {
+        if (!mounted || !_searchGate.isCurrent(generation, normalized)) {
+          return;
+        }
+        setState(() {
+          _isSearching = false;
+          _searchFailed = true;
+        });
       }
-      setState(() {
-        _suggestions =
-            results.isEmpty ? local : _mergeVisibleSuggestions(results, local);
-        _isSearching = false;
-      });
     });
   }
 
@@ -912,9 +931,44 @@ class _ExerciseEditorState extends ConsumerState<_ExerciseEditor> {
                   : null,
             ),
           ),
+          if (_isSearching) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Searching exercises...',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: JimColors.inkMuted,
+                  ),
+            ),
+          ] else if (_searchFailed) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Couldn\'t refresh exercises. Check connection and try again.',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: JimColors.terracotta,
+                  ),
+            ),
+          ],
           if (_suggestions.isNotEmpty) ...[
             const SizedBox(height: 10),
-            ..._suggestions.take(4).map(
+            Text(
+              _searchGate.activeQuery.length < 3
+                  ? 'Suggestions'
+                  : 'Ranked results',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: JimColors.inkMuted,
+                  ),
+            ),
+            if (_searchGate.activeQuery.length >= 3) ...[
+              const SizedBox(height: 4),
+              Text(
+                'Showing best matches from the exercise catalog. Try a more specific name for more precise results.',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: JimColors.inkMuted,
+                    ),
+              ),
+            ],
+            const SizedBox(height: 8),
+            ..._suggestions.take(10).map(
                   (suggestion) => Padding(
                     padding: const EdgeInsets.only(bottom: 8),
                     child: _ExerciseSuggestionTile(
@@ -994,51 +1048,6 @@ class _ExerciseEditorState extends ConsumerState<_ExerciseEditor> {
       ),
     );
   }
-}
-
-List<ExerciseSuggestion> _instantExerciseSuggestions(String query) {
-  final normalized = query.trim().toLowerCase();
-  if (normalized.length < 2) {
-    return const [];
-  }
-  return const [
-    ExerciseSuggestion(
-      exerciseId: 111,
-      name: 'Bench Press (Barbell)',
-      subtitle: 'Barbell • chest',
-    ),
-    ExerciseSuggestion(
-      exerciseId: 113,
-      name: 'Bench Press (Dumbbell)',
-      subtitle: 'Dumbbell • chest',
-    ),
-    ExerciseSuggestion(
-      exerciseId: 115,
-      name: 'Bench Press - Wide Grip (Barbell)',
-      subtitle: 'Barbell • chest',
-    ),
-    ExerciseSuggestion(
-      exerciseId: 350,
-      name: 'Bench Press - Close Grip (Barbell)',
-      subtitle: 'Barbell • triceps',
-    ),
-    ExerciseSuggestion(
-      exerciseId: 349,
-      name: 'Bench Dip',
-      subtitle: 'Bodyweight • triceps',
-    ),
-  ].where((item) => item.name.toLowerCase().contains(normalized)).toList();
-}
-
-List<ExerciseSuggestion> _mergeVisibleSuggestions(
-  List<ExerciseSuggestion> primary,
-  List<ExerciseSuggestion> fallback,
-) {
-  final byId = <int, ExerciseSuggestion>{};
-  for (final item in [...primary, ...fallback]) {
-    byId.putIfAbsent(item.exerciseId, () => item);
-  }
-  return byId.values.toList();
 }
 
 const _weekdays = [

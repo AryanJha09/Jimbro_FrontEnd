@@ -6,9 +6,9 @@ Use this file as the first reference when continuing work in a fresh Codex threa
 
 I am working in `/Users/aryanjha/jimbro`, a Flutter/Riverpod app named JimBro. Before changing code, read this file, run `git status --short`, and run `git diff --cached --stat`.
 
-The repo is intentionally dirty and has staged work in progress, including `.env`. Do not overwrite, unstage, revert, or churn user-owned work unless explicitly requested. `.env` is sensitive; do not print, paste, summarize, or copy its values.
+The repo is intentionally dirty and has work in progress, including `.env`. Do not overwrite, unstage, revert, or churn user-owned work unless explicitly requested. `.env` is sensitive; do not print, paste, summarize, or copy its values.
 
-Current goal: keep the polished MVP stable while finishing live backend/device verification. Mock mode must remain usable.
+Current goal: keep the polished MVP stable while finishing live backend/device verification and resolving the remaining backend Atlas onboarding contract mismatch. Mock mode must remain usable.
 
 Production backend is deployed on Render at `https://jimbro-uvi6.onrender.com/`. Flutter `FASTAPI_BASE_URL` should point to the same host with `/api/v1`.
 
@@ -17,6 +17,7 @@ Production backend is deployed on Render at `https://jimbro-uvi6.onrender.com/`.
 JimBro is now a mobile-first fitness coaching MVP with:
 
 - Guided one-question onboarding with persistent progress, validation, resume repair, dynamic coaching insights, and final profile persistence.
+- Onboarding/profile consistency hardening: completed onboarding becomes the canonical local profile for Profile, Nutrition, Workout, and Home; Atlas sync failures are non-fatal and show sync-pending messaging.
 - Auth/session hardening for mock, FastAPI, and Supabase-direct modes.
 - Profile edit/save with validation, target refresh, sign out, and calculated calorie/protein/hydration/TDEE cards.
 - Home dashboard wired to real backend context when available: `/agent/context` first, then Atlas metrics, food summary, workout logs/trends/templates fallback.
@@ -26,15 +27,18 @@ JimBro is now a mobile-first fitness coaching MVP with:
 - Offline-first/recoverable fallback behavior for schedule, workout/nutrition outbox paths, and backend endpoint unavailability where previously implemented.
 - Native local workout notification bridge for iOS/Android scheduling, permission-denied graceful behavior, and Android notification tap launch intent.
 - Release QA assets: `RELEASE_CHECKLIST.md`, `tool/live_smoke_check.dart`, and `test/release_copy_scan_test.dart`.
+- Backend contract request doc: `docs/BACKEND_ATLAS_ONBOARD_CONTRACT_REQUEST.md`.
 
 ## Latest Verification
 
-Last updated: 2026-06-16.
+Last updated: 2026-06-22.
 
 Recent successful checks:
 
 - `flutter analyze` passed.
-- Full `flutter test` passed: 60 tests.
+- Full `flutter test` passed: 62 tests.
+- `test/atlas_profile_integration_test.dart` passed.
+- `test/home_agent_context_test.dart` passed.
 - `flutter build web --release` passed.
 - `flutter build ios --debug --no-codesign` passed.
 - `flutter build ios --simulator --debug` passed.
@@ -48,17 +52,19 @@ Blocked/unverified:
 - Real device notification delivery/tap behavior still needs manual iOS and Android verification.
 - Live protected backend smoke checks need a real bearer token.
 - Live backend end-to-end persistence still needs verification against deployed FastAPI/Supabase.
+- Manual live onboarding is blocked until backend stops requiring plaintext `password` in `POST /atlas/onboard` for already-authenticated bearer sessions.
 
 ## Current Dirty Worktree
 
 Treat all existing changes as intentional unless the user says otherwise. As of the latest audit, notable staged/unstaged areas include:
 
-- Sensitive staged `.env`.
+- Sensitive modified `.env`.
 - Config/auth/network/repository state: `lib/core/config/app_config.dart`, `lib/core/network/jim_api_client.dart`, `lib/core/navigation/app_state.dart`, `lib/core/repositories/app_repositories.dart`.
 - Main feature screens: auth, onboarding, home, workouts, nutrition, history, profile, atlas chat.
 - Shared UI/models: theme tokens, surfaces/buttons/state components, app models, onboarding models, Jim chat models.
 - Native notification bridge: Android manifest/activity/receiver and iOS AppDelegate.
 - Release/test assets: release checklist, live smoke helper, auth/config, Atlas, workout, nutrition, home, chat, onboarding, and widget tests.
+- Backend docs: `docs/BACKEND_ATLAS_ONBOARD_CONTRACT_REQUEST.md`.
 
 Always inspect targeted diffs before editing touched files, especially staged files.
 
@@ -103,8 +109,12 @@ Atlas/profile:
 - `POST /atlas/onboard`
 - `GET /atlas/metrics`
 - `PATCH /atlas/profile`
-- Onboarding maps supported fields and omits unsupported sex enum values.
+- Onboarding maps supported fields, sends `constraints_json` rather than `constraints`, does not send `generate_program`, and omits unsupported sex enum values.
+- Current deployed backend still requires `username`, `email`, and `password` in `/atlas/onboard`. Frontend only sends `password` when it exists transiently from the current email/password auth flow. It never persists, fabricates, or logs password.
+- Restored Supabase/FastAPI sessions do not expose plaintext password, so frontend skips `/atlas/onboard`, saves the canonical profile locally/in app state, uses profile-based local metrics, and shows a sync-pending message.
+- `GET /atlas/metrics` 404 / `ATLAS_METRICS_NOT_FOUND` is treated as metrics pending, not app failure.
 - Live Atlas metrics are source of truth for BMR/TDEE/macros/hydration when available; local formulas are fallback only.
+- Backend source code is not present in this repo. Requested backend change is documented in `docs/BACKEND_ATLAS_ONBOARD_CONTRACT_REQUEST.md`: `/atlas/onboard` should accept authenticated bearer JWT users without requiring `password`, derive user id/email server-side, make username optional/derived, and return profile/metrics with `updated_at`.
 
 Home/dashboard:
 
@@ -147,12 +157,19 @@ Jim chat:
 - `RELEASE_CHECKLIST.md`: repeatable release checklist, env variable names only, mode matrix, mock/live smoke steps, notification tests, Android SDK note, copy scan instructions.
 - `tool/live_smoke_check.dart`: optional no-secret live smoke helper. Prints config presence, status codes, and response key names only. Use `JIMBRO_SMOKE_BEARER_TOKEN` for protected checks.
 - `test/release_copy_scan_test.dart`: scans `lib/**/*.dart` for user-facing banned release-copy terms: `demo`, `prototype`, `fake`, `lorem`, `no-op`, and Aryan seed-data references. Comment-only lines are ignored.
+- `docs/BACKEND_ATLAS_ONBOARD_CONTRACT_REQUEST.md`: backend contract request for passwordless, bearer-authenticated Atlas onboarding.
 
 ## What Still Needs To Be Done
 
 Highest priority:
 
-1. Run one real live end-to-end path:
+1. Backend Atlas onboarding contract fix:
+   - update deployed backend so `POST /atlas/onboard` accepts authenticated bearer users without `password`
+   - derive user id/email from JWT/session
+   - make `username` optional/derived
+   - return saved profile/metrics with `updated_at`
+   - see `docs/BACKEND_ATLAS_ONBOARD_CONTRACT_REQUEST.md`
+2. After backend contract fix, run one real live end-to-end path:
    - sign in
    - complete onboarding
    - reload profile/Atlas metrics
@@ -161,16 +178,16 @@ Highest priority:
    - start/finish workout and verify nested log persistence
    - create/edit/delete food log and verify daily summary
    - open Jim chat and verify standard/streaming/clarification behavior
-2. Run `tool/live_smoke_check.dart` with a valid bearer token and confirm protected endpoints.
-3. Run live smoke helper with a bearer token against the Render backend.
-4. Configure Android SDK and run `flutter build apk --debug`.
-5. Native notification manual QA:
+3. Run `tool/live_smoke_check.dart` with a valid bearer token and confirm protected endpoints.
+4. Run live smoke helper with a bearer token against the Render backend.
+5. Configure Android SDK and run `flutter build apk --debug`.
+6. Native notification manual QA:
    - iOS device/simulator permission accept/deny
    - schedule delivery
    - notification tap opens app
    - Android 13+ permission accept/deny
    - Android delivery/tap after SDK is configured
-6. Confirm Flutter `.env` contains only client-safe public values before any release build is distributed.
+7. Confirm Flutter `.env` contains only client-safe public values before any release build is distributed.
 
 Medium priority:
 

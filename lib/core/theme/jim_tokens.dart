@@ -1,10 +1,10 @@
 import 'package:flutter/material.dart';
 
 class JimColors {
-  static const shell = Color(0xFFFAF7F2);
-  static const eggshell = Color(0xFFF7F2EA);
-  static const galleryWhite = Color(0xFFF3EFE8);
-  static const ivory = Color(0xFFEEE8E0);
+  static const shell = Color(0xFFFCF9F4);
+  static const eggshell = Color(0xFFF7F1E9);
+  static const galleryWhite = Color(0xFFF4F0E9);
+  static const ivory = Color(0xFFEEE8DF);
   static const mistStone = Color(0xFFE7E0D8);
   static const paleStone = Color(0xFFD7DFF0);
   static const limestone = Color(0xFFC2CCE6);
@@ -18,9 +18,9 @@ class JimColors {
   static const ink = Color(0xFF313542);
   static const inkSoft = Color(0xFF5B6071);
   static const inkMuted = Color(0xFF8D92A3);
-  static const plaque = Color(0xFFFFFCF8);
-  static const line = Color(0x1D7C8498);
-  static const insetLine = Color(0x22ABB3C8);
+  static const plaque = Color(0xFFFFFDF9);
+  static const line = Color(0x217C8498);
+  static const insetLine = Color(0x2BABB3C8);
   static const success = Color(0xFF5E8B71);
   static const warning = Color(0xFFAE8256);
   static const terracotta = Color(0xFFA36460);
@@ -79,8 +79,13 @@ class JimElevation {
   static List<BoxShadow> soft = const [
     BoxShadow(
       color: JimColors.shadow,
-      blurRadius: 22,
-      offset: Offset(0, 10),
+      blurRadius: 24,
+      offset: Offset(0, 9),
+    ),
+    BoxShadow(
+      color: Color(0x66FFFFFF),
+      blurRadius: 0,
+      offset: Offset(0, -1),
     ),
   ];
   static List<BoxShadow> lifted = const [
@@ -96,7 +101,7 @@ class JimMotion {
   static const loaderSpin = Duration(milliseconds: 2200);
   static const loaderSettle = Duration(milliseconds: 950);
   static const screenFade = Duration(milliseconds: 720);
-  static const gentle = Duration(milliseconds: 420);
+  static const gentle = Duration(milliseconds: 260);
 }
 
 class JimTextures extends StatelessWidget {

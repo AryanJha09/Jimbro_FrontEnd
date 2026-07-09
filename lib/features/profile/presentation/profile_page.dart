@@ -57,6 +57,7 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
   late String _dietaryPreference;
   late String _trainingPreference;
   bool _isSaving = false;
+  bool _isRetryingSync = false;
 
   UserProfile get _profile => widget.draft.profile;
 
@@ -234,6 +235,16 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
           onPressed: _signOut,
         ),
         const SizedBox(height: JimSpacing.md),
+        if (draft.profileSyncStatus != ProfileSyncStatus.synced ||
+            draft.atlasMetricsStatus != AtlasMetricsStatus.available) ...[
+          _ProfileSyncNotice(
+            profileSyncStatus: draft.profileSyncStatus,
+            atlasMetricsStatus: draft.atlasMetricsStatus,
+            isRetrying: _isRetryingSync,
+            onRetry: _isRetryingSync ? null : _retryProfileSync,
+          ),
+          const SizedBox(height: JimSpacing.md),
+        ],
         _TargetSummary(metrics: metrics),
         const SizedBox(height: JimSpacing.md),
         JimSurface(
@@ -467,6 +478,37 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
     await ref.read(appDraftProvider.notifier).signOut();
   }
 
+  Future<void> _retryProfileSync() async {
+    setState(() => _isRetryingSync = true);
+    try {
+      final result =
+          await ref.read(appDraftProvider.notifier).retryProfileSync();
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            result?.warning ?? 'Coaching profile synced. Targets refreshed.',
+          ),
+        ),
+      );
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                'Coaching sync is still unavailable. Your profile is safe here.'),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isRetryingSync = false);
+      }
+    }
+  }
+
   String? Function(String?) _requiredText(String message) {
     return (value) => value == null || value.trim().isEmpty ? message : null;
   }
@@ -495,6 +537,51 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
       return message;
     }
     return null;
+  }
+}
+
+class _ProfileSyncNotice extends StatelessWidget {
+  const _ProfileSyncNotice({
+    required this.profileSyncStatus,
+    required this.atlasMetricsStatus,
+    required this.isRetrying,
+    required this.onRetry,
+  });
+
+  final ProfileSyncStatus profileSyncStatus;
+  final AtlasMetricsStatus atlasMetricsStatus;
+  final bool isRetrying;
+  final VoidCallback? onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final metricsPending = atlasMetricsStatus != AtlasMetricsStatus.available;
+    return JimSurface(
+      tone: JimSurfaceTone.warning,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Coaching sync pending',
+              style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: JimSpacing.xxs),
+          Text(
+            metricsPending
+                ? 'Your profile is saved here. Jim is using local estimates until coaching metrics finish syncing.'
+                : 'Your profile is saved here and will retry its coaching sync shortly.',
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: JimColors.inkSoft,
+                  height: 1.4,
+                ),
+          ),
+          const SizedBox(height: JimSpacing.sm),
+          JimSecondaryButton(
+            label: isRetrying ? 'Retrying...' : 'Retry coaching sync',
+            icon: Icons.sync_rounded,
+            onPressed: onRetry ?? () {},
+          ),
+        ],
+      ),
+    );
   }
 }
 

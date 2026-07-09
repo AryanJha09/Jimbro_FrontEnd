@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
@@ -14,14 +15,14 @@ import 'package:jimbro/shared/models/app_models.dart';
 import 'package:jimbro/shared/models/jim_chat_models.dart';
 
 void main() {
-  test('maps standard chat response and clarification options', () {
+  test('maps documented standard chat reply, type, and options', () {
     final response = jimChatResponseFromBackend({
       'data': {
         'session_id': 'chat-1',
-        'message': 'Which meal?',
-        'requires_clarification': true,
+        'reply': 'Which meal?',
+        'type': 'clarification',
         'prompt': 'Choose a meal type.',
-        'clarification_options': [
+        'options': [
           {'id': 'breakfast', 'label': 'Breakfast'},
           {'id': 'lunch', 'label': 'Lunch'},
         ],
@@ -76,6 +77,50 @@ void main() {
     expect(events[1].text, 'lo');
     expect(events[2].response?.actionsTaken, ['log_workout']);
     expect(events[3].error, 'stream failed');
+  });
+
+  test('parses plain text, JSON chunks, and done sentinel', () async {
+    final bytes = Stream<List<int>>.fromIterable([
+      utf8.encode('Plain reply\n\n'),
+      utf8.encode('{"type":"text_delta","reply":" JSON"}\n\n'),
+      utf8.encode('data: [DONE]\n\n'),
+    ]);
+
+    final events = await parseJimChatSse(bytes).toList();
+
+    expect(events.map((event) => event.type), [
+      JimChatStreamEventType.textDelta,
+      JimChatStreamEventType.textDelta,
+      JimChatStreamEventType.done,
+    ]);
+    expect(events[0].text, 'Plain reply');
+    expect(events[1].text, ' JSON');
+  });
+
+  test('live chat stream requests an SSE response and deletes sessions',
+      () async {
+    final adapter = _StreamChatAdapter();
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://api.example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiJimChatRepository(dio);
+
+    final events = await repository
+        .stream(
+          _session,
+          sessionId: 'chat-stream',
+          message: 'Hello Jim',
+          mode: JimChatMode.general,
+        )
+        .toList();
+    await repository.endSession(_session, 'chat-stream');
+
+    expect(adapter.streamResponseType, ResponseType.stream);
+    expect(events.single.text, 'Hello');
+    expect(adapter.deletePath, '/chat/chat-stream');
   });
 
   test('controller exposes clarification and refreshes by completed action',
@@ -177,6 +222,44 @@ class _ChatAdapter implements HttpClientAdapter {
           'actions_taken': ['log_food'],
         },
       }),
+      200,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
+}
+
+class _StreamChatAdapter implements HttpClientAdapter {
+  ResponseType? streamResponseType;
+  String? deletePath;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<List<int>>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    if (options.method == 'POST' && options.path == '/chat/stream') {
+      streamResponseType = options.responseType;
+      return ResponseBody(
+        Stream.value(
+          Uint8List.fromList(utf8.encode('data: {"text":"Hello"}\n\n')),
+        ),
+        200,
+        headers: {
+          Headers.contentTypeHeader: ['text/event-stream'],
+        },
+      );
+    }
+    if (options.method == 'DELETE') {
+      deletePath = options.path;
+    }
+    return ResponseBody.fromString(
+      '{"data":{}}',
       200,
       headers: {
         Headers.contentTypeHeader: [Headers.jsonContentType],

@@ -1141,7 +1141,7 @@ AppDraftState _dashboardDraft(
       : _latestWorkout(context.recentWorkouts);
 
   return draft.copyWith(
-    profile: context.userProfile ?? draft.profile,
+    profile: draft.profile,
     metrics: metrics,
     template: activeTemplate,
     workoutLog: latestWorkout,

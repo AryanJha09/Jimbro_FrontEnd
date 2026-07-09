@@ -45,13 +45,22 @@ class JimSurface extends StatelessWidget {
           _ => JimColors.insetLine,
         };
 
-    return Container(
+    return AnimatedContainer(
+      duration: JimMotion.gentle,
+      curve: Curves.easeOutCubic,
       padding: padding,
       decoration: BoxDecoration(
         color: resolvedBackground,
         borderRadius: BorderRadius.circular(radius),
         border: Border.all(color: resolvedBorder),
         boxShadow: inset ? const [] : JimElevation.soft,
+        gradient: tone == JimSurfaceTone.accent
+            ? const LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [Color(0xFFF4F7FF), JimColors.accentSoft],
+              )
+            : null,
       ),
       child: child,
     );

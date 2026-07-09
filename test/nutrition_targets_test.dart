@@ -183,10 +183,9 @@ void main() {
     expect(adapter.foodLogPayloads, hasLength(1));
     expect(adapter.foodLogPayloads.single, {
       'food_id': 'custom-food-1',
-      'quantity_g': 150.0,
+      'quantity_grams': 150.0,
       'meal_type': 'lunch',
-      'log_date': adapter.today,
-      'quantity_source': 'explicit',
+      'date': adapter.today,
     });
     expect(saved.single.calories, 500);
     expect(summary.consumedCalories, 500);
@@ -220,7 +219,79 @@ void main() {
     expect(suggestions.single.foodId, 'catalog-food-1');
     expect(adapter.createdFoodPayloads, isEmpty);
     expect(adapter.foodLogPayloads.single['food_id'], 'catalog-food-1');
-    expect(adapter.foodLogPayloads.single['quantity_source'], 'default_100g');
+    expect(adapter.foodLogPayloads.single['quantity_grams'], 100.0);
+    expect(
+        adapter.foodLogPayloads.single.containsKey('quantity_source'), isFalse);
+  });
+
+  test('food search uses the documented query-only endpoint', () async {
+    final adapter = _NutritionDioAdapter();
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiNutritionRepository(dio);
+
+    final suggestions = await repository.searchFoods('ch');
+
+    expect(suggestions, hasLength(1));
+    expect(adapter.foodSearchPaths, ['/food/search']);
+    expect(adapter.foodSearchQueryParameters.single, {'q': 'ch'});
+
+    await repository.searchFoods('chicken');
+
+    expect(adapter.foodSearchPaths.last, '/food/search');
+    expect(adapter.foodSearchQueryParameters.last, {'q': 'chicken'});
+  });
+
+  test('food search failure does not block manual food logging', () async {
+    final adapter = _NutritionDioAdapter()..failFoodSearch = true;
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiNutritionRepository(dio);
+
+    final suggestions = await repository.searchFoods('chicken');
+    await repository.saveFoodLogs(
+      _liveSession,
+      [
+        FoodLogDraft.empty.copyWith(
+          foodName: 'Manual chicken',
+          quantityGrams: 100,
+          mealType: MealType.lunch,
+          calories: 165,
+          protein: 31,
+          carbs: 0,
+          fat: 4,
+        ),
+      ],
+    );
+
+    expect(suggestions, isEmpty);
+    expect(adapter.createdFoodPayloads.single['name'], 'Manual chicken');
+    expect(adapter.foodLogPayloads.single['food_id'], 'custom-food-1');
+  });
+
+  test('food search caches normalized repeated queries', () async {
+    final adapter = _NutritionDioAdapter();
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiNutritionRepository(dio);
+
+    await repository.searchFoods(' Chicken ');
+    await repository.searchFoods('chicken');
+
+    expect(adapter.foodSearchPaths, ['/food/search']);
+    expect(adapter.foodSearchQueryParameters.single, {'q': 'chicken'});
   });
 
   test('delete removes backend log and refreshes summary', () async {
@@ -255,6 +326,60 @@ void main() {
     expect(adapter.deletedLogIds, ['log-delete']);
     expect(summary.consumedCalories, 0);
     expect(summary.proteinConsumed, 0);
+  });
+
+  test('quantity edit patches the existing food log', () async {
+    final adapter = _NutritionDioAdapter();
+    adapter.existingLogs = [
+      {
+        'food_log_id': 'log-edit',
+        'food_id': 'catalog-food-1',
+        'food_name': 'Greek yogurt',
+        'quantity_g': 100,
+        'meal_type': 'breakfast',
+        'log_date': adapter.today,
+        'calories_snapshot': 120,
+        'protein_snapshot': 15,
+        'carbs_snapshot': 8,
+        'fat_snapshot': 2,
+      },
+    ];
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiNutritionRepository(dio);
+
+    await repository.saveFoodLogs(
+      _liveSession,
+      [
+        FoodLogDraft(
+          foodLogId: 'log-edit',
+          foodId: 'catalog-food-1',
+          logDate: DateTime.parse(adapter.today),
+          quantitySource: QuantitySource.explicit,
+          caloriesPer100g: 120,
+          proteinPer100g: 15,
+          carbsPer100g: 8,
+          fatPer100g: 2,
+          foodName: 'Greek yogurt',
+          quantityGrams: 150,
+          mealType: MealType.breakfast,
+          calories: 180,
+          protein: 22.5,
+          carbs: 12,
+          fat: 3,
+        ),
+      ],
+    );
+
+    expect(adapter.patchedFoodLogPayloads, [
+      {
+        'quantity_grams': 150.0,
+      },
+    ]);
   });
 
   test('food summary 404 falls back to food-log list aggregation', () async {
@@ -472,12 +597,16 @@ class _NutritionDioAdapter implements HttpClientAdapter {
   final createdFoodPayloads = <Map<String, dynamic>>[];
   final foodLogPayloads = <Map<String, dynamic>>[];
   final deletedLogIds = <String>[];
+  final patchedFoodLogPayloads = <Map<String, dynamic>>[];
   final summaryPaths = <String>[];
+  final foodSearchPaths = <String>[];
+  final foodSearchQueryParameters = <Map<String, dynamic>>[];
   List<Map<String, dynamic>> existingLogs = [];
   double summaryCalories = 500;
   double summaryProtein = 35;
   bool summaryUnsupported = false;
   bool offlineFoodCreate = false;
+  bool failFoodSearch = false;
 
   String get today => DateTime.now().toIso8601String().substring(0, 10);
 
@@ -510,6 +639,13 @@ class _NutritionDioAdapter implements HttpClientAdapter {
       });
     }
     if (options.method == 'GET' && options.path == '/food/search') {
+      foodSearchPaths.add(options.path);
+      foodSearchQueryParameters.add(Map<String, dynamic>.from(
+        options.queryParameters,
+      ));
+      if (failFoodSearch) {
+        return _json(500, {'detail': 'USDA unavailable'});
+      }
       return _json(200, {
         'success': true,
         'data': [
@@ -554,6 +690,25 @@ class _NutritionDioAdapter implements HttpClientAdapter {
           'protein_snapshot': 35,
           'carbs_snapshot': 45,
           'fat_snapshot': 18,
+        },
+      });
+    }
+    if (options.method == 'PATCH' && options.path.startsWith('/food-log/')) {
+      final payload = Map<String, dynamic>.from(options.data as Map);
+      patchedFoodLogPayloads.add(payload);
+      return _json(200, {
+        'success': true,
+        'data': {
+          'food_log_id': options.path.split('/').last,
+          'food_id': 'catalog-food-1',
+          'food_name': 'Greek yogurt',
+          'quantity_grams': payload['quantity_grams'],
+          'meal_type': 'breakfast',
+          'date': today,
+          'calories_snapshot': 180,
+          'protein_snapshot': 22.5,
+          'carbs_snapshot': 12,
+          'fat_snapshot': 3,
         },
       });
     }

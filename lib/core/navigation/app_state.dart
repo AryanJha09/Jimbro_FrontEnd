@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
@@ -88,11 +87,17 @@ class ProfileSyncResult {
     required this.profile,
     required this.metrics,
     this.warning,
+    this.profileSyncStatus = ProfileSyncStatus.synced,
+    this.atlasMetricsStatus = AtlasMetricsStatus.available,
+    this.lastSyncErrorCode,
   });
 
   final UserProfile profile;
   final UserStaticMetrics metrics;
   final String? warning;
+  final ProfileSyncStatus profileSyncStatus;
+  final AtlasMetricsStatus atlasMetricsStatus;
+  final String? lastSyncErrorCode;
 
   bool get hasWarning => warning != null && warning!.trim().isNotEmpty;
 }
@@ -126,6 +131,8 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       ref.read(workoutNotificationServiceProvider);
   NutritionRepository get _nutritionRepository =>
       ref.read(nutritionRepositoryProvider);
+  ProgramRepository get _programRepository =>
+      ref.read(programRepositoryProvider);
   ConsistencyRepository get _consistencyRepository =>
       ref.read(consistencyRepositoryProvider);
   SearchRepository get _searchRepository => ref.read(searchRepositoryProvider);
@@ -137,6 +144,7 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     ref.watch(workoutRepositoryProvider);
     ref.watch(workoutNotificationServiceProvider);
     ref.watch(nutritionRepositoryProvider);
+    ref.watch(programRepositoryProvider);
     ref.watch(consistencyRepositoryProvider);
     ref.watch(searchRepositoryProvider);
 
@@ -217,6 +225,14 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       current.copyWith(
         profile: result.profile,
         metrics: result.metrics,
+        profileSyncStatus: result.profileSyncStatus,
+        atlasMetricsStatus: result.atlasMetricsStatus,
+        lastLocalProfileUpdate: DateTime.now(),
+        lastBackendProfileUpdate:
+            result.profileSyncStatus == ProfileSyncStatus.synced
+                ? DateTime.now()
+                : null,
+        lastSyncErrorCode: result.lastSyncErrorCode,
         nutritionSummary: _applyTargetEstimate(
           current.nutritionSummary,
           result.metrics,
@@ -236,6 +252,24 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     if (current == null) {
       return null;
     }
+    final localMetrics = _localMetricsForProfile(profile);
+    state = AsyncData(
+      current.copyWith(
+        profile: profile,
+        metrics: localMetrics,
+        nutritionSummary: _applyTargetEstimate(
+          current.nutritionSummary,
+          localMetrics,
+          clearUnavailableTargets: !_metricsAreAvailable(localMetrics),
+        ),
+        profileSyncStatus: ProfileSyncStatus.pending,
+        atlasMetricsStatus: AtlasMetricsStatus.pending,
+        lastLocalProfileUpdate: DateTime.now(),
+        lastSyncErrorCode: null,
+        programGenerationChoice: ProgramGenerationChoice.pending,
+        programGenerationStatus: ProgramGenerationStatus.idle,
+      ),
+    );
     final result = await _syncOnboardingProfile(
       current: current,
       profile: profile,
@@ -264,10 +298,111 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
           result.metrics,
           clearUnavailableTargets: result.metrics.targetCalories <= 0,
         ),
+        profileSyncStatus: result.profileSyncStatus,
+        atlasMetricsStatus: result.atlasMetricsStatus,
+        lastLocalProfileUpdate: DateTime.now(),
+        lastBackendProfileUpdate:
+            result.profileSyncStatus == ProfileSyncStatus.synced
+                ? DateTime.now()
+                : null,
+        lastSyncErrorCode: result.lastSyncErrorCode,
+        programGenerationChoice: ProgramGenerationChoice.pending,
+        programGenerationStatus: ProgramGenerationStatus.idle,
       ),
     );
     _refreshAgentContext(current.session);
     return result;
+  }
+
+  Future<ProgramGenerationResult> generateProgramAfterOnboarding() async {
+    final current = state.valueOrNull;
+    if (current == null) {
+      return const ProgramGenerationResult.failure(
+        'Jim could not build your split yet. You can retry or skip for now.',
+      );
+    }
+    if (current.programGenerationStatus == ProgramGenerationStatus.generating) {
+      return const ProgramGenerationResult.failure(
+        'Jim is already building your split.',
+      );
+    }
+
+    state = AsyncData(
+      current.copyWith(
+        programGenerationChoice: ProgramGenerationChoice.accepted,
+        programGenerationStatus: ProgramGenerationStatus.generating,
+      ),
+    );
+
+    final result = await _programRepository.generateProgram(current.session);
+    final latest = state.valueOrNull ?? current;
+    if (!result.isSuccess) {
+      state = AsyncData(
+        latest.copyWith(
+          programGenerationChoice: ProgramGenerationChoice.accepted,
+          programGenerationStatus: ProgramGenerationStatus.failed,
+        ),
+      );
+      return result;
+    }
+
+    var templates = latest.templates;
+    var template = latest.template;
+    var schedule = latest.workoutSchedule;
+    var workoutLog = latest.workoutLog;
+    if (latest.session != null) {
+      templates = await _loadOrDefault(
+        () => _workoutRepository.loadTemplates(latest.session),
+        latest.templates,
+      );
+      if (templates.isNotEmpty) {
+        template = templates.last;
+      }
+      schedule = await _loadOrDefault(
+        () => _workoutRepository.loadSchedule(latest.session),
+        latest.workoutSchedule,
+      );
+      workoutLog = await _loadOrDefault(
+        () => _workoutRepository.loadWorkoutLog(latest.session),
+        latest.workoutLog,
+      );
+    }
+
+    state = AsyncData(
+      latest.copyWith(
+        templates: templates,
+        template: template,
+        workoutSchedule: schedule,
+        workoutLog: workoutLog,
+        programGenerationChoice: ProgramGenerationChoice.accepted,
+        programGenerationStatus: ProgramGenerationStatus.generated,
+      ),
+    );
+    _refreshAgentContext(latest.session);
+    ref.read(currentTabProvider.notifier).state = 0;
+    return result;
+  }
+
+  Future<void> skipProgramGenerationAfterOnboarding() async {
+    final current = state.valueOrNull;
+    if (current == null) {
+      return;
+    }
+    state = AsyncData(
+      current.copyWith(
+        programGenerationChoice: ProgramGenerationChoice.skipped,
+        programGenerationStatus: ProgramGenerationStatus.idle,
+      ),
+    );
+    ref.read(currentTabProvider.notifier).state = 0;
+  }
+
+  Future<ProfileSyncResult?> retryProfileSync() async {
+    final current = state.valueOrNull;
+    if (current == null) {
+      return null;
+    }
+    return updateProfile(current.profile);
   }
 
   Future<void> updateProfileDraft(UserProfile profile) async {
@@ -1102,7 +1237,10 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     );
     if (kDebugMode) {
       debugPrint(
-        'JimBro workout log before repository: ${jsonEncode(_workoutLogDebugMap(draftToLog))}',
+        'JimBro workout log prepared: '
+        'exercise_count=${draftToLog.exercises.length} '
+        'set_count=${draftToLog.exercises.fold<int>(0, (total, exercise) => total + exercise.sets.length)}. '
+        'No member or exercise values logged.',
       );
     }
     final savedLog = await _runProtectedAction(
@@ -1371,7 +1509,7 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
         session: current.session,
         profile: canonicalProfile,
       );
-      final metrics = await _runProtectedAction(
+      var metrics = await _runProtectedAction(
         () => _profileRepository.submitAtlasOnboarding(
           current.session,
           canonicalProfile,
@@ -1379,6 +1517,29 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
           account,
         ),
       );
+      try {
+        final patchedMetrics = await _runProtectedAction(
+          () => _profileRepository.patchAtlasProfile(
+            current.session,
+            previous: current.profile,
+            next: canonicalProfile,
+          ),
+        );
+        if (_metricsAreAvailable(patchedMetrics)) {
+          metrics = patchedMetrics;
+        }
+      } on AuthSessionExpiredException {
+        rethrow;
+      } on Exception {
+        // Onboarding metrics remain usable when the follow-up profile patch
+        // is not yet supported by the deployed coaching service.
+      }
+      if (!_metricsAreAvailable(metrics)) {
+        return _fallbackProfileSync(
+          canonicalProfile,
+          'Your setup is saved on this device. Atlas is still preparing your coaching targets.',
+        );
+      }
       return ProfileSyncResult(profile: canonicalProfile, metrics: metrics);
     } on AtlasOnboardingCredentialException catch (error) {
       return _fallbackProfileSync(canonicalProfile, error.message);
@@ -1394,11 +1555,10 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       );
     } on AuthSessionExpiredException {
       rethrow;
-    } on Exception catch (error) {
+    } on Exception {
       return _fallbackProfileSync(
         canonicalProfile,
-        'Your setup is saved on this device. Jim will sync it when the coaching service is available.'
-        '${kDebugMode ? '\nAtlas sync detail: ${error.runtimeType}' : ''}',
+        'Your setup is saved on this device. Jim will sync it when the coaching service is available.',
       );
     }
   }
@@ -1420,32 +1580,50 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       return ProfileSyncResult(profile: saved, metrics: savedMetrics);
     }
 
+    var canonicalProfile = profile;
+    try {
+      canonicalProfile = await _profileRepository.saveProfile(
+        current.session,
+        profile,
+      );
+    } on AuthSessionExpiredException {
+      rethrow;
+    } on Exception {
+      // Keep the submitted profile canonical locally while backend profile
+      // persistence recovers.
+    }
+
     try {
       final metrics = await _runProtectedAction(
         () => _profileRepository.patchAtlasProfile(
           current.session,
           previous: current.profile,
-          next: profile,
+          next: canonicalProfile,
         ),
       );
-      return ProfileSyncResult(profile: profile, metrics: metrics);
+      if (!_metricsAreAvailable(metrics)) {
+        return _fallbackProfileSync(
+          canonicalProfile,
+          'Your profile is saved. Atlas is still preparing your coaching targets.',
+        );
+      }
+      return ProfileSyncResult(profile: canonicalProfile, metrics: metrics);
     } on AtlasProfileSyncException catch (error) {
-      return _fallbackProfileSync(profile, error.message);
+      return _fallbackProfileSync(canonicalProfile, error.message);
     } on DioException catch (error) {
       if (!_isRecoverableStartupFailure(error)) {
         rethrow;
       }
       return _fallbackProfileSync(
-        profile,
+        canonicalProfile,
         'Atlas is unavailable right now, so Jim kept local estimates. Try saving your profile again later.',
       );
     } on AuthSessionExpiredException {
       rethrow;
-    } on Exception catch (error) {
+    } on Exception {
       return _fallbackProfileSync(
-        profile,
-        'Atlas could not refresh metrics yet. Jim kept local estimates.\n'
-        '${kDebugMode ? error.toString() : ''}',
+        canonicalProfile,
+        'Atlas could not refresh metrics yet. Jim kept local estimates.',
       );
     }
   }
@@ -1455,6 +1633,9 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       profile: profile,
       metrics: _localMetricsForProfile(profile),
       warning: warning.trim().isEmpty ? null : warning.trim(),
+      profileSyncStatus: ProfileSyncStatus.pending,
+      atlasMetricsStatus: AtlasMetricsStatus.pending,
+      lastSyncErrorCode: 'atlas_sync_pending',
     );
   }
 
@@ -1526,10 +1707,6 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
           cutIntensity: '',
         ),
       ),
-      _loadOrDefault<WorkoutTemplateDraft>(
-        () => _workoutRepository.loadTemplate(session),
-        WorkoutTemplateDraft.empty,
-      ),
       _loadOrDefault<List<WorkoutTemplateDraft>>(
         () => _workoutRepository.loadTemplates(session),
         const <WorkoutTemplateDraft>[],
@@ -1561,13 +1738,12 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       ),
     ]);
 
-    final template = results[2] as WorkoutTemplateDraft;
-    final loadedTemplates = results[3] as List<WorkoutTemplateDraft>;
-    final templates = loadedTemplates.isEmpty && template.name.isNotEmpty
-        ? <WorkoutTemplateDraft>[template]
-        : loadedTemplates;
-    final workoutSchedule = results[4] as List<WorkoutScheduleEntry>;
-    final loadedWorkoutLog = results[5] as WorkoutLogDraft;
+    final loadedTemplates = results[2] as List<WorkoutTemplateDraft>;
+    final templates = loadedTemplates;
+    final template =
+        templates.isEmpty ? WorkoutTemplateDraft.empty : templates.last;
+    final workoutSchedule = results[3] as List<WorkoutScheduleEntry>;
+    final loadedWorkoutLog = results[4] as WorkoutLogDraft;
     final workoutLog = loadedWorkoutLog.name.isEmpty &&
             loadedWorkoutLog.notes.isEmpty &&
             loadedWorkoutLog.exercises.isEmpty
@@ -1586,7 +1762,7 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
         : targetEstimate.hasRequiredProfile
             ? targetEstimate.toMetrics()
             : loadedMetrics;
-    final loadedSummary = results[7] as DailyNutritionSummary;
+    final loadedSummary = results[6] as DailyNutritionSummary;
     final summaryWithTargets = _applyTargetEstimate(
       loadedSummary,
       estimatedMetrics,
@@ -1595,7 +1771,7 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     final nutritionSummary = isLiveSession
         ? summaryWithTargets
         : _rebuildNutritionSummary(
-            logs: results[6] as List<FoodLogDraft>,
+            logs: results[5] as List<FoodLogDraft>,
             base: summaryWithTargets,
           );
 
@@ -1607,10 +1783,16 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       templates: templates,
       workoutSchedule: workoutSchedule,
       workoutLog: workoutLog,
-      foodLogs: results[6] as List<FoodLogDraft>,
+      foodLogs: results[5] as List<FoodLogDraft>,
       nutritionSummary: nutritionSummary,
-      consistency: results[8] as ConsistencyState,
+      consistency: results[7] as ConsistencyState,
       search: _searchRepository.emptyState(),
+      profileSyncStatus: ProfileSyncStatus.synced,
+      atlasMetricsStatus: _metricsAreAvailable(loadedMetrics)
+          ? AtlasMetricsStatus.available
+          : _metricsAreAvailable(estimatedMetrics)
+              ? AtlasMetricsStatus.pending
+              : AtlasMetricsStatus.unavailable,
     );
   }
 
@@ -1728,36 +1910,6 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     ref.read(currentTabProvider.notifier).state = 0;
     state = AsyncData(await _loadDraftForSession(null));
   }
-}
-
-Map<String, Object?> _workoutLogDebugMap(WorkoutLogDraft log) {
-  return {
-    'workout_log_id': log.workoutLogId,
-    'template_id': log.templateId,
-    'name': log.name,
-    'notes': log.notes,
-    'started_at_label': log.startedAtLabel,
-    'ended_at_label': log.endedAtLabel,
-    'exercises': log.exercises.asMap().entries.map((entry) {
-      final exercise = entry.value;
-      return {
-        'exercise_id': exercise.exerciseId,
-        'exercise_name': exercise.exerciseName,
-        'order_index': entry.key,
-        'notes': exercise.notes,
-        'sets': exercise.sets.map((setDraft) {
-          return {
-            'set_number': setDraft.setNumber,
-            'reps': setDraft.reps,
-            'weight_kg': setDraft.weightKg,
-            'is_warmup': setDraft.isWarmup,
-            'is_completed': setDraft.isCompleted,
-            'rpe': setDraft.rpe,
-          };
-        }).toList(),
-      };
-    }).toList(),
-  };
 }
 
 WorkoutLogDraft _syncWorkoutLogWithTemplateIfIdle(

@@ -4,6 +4,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:jimbro/app/app.dart';
+import 'package:jimbro/core/repositories/app_repositories.dart';
+import 'package:jimbro/shared/models/app_models.dart';
 
 void main() {
   setUp(() {
@@ -28,6 +30,75 @@ void main() {
     expect(find.text('Training streak'), findsOneWidget);
     expect(find.text('Recent volume'), findsOneWidget);
     expect(find.text('Next workout'), findsOneWidget);
+  });
+
+  testWidgets('onboarding completion shows optional split generation choice',
+      (tester) async {
+    await tester.pumpWidget(const ProviderScope(child: JimBroApp()));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Continue with Google'));
+    await tester.pumpAndSettle();
+    await completeOnboardingFlow(tester, finishProgramChoice: false);
+
+    expect(
+      find.text('Want Jim to generate your weekly workout split?'),
+      findsOneWidget,
+    );
+    expect(
+        find.byKey(const ValueKey('generate-program-button')), findsOneWidget);
+    expect(find.byKey(const ValueKey('skip-program-button')), findsOneWidget);
+  });
+
+  testWidgets('program generation skip enters Home without backend call',
+      (tester) async {
+    final programs = _CountingProgramRepository();
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [programRepositoryProvider.overrideWithValue(programs)],
+        child: const JimBroApp(),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Continue with Google'));
+    await tester.pumpAndSettle();
+    await completeOnboardingFlow(tester, finishProgramChoice: false);
+    await tester.tap(find.byKey(const ValueKey('skip-program-button')));
+    await tester.pumpAndSettle();
+
+    expect(programs.generateCalls, 0);
+    expect(find.text('Today\'s focus'), findsOneWidget);
+  });
+
+  testWidgets('program generation failure shows retry and keeps app entry open',
+      (tester) async {
+    final programs = _CountingProgramRepository(succeed: false);
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [programRepositoryProvider.overrideWithValue(programs)],
+        child: const JimBroApp(),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Continue with Google'));
+    await tester.pumpAndSettle();
+    await completeOnboardingFlow(tester, finishProgramChoice: false);
+    await tester.tap(find.byKey(const ValueKey('generate-program-button')));
+    await tester.pumpAndSettle();
+
+    expect(programs.generateCalls, 1);
+    expect(
+      find.text('Your profile is saved. Jim couldn’t build the split yet.'),
+      findsOneWidget,
+    );
+    expect(find.text('Retry'), findsOneWidget);
+    expect(find.text('Skip for now'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('skip-program-button')));
+    await tester.pumpAndSettle();
+    expect(find.text('Today\'s focus'), findsOneWidget);
   });
 
   testWidgets('home primary CTA opens workout flow', (tester) async {
@@ -106,7 +177,7 @@ void main() {
 
     expect(
         find.text('Ready to set up your first coaching plan?'), findsOneWidget);
-    await completeOnboardingFlow(tester);
+    await completeOnboardingFlow(tester, finishProgramChoice: false);
 
     expect(find.text('Shape your coaching plan'), findsOneWidget);
 
@@ -241,7 +312,10 @@ Future<void> enterApp(WidgetTester tester) async {
   await completeOnboardingFlow(tester);
 }
 
-Future<void> completeOnboardingFlow(WidgetTester tester) async {
+Future<void> completeOnboardingFlow(
+  WidgetTester tester, {
+  bool finishProgramChoice = true,
+}) async {
   await tapOnboardingCta(tester, 'Start setup');
   await selectOnboardingOption(tester, 'Build muscle');
   await tapOnboardingCta(tester, 'Continue');
@@ -267,6 +341,10 @@ Future<void> completeOnboardingFlow(WidgetTester tester) async {
   await tapOnboardingCta(tester, 'Continue');
   await tapOnboardingCta(tester, 'Start my plan');
   await tester.pumpAndSettle();
+  if (finishProgramChoice && find.text('Skip for now').evaluate().isNotEmpty) {
+    await tester.tap(find.byKey(const ValueKey('skip-program-button')));
+    await tester.pumpAndSettle();
+  }
 }
 
 Future<void> tapBottomNav(WidgetTester tester, IconData icon) async {
@@ -358,4 +436,22 @@ Future<void> tapOnboardingCta(
   await tester.ensureVisible(find.text(label).last);
   await tester.tap(find.text(label).last);
   await tester.pumpAndSettle();
+}
+
+class _CountingProgramRepository implements ProgramRepository {
+  _CountingProgramRepository({this.succeed = true});
+
+  final bool succeed;
+  int generateCalls = 0;
+
+  @override
+  Future<ProgramGenerationResult> generateProgram(AuthSession? session) async {
+    generateCalls++;
+    if (succeed) {
+      return const ProgramGenerationResult.success();
+    }
+    return const ProgramGenerationResult.failure(
+      'Jim could not build your split yet. You can retry or skip for now.',
+    );
+  }
 }
