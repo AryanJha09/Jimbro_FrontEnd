@@ -25,8 +25,33 @@ abstract class AuthRepository {
   Future<void> signOut();
 }
 
+class AccountDeletionResult {
+  const AccountDeletionResult({
+    required this.deleted,
+    this.alreadyDeleted = false,
+  });
+
+  final bool deleted;
+  final bool alreadyDeleted;
+}
+
+abstract class AccountRepository {
+  Future<AccountDeletionResult> deleteAccount(AuthSession session);
+}
+
 class AuthSessionExpiredException implements Exception {
   const AuthSessionExpiredException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+class AccountDeletionException implements Exception {
+  const AccountDeletionException([
+    this.message = 'Unable to delete your account. Please try again.',
+  ]);
 
   final String message;
 
@@ -224,6 +249,50 @@ class MockAuthRepository implements AuthRepository {
   @override
   Future<void> signOut() async {
     _session = null;
+  }
+}
+
+class MockAccountRepository implements AccountRepository {
+  @override
+  Future<AccountDeletionResult> deleteAccount(AuthSession session) async {
+    return const AccountDeletionResult(deleted: true);
+  }
+}
+
+class FastApiAccountRepository implements AccountRepository {
+  FastApiAccountRepository(this._dio);
+
+  final Dio _dio;
+
+  @override
+  Future<AccountDeletionResult> deleteAccount(AuthSession session) async {
+    try {
+      final response = await _requestWithSessionRetry(
+        _dio,
+        session,
+        (headers) => _dio.delete<dynamic>(
+          '/account',
+          options: Options(
+            headers: {
+              ...headers,
+              'Accept': 'application/json',
+            },
+          ),
+        ),
+      );
+      final body = _asMap(response.data);
+      final data = _asMap(body['data']);
+      final deleted = data['deleted'] == true;
+      if (response.statusCode != 200 || body['success'] != true || !deleted) {
+        throw const AccountDeletionException();
+      }
+      return AccountDeletionResult(
+        deleted: true,
+        alreadyDeleted: data['already_deleted'] == true,
+      );
+    } catch (_) {
+      throw const AccountDeletionException();
+    }
   }
 }
 
@@ -2856,6 +2925,11 @@ class OfflineOutboxStore {
     );
   }
 
+  Future<void> clear(AuthSession? session) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_key(session));
+  }
+
   Future<void> update(AuthSession? session, OfflineOutboxItem item) async {
     final current = await load(session);
     await replace(
@@ -2940,6 +3014,11 @@ class LocalWorkoutScheduleStore {
     await replace(session, updated);
   }
 
+  Future<void> clear(AuthSession? session) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_key(session));
+  }
+
   String _key(AuthSession? session) {
     final userId = session?.userId.trim();
     return 'jimbro.workout_schedule.${userId == null || userId.isEmpty ? 'local' : userId}';
@@ -2954,6 +3033,37 @@ class LocalWorkoutScheduleStore {
     return 'local-${entry.weekday}-$templateKey';
   }
 }
+
+class LocalAccountDataStore {
+  const LocalAccountDataStore({
+    this.outbox = const OfflineOutboxStore(),
+    this.workoutSchedule = const LocalWorkoutScheduleStore(),
+  });
+
+  final OfflineOutboxStore outbox;
+  final LocalWorkoutScheduleStore workoutSchedule;
+
+  Future<void> clearDeletedAccount(AuthSession session) async {
+    await outbox.clear(session);
+    await workoutSchedule.clear(session);
+    final prefs = await SharedPreferences.getInstance();
+    final encodedUserId = Uri.encodeComponent(session.userId);
+    await prefs.remove('jimbro.onboarding.v1.$encodedUserId');
+    await prefs.remove('jimbro.onboarding.v1.$encodedUserId.tmp');
+  }
+}
+
+final localAccountDataStoreProvider = Provider<LocalAccountDataStore>(
+  (ref) => const LocalAccountDataStore(),
+);
+
+final accountRepositoryProvider = Provider<AccountRepository>((ref) {
+  final config = ref.watch(appConfigProvider);
+  if (!config.useLiveBackend) {
+    return MockAccountRepository();
+  }
+  return FastApiAccountRepository(ref.watch(dioProvider));
+});
 
 final authRepositoryProvider = Provider<AuthRepository>((ref) {
   final config = ref.watch(appConfigProvider);

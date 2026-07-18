@@ -58,6 +58,7 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
   late String _trainingPreference;
   bool _isSaving = false;
   bool _isRetryingSync = false;
+  bool _isDeletingAccount = false;
 
   UserProfile get _profile => widget.draft.profile;
 
@@ -233,6 +234,11 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
           icon: Icons.logout_rounded,
           expand: true,
           onPressed: _signOut,
+        ),
+        const SizedBox(height: JimSpacing.sm),
+        _DeleteAccountButton(
+          isLoading: _isDeletingAccount,
+          onPressed: _isDeletingAccount ? null : _confirmDeleteAccount,
         ),
         const SizedBox(height: JimSpacing.md),
         if (draft.profileSyncStatus != ProfileSyncStatus.synced ||
@@ -478,6 +484,66 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
     await ref.read(appDraftProvider.notifier).signOut();
   }
 
+  Future<void> _confirmDeleteAccount() async {
+    if (_isDeletingAccount) {
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) {
+            final colorScheme = Theme.of(dialogContext).colorScheme;
+            return AlertDialog(
+              title: const Text('Delete your account?'),
+              content: const Text(
+                'This permanently deletes your account and all your data. '
+                'This cannot be undone.',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(false),
+                  child: const Text('Cancel'),
+                ),
+                TextButton(
+                  style: TextButton.styleFrom(
+                    foregroundColor: colorScheme.error,
+                  ),
+                  onPressed: () => Navigator.of(dialogContext).pop(true),
+                  child: const Text('Delete'),
+                ),
+              ],
+            );
+          },
+        ) ??
+        false;
+    if (!mounted || !confirmed) {
+      return;
+    }
+    await _deleteAccount();
+  }
+
+  Future<void> _deleteAccount() async {
+    if (_isDeletingAccount) {
+      return;
+    }
+    setState(() => _isDeletingAccount = true);
+    try {
+      await ref.read(appDraftProvider.notifier).deleteAccount();
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Unable to delete your account. Please try again.'),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isDeletingAccount = false);
+      }
+    }
+  }
+
   Future<void> _retryProfileSync() async {
     setState(() => _isRetryingSync = true);
     try {
@@ -537,6 +603,69 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
       return message;
     }
     return null;
+  }
+}
+
+class _DeleteAccountButton extends StatelessWidget {
+  const _DeleteAccountButton({
+    required this.isLoading,
+    required this.onPressed,
+  });
+
+  final bool isLoading;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Semantics(
+      button: true,
+      label: isLoading ? 'Deleting account' : 'Delete Account',
+      child: OutlinedButton(
+        key: const ValueKey('profile-delete-account-button'),
+        onPressed: onPressed,
+        style: OutlinedButton.styleFrom(
+          foregroundColor: JimColors.terracotta,
+          disabledForegroundColor: JimColors.terracotta.withValues(alpha: .55),
+          side: BorderSide(
+            color: isLoading
+                ? JimColors.terracotta.withValues(alpha: .35)
+                : JimColors.terracotta.withValues(alpha: .62),
+          ),
+          minimumSize: const Size(0, 52),
+          padding: const EdgeInsets.symmetric(
+            horizontal: JimSpacing.lg,
+            vertical: 15,
+          ),
+          backgroundColor: colorScheme.error.withValues(alpha: .06),
+          textStyle: Theme.of(context).textTheme.labelLarge,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(JimRadius.pill),
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.max,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            if (isLoading)
+              SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2.2,
+                  valueColor: AlwaysStoppedAnimation<Color>(
+                    JimColors.terracotta.withValues(alpha: .78),
+                  ),
+                ),
+              )
+            else
+              const Icon(Icons.delete_forever_rounded, size: 18),
+            const SizedBox(width: 10),
+            Text(isLoading ? 'Deleting...' : 'Delete Account'),
+          ],
+        ),
+      ),
+    );
   }
 }
 

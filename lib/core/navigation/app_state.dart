@@ -123,6 +123,10 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
   _TransientOnboardingPassword? _transientOnboardingPassword;
 
   AuthRepository get _authRepository => ref.read(authRepositoryProvider);
+  AccountRepository get _accountRepository =>
+      ref.read(accountRepositoryProvider);
+  LocalAccountDataStore get _localAccountDataStore =>
+      ref.read(localAccountDataStoreProvider);
   ProfileRepository get _profileRepository =>
       ref.read(profileRepositoryProvider);
   WorkoutRepository get _workoutRepository =>
@@ -140,6 +144,8 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
   @override
   Future<AppDraftState> build() async {
     ref.watch(authRepositoryProvider);
+    ref.watch(accountRepositoryProvider);
+    ref.watch(localAccountDataStoreProvider);
     ref.watch(profileRepositoryProvider);
     ref.watch(workoutRepositoryProvider);
     ref.watch(workoutNotificationServiceProvider);
@@ -201,15 +207,21 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
   }
 
   Future<void> signOut() async {
-    _transientOnboardingPassword = null;
-    await _authRepository.signOut();
-    ref.read(authSessionProvider.notifier).state = null;
-    ref.read(isAuthenticatedProvider.notifier).state = false;
-    ref.read(hasCompletedOnboardingProvider.notifier).state = false;
-    ref.read(forceShowOnboardingProvider.notifier).state = false;
-    ref.read(currentTabProvider.notifier).state = 0;
-    state = const AsyncLoading();
-    state = await AsyncValue.guard(() => _loadDraftForSession(null));
+    await _clearLocalSession();
+  }
+
+  Future<void> deleteAccount() async {
+    final current = state.valueOrNull;
+    if (current == null) {
+      throw const AccountDeletionException();
+    }
+    final session = await _requireSessionForProtectedAction(
+      current,
+      source: 'lib/core/navigation/app_state.dart -> deleteAccount',
+      feature: 'account deletion',
+    );
+    await _accountRepository.deleteAccount(session);
+    await _clearLocalSession(deletedAccount: session);
   }
 
   Future<ProfileSyncResult?> updateProfile(UserProfile profile) async {
@@ -1667,6 +1679,36 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     if (loaded != null && _profileLooksOnboarded(loaded.profile)) {
       ref.read(hasCompletedOnboardingProvider.notifier).state = true;
     }
+  }
+
+  Future<void> _clearLocalSession({AuthSession? deletedAccount}) async {
+    _transientOnboardingPassword = null;
+    try {
+      await _authRepository.signOut();
+    } catch (_) {
+      if (deletedAccount == null) {
+        rethrow;
+      }
+    }
+    ref.read(authSessionProvider.notifier).state = null;
+    ref.read(isAuthenticatedProvider.notifier).state = false;
+    ref.read(hasCompletedOnboardingProvider.notifier).state = false;
+    ref.read(forceShowOnboardingProvider.notifier).state = false;
+    ref.read(currentTabProvider.notifier).state = 0;
+    state = const AsyncLoading();
+    if (deletedAccount != null) {
+      try {
+        await _localAccountDataStore.clearDeletedAccount(deletedAccount);
+      } catch (error) {
+        if (kDebugMode) {
+          debugPrint(
+            'JimBro deleted-account local cleanup deferred: '
+            '${error.runtimeType}. No account data values logged.',
+          );
+        }
+      }
+    }
+    state = await AsyncValue.guard(() => _loadDraftForSession(null));
   }
 
   Future<AppDraftState> _loadDraftForSession(AuthSession? session) async {
