@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../core/errors/app_error.dart';
 import '../../../core/navigation/app_state.dart';
-import '../../../core/repositories/app_repositories.dart';
 import '../../../core/theme/jim_tokens.dart';
 import '../../../shared/components/backend_state_view.dart';
 import '../../../shared/components/jim_companion.dart';
@@ -63,6 +63,7 @@ class _OnboardingPreviewFlow extends ConsumerStatefulWidget {
 class _OnboardingPreviewFlowState
     extends ConsumerState<_OnboardingPreviewFlow> {
   bool _isFinishing = false;
+  bool _isContinuing = false;
 
   @override
   Widget build(BuildContext context) {
@@ -79,6 +80,7 @@ class _OnboardingPreviewFlowState
         body: _OnboardingScaffold(
           onboarding: onboarding,
           isFinishing: _isFinishing,
+          isSaving: _isContinuing,
           onBack: _handleBack,
           onContinue: () => _handleContinue(onboarding),
           onFinish: () => _handleFinish(onboarding),
@@ -88,6 +90,9 @@ class _OnboardingPreviewFlowState
   }
 
   Future<void> _handleBack() async {
+    if (_isContinuing || _isFinishing) {
+      return;
+    }
     final onboarding = ref.read(onboardingControllerProvider).valueOrNull;
     final step = OnboardingStepId.fromWireValue(
       onboarding?.currentStepId ?? OnboardingStepId.welcome.wireValue,
@@ -100,10 +105,23 @@ class _OnboardingPreviewFlowState
   }
 
   Future<void> _handleContinue(OnboardingStateModel onboarding) async {
-    await _continueOnboarding(ref, onboarding);
+    if (_isContinuing || _isFinishing) {
+      return;
+    }
+    setState(() => _isContinuing = true);
+    try {
+      await _continueOnboarding(ref, onboarding);
+    } finally {
+      if (mounted) {
+        setState(() => _isContinuing = false);
+      }
+    }
   }
 
   Future<void> _handleFinish(OnboardingStateModel onboarding) async {
+    if (_isContinuing || _isFinishing) {
+      return;
+    }
     final controller = ref.read(onboardingControllerProvider.notifier);
     final validation = controller.validateForCompletion(onboarding);
     if (!validation.isValid) {
@@ -114,11 +132,13 @@ class _OnboardingPreviewFlowState
     }
 
     setState(() => _isFinishing = true);
-    await controller.complete();
-    if (!mounted) {
-      return;
+    final completed = await controller.complete();
+    if (mounted) {
+      setState(() => _isFinishing = false);
+      if (completed) {
+        await Navigator.of(context).maybePop();
+      }
     }
-    await Navigator.of(context).maybePop();
   }
 }
 
@@ -144,6 +164,7 @@ class _InMemoryOnboardingPersistenceStore
 
 class _OnboardingPageState extends ConsumerState<OnboardingPage> {
   bool _isFinishing = false;
+  bool _isContinuing = false;
   bool _showProgramChoice = false;
   String? _programGenerationError;
 
@@ -187,6 +208,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
         return _OnboardingScaffold(
           onboarding: onboarding,
           isFinishing: _isFinishing,
+          isSaving: _isContinuing,
           onBack: _handleBack,
           onContinue: () => _handleContinue(onboarding),
           onFinish: () => _handleFinish(draft, onboarding),
@@ -196,17 +218,33 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
   }
 
   Future<void> _handleBack() async {
+    if (_isContinuing || _isFinishing) {
+      return;
+    }
     await ref.read(onboardingControllerProvider.notifier).goBack();
   }
 
   Future<void> _handleContinue(OnboardingStateModel onboarding) async {
-    await _continueOnboarding(ref, onboarding);
+    if (_isContinuing || _isFinishing) {
+      return;
+    }
+    setState(() => _isContinuing = true);
+    try {
+      await _continueOnboarding(ref, onboarding);
+    } finally {
+      if (mounted) {
+        setState(() => _isContinuing = false);
+      }
+    }
   }
 
   Future<void> _handleFinish(
     AppDraftState draft,
     OnboardingStateModel onboarding,
   ) async {
+    if (_isContinuing || _isFinishing) {
+      return;
+    }
     final controller = ref.read(onboardingControllerProvider.notifier);
     final validation = controller.validateForCompletion(onboarding);
     if (!validation.isValid) {
@@ -220,9 +258,11 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
     try {
       final isDevRestart = kDebugMode && ref.read(forceShowOnboardingProvider);
       if (isDevRestart) {
-        await controller.complete();
+        if (!await controller.complete()) {
+          return;
+        }
         ref.read(forceShowOnboardingProvider.notifier).state = false;
-        ref.read(hasCompletedOnboardingProvider.notifier).state = true;
+        ref.read(appDraftProvider.notifier).markOnboardingComplete();
         return;
       }
 
@@ -242,9 +282,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
           answers.trainingPreference,
         ),
         activityLevel: _activityTitle(answers.activityLevel),
-        dietaryPreference: _dietaryPreferenceTitle(
-          answers.dietaryPreference,
-        ),
+        dietaryPreference: answers.dietaryPreference?.wireValue ?? '',
         goalTimeframe: _frequencyToTimeframe(
           onboarding.inference.recommendedFrequency,
         ),
@@ -255,7 +293,9 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
                 profile: profile,
                 answers: answers,
               );
-      await controller.complete();
+      if (!await controller.complete()) {
+        return;
+      }
       if (kDebugMode) {
         ref.read(forceShowOnboardingProvider.notifier).state = false;
       }
@@ -275,22 +315,35 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
       if (!mounted) {
         return;
       }
-      final message = error is AtlasOnboardingCredentialException
-          ? error.message
-          : 'I could not save the plan yet. Your setup is still here.';
-      await showDialog<void>(
+      final message = presentAppError(
+        error,
+        fallbackMessage:
+            'Your account is ready, but we could not save your profile. Your answers are still here. Please try again.',
+        method: 'POST',
+        route: '/supabase/profile',
+      );
+      final retry = await showDialog<bool>(
         context: context,
         builder: (context) => AlertDialog(
           title: const Text('Your answers are safe'),
           content: Text(message),
           actions: [
             TextButton(
-              onPressed: () => Navigator.of(context).pop(),
+              onPressed: () => Navigator.of(context).pop(false),
               child: const Text('Close'),
+            ),
+            FilledButton(
+              key: const ValueKey('retry-onboarding-save-button'),
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Try again'),
             ),
           ],
         ),
       );
+      if (retry == true && mounted) {
+        setState(() => _isFinishing = false);
+        await _handleFinish(draft, onboarding);
+      }
     } finally {
       if (mounted) {
         setState(() => _isFinishing = false);
@@ -311,8 +364,11 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
       return;
     }
     if (result.isSuccess) {
-      await ref.read(onboardingControllerProvider.notifier).complete();
-      ref.read(hasCompletedOnboardingProvider.notifier).state = true;
+      final completed =
+          await ref.read(onboardingControllerProvider.notifier).complete();
+      if (completed) {
+        ref.read(appDraftProvider.notifier).markOnboardingComplete();
+      }
       return;
     }
     setState(() {
@@ -328,8 +384,11 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage> {
     if (!mounted) {
       return;
     }
-    await ref.read(onboardingControllerProvider.notifier).complete();
-    ref.read(hasCompletedOnboardingProvider.notifier).state = true;
+    final completed =
+        await ref.read(onboardingControllerProvider.notifier).complete();
+    if (completed) {
+      ref.read(appDraftProvider.notifier).markOnboardingComplete();
+    }
   }
 
   String _resolvedProfileName(AppDraftState draft) {
@@ -486,6 +545,7 @@ class _OnboardingScaffold extends StatelessWidget {
   const _OnboardingScaffold({
     required this.onboarding,
     required this.isFinishing,
+    required this.isSaving,
     required this.onBack,
     required this.onContinue,
     required this.onFinish,
@@ -493,6 +553,7 @@ class _OnboardingScaffold extends StatelessWidget {
 
   final OnboardingStateModel onboarding;
   final bool isFinishing;
+  final bool isSaving;
   final VoidCallback onBack;
   final VoidCallback onContinue;
   final VoidCallback onFinish;
@@ -526,7 +587,9 @@ class _OnboardingScaffold extends StatelessWidget {
               children: [
                 _ProgressHeader(
                   progress: progress,
-                  canGoBack: step != OnboardingStepId.welcome,
+                  canGoBack: step != OnboardingStepId.welcome &&
+                      !isSaving &&
+                      !isFinishing,
                   onBack: onBack,
                 ),
                 Expanded(
@@ -553,8 +616,10 @@ class _OnboardingScaffold extends StatelessWidget {
                 ),
                 _BottomCta(
                   label: isSummary ? 'Start my plan' : spec.ctaLabel,
-                  enabled: isSummary ? !isFinishing : canContinue,
-                  isLoading: isFinishing,
+                  enabled: isSummary
+                      ? !isFinishing && !isSaving
+                      : canContinue && !isSaving,
+                  isLoading: isFinishing || isSaving,
                   onPressed: isSummary ? onFinish : onContinue,
                 ),
               ],
@@ -973,8 +1038,12 @@ class _CoachInsightCard extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 12),
-              Text('Jim noticed',
-                  style: Theme.of(context).textTheme.titleLarge),
+              Expanded(
+                child: Text(
+                  'Jim noticed',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 16),
@@ -1569,45 +1638,45 @@ _ScreenSpec _screenSpecFor(
       ),
     OnboardingStepId.dietaryPreference => _ScreenSpec(
         intro: 'Food guidance should fit the way you actually eat.',
-        question: 'How would you like JimBro to support your food habits?',
+        question: 'Which dietary preference fits you best?',
         supporting:
-            'This is not about perfection. It helps me choose the right level of guidance.',
+            'Choose one so Jim can personalize nutrition guidance safely.',
         ctaLabel: 'Continue',
         stage: JimCompanionStage.armored1,
         buildBody: (context, state) => _ChoiceList<OnboardingDietaryPreference>(
           selected: state.answers.dietaryPreference,
           onSelected: (value) =>
               context.readOnboarding().answerDietaryPreference(value),
-          options: const [
+          options: [
             _ChoiceOption(
-              value: OnboardingDietaryPreference.simple,
-              title: 'Keep it simple',
-              description: 'Focus on awareness and small improvements.',
-              icon: Icons.lightbulb_outline_rounded,
-            ),
-            _ChoiceOption(
-              value: OnboardingDietaryPreference.protein,
-              title: 'Help me eat more protein',
-              description: 'Make meals more supportive for training.',
+              value: OnboardingDietaryPreference.omnivore,
+              title: OnboardingDietaryPreference.omnivore.label,
+              description: 'I eat both plant and animal foods.',
               icon: Icons.restaurant_rounded,
             ),
             _ChoiceOption(
-              value: OnboardingDietaryPreference.calories,
-              title: 'Help me manage calories',
-              description: 'Give clearer targets and daily feedback.',
-              icon: Icons.insights_rounded,
+              value: OnboardingDietaryPreference.vegetarian,
+              title: OnboardingDietaryPreference.vegetarian.label,
+              description: 'I avoid meat and fish.',
+              icon: Icons.eco_outlined,
             ),
             _ChoiceOption(
-              value: OnboardingDietaryPreference.mealPlanning,
-              title: 'Help me plan meals',
-              description: 'Make food decisions easier ahead of time.',
-              icon: Icons.menu_book_outlined,
+              value: OnboardingDietaryPreference.vegan,
+              title: OnboardingDietaryPreference.vegan.label,
+              description: 'I avoid animal-derived foods.',
+              icon: Icons.spa_outlined,
             ),
             _ChoiceOption(
-              value: OnboardingDietaryPreference.notNow,
-              title: 'Not now',
-              description: 'Start with training first.',
-              icon: Icons.pause_circle_outline_rounded,
+              value: OnboardingDietaryPreference.keto,
+              title: OnboardingDietaryPreference.keto.label,
+              description: 'I follow a very low-carbohydrate approach.',
+              icon: Icons.egg_alt_outlined,
+            ),
+            _ChoiceOption(
+              value: OnboardingDietaryPreference.other,
+              title: OnboardingDietaryPreference.other.label,
+              description: 'None of the options above fits exactly.',
+              icon: Icons.more_horiz_rounded,
             ),
           ],
         ),
@@ -1960,15 +2029,14 @@ String _coachingFocus(OnboardingAnswersDto answers) {
     null => 'Build a routine that feels realistic.',
   };
   final food = switch (answers.dietaryPreference) {
-    OnboardingDietaryPreference.protein =>
-      ' We’ll keep protein as a simple food anchor.',
-    OnboardingDietaryPreference.calories =>
-      ' We’ll add calorie awareness without making it feel heavy.',
-    OnboardingDietaryPreference.mealPlanning =>
-      ' We’ll make meal decisions easier ahead of time.',
-    OnboardingDietaryPreference.notNow =>
-      ' We’ll keep food guidance quiet until you want it.',
-    _ => '',
+    OnboardingDietaryPreference.vegetarian =>
+      ' We’ll keep suggestions vegetarian-friendly.',
+    OnboardingDietaryPreference.vegan => ' We’ll keep suggestions plant-based.',
+    OnboardingDietaryPreference.keto =>
+      ' We’ll account for your low-carbohydrate approach.',
+    OnboardingDietaryPreference.other =>
+      ' We’ll keep recommendations flexible around your needs.',
+    OnboardingDietaryPreference.omnivore || null => '',
   };
   return '$base$food';
 }
@@ -2013,16 +2081,16 @@ String _coachingRecommendation(
 ) {
   final training = _trainingPreferencePhrase(answers.trainingPreference);
   final food = switch (answers.dietaryPreference) {
-    OnboardingDietaryPreference.simple =>
-      'I’ll keep food guidance simple and focused on small useful choices.',
-    OnboardingDietaryPreference.protein =>
-      'I’ll use protein as your first food anchor because it supports training without making every meal complicated.',
-    OnboardingDietaryPreference.calories =>
-      'I’ll help you understand calories clearly, but we’ll start with awareness before pressure.',
-    OnboardingDietaryPreference.mealPlanning =>
-      'I’ll help you plan ahead so food decisions feel easier during the week.',
-    OnboardingDietaryPreference.notNow =>
-      'I’ll keep food support quiet for now and focus first on training consistency.',
+    OnboardingDietaryPreference.omnivore =>
+      'I’ll keep food guidance flexible across plant and animal foods.',
+    OnboardingDietaryPreference.vegetarian =>
+      'I’ll keep meal and protein suggestions vegetarian-friendly.',
+    OnboardingDietaryPreference.vegan =>
+      'I’ll keep meal and protein suggestions fully plant-based.',
+    OnboardingDietaryPreference.keto =>
+      'I’ll account for your low-carbohydrate approach when suggesting meals.',
+    OnboardingDietaryPreference.other =>
+      'I’ll keep food guidance flexible around the preferences you share.',
     null =>
       'I’ll keep food guidance light until you choose how much support you want.',
   };
@@ -2252,17 +2320,6 @@ String _activityTitle(OnboardingActivityLevel? activity) {
     OnboardingActivityLevel.moderatelyActive => 'Moderately active',
     OnboardingActivityLevel.veryActive => 'Very active',
     OnboardingActivityLevel.changesALot => 'Changes a lot',
-    null => '',
-  };
-}
-
-String _dietaryPreferenceTitle(OnboardingDietaryPreference? preference) {
-  return switch (preference) {
-    OnboardingDietaryPreference.simple => 'Keep food simple',
-    OnboardingDietaryPreference.protein => 'Help me eat more protein',
-    OnboardingDietaryPreference.calories => 'Help me manage calories',
-    OnboardingDietaryPreference.mealPlanning => 'Help me plan meals',
-    OnboardingDietaryPreference.notNow => 'Not right now',
     null => '',
   };
 }

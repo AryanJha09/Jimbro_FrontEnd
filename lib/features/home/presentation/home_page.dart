@@ -7,6 +7,7 @@ import '../../../core/theme/jim_tokens.dart';
 import '../../atlas/presentation/atlas_chat_page.dart';
 import '../../../shared/components/backend_state_view.dart';
 import '../../../shared/components/jim_button.dart';
+import '../../../shared/components/jim_companion.dart';
 import '../../../shared/components/jim_page_scaffold.dart';
 import '../../../shared/components/jim_surface.dart';
 import '../../../shared/models/app_models.dart';
@@ -100,13 +101,6 @@ class _HomePageContent extends ConsumerWidget {
         const _AtlasEntryPoint(),
         const SizedBox(height: JimSpacing.md),
         _InsightSnapshot(insightsAsync: insightsAsync),
-        const SizedBox(height: JimSpacing.md),
-        _HomeNavigation(
-          onWorkout: () => openTab(1),
-          onNutrition: () => openTab(2),
-          onProgress: () => openTab(3),
-          onProfile: () => openTab(4),
-        ),
       ],
     );
   }
@@ -186,18 +180,9 @@ class _HeroSection extends StatelessWidget {
         children: [
           Row(
             children: [
-              Container(
-                width: 46,
-                height: 46,
-                decoration: BoxDecoration(
-                  color: JimColors.plaque,
-                  borderRadius: BorderRadius.circular(JimRadius.md),
-                  border: Border.all(color: JimColors.accentLine),
-                ),
-                child: const Icon(
-                  Icons.auto_awesome_rounded,
-                  color: JimColors.accentStrong,
-                ),
+              const JimCompanionAvatar(
+                stage: JimCompanionStage.softBase,
+                size: 64,
               ),
               const SizedBox(width: JimSpacing.sm),
               Expanded(
@@ -430,12 +415,13 @@ class _MetricCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final textScale = MediaQuery.textScalerOf(context).scale(1);
 
     return JimInteractiveSurface(
       onTap: card.onTap,
       padding: const EdgeInsets.all(JimSpacing.md),
       child: SizedBox(
-        height: 154,
+        height: 154 + ((textScale - 1).clamp(0, 1).toDouble() * 140),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -930,111 +916,6 @@ class _InsightCard extends StatelessWidget {
   }
 }
 
-class _HomeNavigation extends StatelessWidget {
-  const _HomeNavigation({
-    required this.onWorkout,
-    required this.onNutrition,
-    required this.onProgress,
-    required this.onProfile,
-  });
-
-  final VoidCallback onWorkout;
-  final VoidCallback onNutrition;
-  final VoidCallback onProgress;
-  final VoidCallback onProfile;
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Expanded(
-          child: _NavButton(
-            icon: Icons.fitness_center_rounded,
-            label: 'Workout',
-            onTap: onWorkout,
-          ),
-        ),
-        const SizedBox(width: JimSpacing.xs),
-        Expanded(
-          child: _NavButton(
-            icon: Icons.ramen_dining_outlined,
-            label: 'Food',
-            onTap: onNutrition,
-          ),
-        ),
-        const SizedBox(width: JimSpacing.xs),
-        Expanded(
-          child: _NavButton(
-            icon: Icons.show_chart_rounded,
-            label: 'Progress',
-            onTap: onProgress,
-          ),
-        ),
-        const SizedBox(width: JimSpacing.xs),
-        Expanded(
-          child: _NavButton(
-            icon: Icons.person_outline_rounded,
-            label: 'Profile',
-            onTap: onProfile,
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _NavButton extends StatelessWidget {
-  const _NavButton({
-    required this.icon,
-    required this.label,
-    required this.onTap,
-  });
-
-  final IconData icon;
-  final String label;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(JimRadius.md),
-        child: Container(
-          height: 76,
-          padding: const EdgeInsets.symmetric(horizontal: 6),
-          decoration: BoxDecoration(
-            color: JimColors.plaque,
-            borderRadius: BorderRadius.circular(JimRadius.md),
-            border: Border.all(color: JimColors.insetLine),
-            boxShadow: JimElevation.soft,
-          ),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, color: JimColors.accentStrong, size: 22),
-              const SizedBox(height: JimSpacing.xs),
-              FittedBox(
-                fit: BoxFit.scaleDown,
-                child: Text(
-                  label,
-                  maxLines: 1,
-                  style: theme.textTheme.labelMedium?.copyWith(
-                    color: JimColors.inkSoft,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 class _ProgressLine extends StatelessWidget {
   const _ProgressLine({
     required this.label,
@@ -1049,28 +930,49 @@ class _ProgressLine extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final useStackedLabels = MediaQuery.textScalerOf(context).scale(1) > 1;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            Expanded(
-              child: Text(
+        if (useStackedLabels)
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
                 label,
                 style: theme.textTheme.bodyMedium?.copyWith(
                   fontWeight: FontWeight.w700,
                 ),
               ),
-            ),
-            Text(
-              value,
-              style: theme.textTheme.labelLarge?.copyWith(
-                color: JimColors.inkSoft,
+              const SizedBox(height: JimSpacing.xxs),
+              Text(
+                value,
+                style: theme.textTheme.labelLarge?.copyWith(
+                  color: JimColors.inkSoft,
+                ),
               ),
-            ),
-          ],
-        ),
+            ],
+          )
+        else
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  label,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              Text(
+                value,
+                style: theme.textTheme.labelLarge?.copyWith(
+                  color: JimColors.inkSoft,
+                ),
+              ),
+            ],
+          ),
         const SizedBox(height: JimSpacing.xs),
         ClipRRect(
           borderRadius: BorderRadius.circular(JimRadius.pill),

@@ -1,9 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -12,6 +15,9 @@ import '../../shared/models/atlas_insight.dart';
 import '../../shared/models/jim_chat_models.dart';
 import '../../shared/models/onboarding_models.dart';
 import '../config/app_config.dart';
+import '../errors/app_error.dart';
+import '../errors/profile_schema_exception.dart';
+import '../models/profile_api_models.dart';
 import '../network/jim_api_client.dart';
 import '../nutrition/nutrition_targets.dart';
 
@@ -25,6 +31,127 @@ abstract class AuthRepository {
   Future<void> signOut();
 }
 
+abstract class SecureAuthSessionStore {
+  Future<AuthSession?> read();
+  Future<void> write(AuthSession session);
+  Future<void> clear();
+}
+
+class FlutterSecureAuthSessionStore implements SecureAuthSessionStore {
+  const FlutterSecureAuthSessionStore({
+    FlutterSecureStorage storage = const FlutterSecureStorage(),
+  }) : _storage = storage;
+
+  static const _key = 'jimbro.fastapi.auth_session.v1';
+  final FlutterSecureStorage _storage;
+
+  @override
+  Future<AuthSession?> read() async {
+    final encoded = await _storage.read(key: _key);
+    if (encoded == null || encoded.isEmpty) {
+      return null;
+    }
+    try {
+      final data = _asMap(jsonDecode(encoded));
+      final accessToken = data['access_token']?.toString() ?? '';
+      final userId = data['user_id']?.toString() ?? '';
+      if (accessToken.isEmpty || userId.isEmpty || _jwtIsExpired(accessToken)) {
+        await clear();
+        return null;
+      }
+      return AuthSession(
+        userId: userId,
+        displayName: data['display_name']?.toString() ?? 'JimBro User',
+        email: data['email']?.toString() ?? '',
+        accessToken: accessToken,
+        refreshToken: data['refresh_token']?.toString(),
+        provider: 'fastapi',
+      );
+    } catch (_) {
+      await clear();
+      return null;
+    }
+  }
+
+  @override
+  Future<void> write(AuthSession session) async {
+    await _storage.write(
+      key: _key,
+      value: jsonEncode({
+        'user_id': session.userId,
+        'display_name': session.displayName,
+        'email': session.email,
+        'access_token': session.accessToken,
+        'refresh_token': session.refreshToken,
+      }),
+    );
+  }
+
+  @override
+  Future<void> clear() => _storage.delete(key: _key);
+}
+
+abstract class EmailSignUpRepository {
+  Future<AuthSession> signUpWithEmailPassword({
+    required String email,
+    required String password,
+  });
+}
+
+class AuthVerificationRequiredException implements Exception {
+  const AuthVerificationRequiredException([
+    this.message = 'Check your email to finish signing up, then sign in.',
+  ]);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+class ApplicationUserProvisioningResult {
+  const ApplicationUserProvisioningResult({
+    required this.applicationUserId,
+    this.reconciled = false,
+    this.profile,
+    this.profileDto,
+    this.onboardingCompleted,
+  });
+
+  final String applicationUserId;
+  final bool reconciled;
+  final UserProfile? profile;
+  final ProfileApiDto? profileDto;
+  final bool? onboardingCompleted;
+}
+
+class UserProvisioningException implements Exception {
+  const UserProvisioningException([
+    this.message =
+        'Your account is signed in, but we could not finish creating your JimBro profile.',
+    this.code = 'USER_PROVISIONING_FAILED',
+  ]);
+
+  final String message;
+  final String code;
+
+  @override
+  String toString() => message;
+}
+
+class InvalidDietaryPreferenceException implements Exception {
+  const InvalidDietaryPreferenceException([
+    this.message = 'Choose one of the available dietary preferences.',
+    this.code = 'INVALID_DIETARY_PREFERENCE',
+  ]);
+
+  final String message;
+  final String code;
+
+  @override
+  String toString() => message;
+}
+
 class AccountDeletionResult {
   const AccountDeletionResult({
     required this.deleted,
@@ -36,7 +163,16 @@ class AccountDeletionResult {
 }
 
 abstract class AccountRepository {
+  Future<ApplicationUserProvisioningResult> provisionAuthenticatedUser(
+    AuthSession session,
+  );
   Future<AccountDeletionResult> deleteAccount(AuthSession session);
+}
+
+typedef AccessTokenProvider = Future<String?> Function();
+
+abstract class UserScopedCache {
+  void clearUserCache(String userId);
 }
 
 class AuthSessionExpiredException implements Exception {
@@ -68,31 +204,40 @@ class AtlasProfileSyncException implements Exception {
   String toString() => message;
 }
 
-class AtlasOnboardingCredentialException implements Exception {
-  const AtlasOnboardingCredentialException(this.message);
+class NutritionMutationConflictException implements Exception {
+  const NutritionMutationConflictException(this.message);
 
   final String message;
-
-  @override
-  String toString() => message;
 }
 
-class AtlasOnboardingAccount {
-  const AtlasOnboardingAccount({
-    required this.username,
-    required this.email,
-    required this.password,
+class NutritionMutationPendingException implements Exception {
+  const NutritionMutationPendingException(this.message);
+
+  final String message;
+}
+
+class CachedSearchResultsException<T> implements Exception {
+  const CachedSearchResultsException({
+    required this.results,
+    required this.error,
   });
 
-  final String username;
-  final String email;
-  final String password;
+  final List<T> results;
+  final AppError error;
+}
+
+class SecureOutboxUnavailableException implements Exception {
+  const SecureOutboxUnavailableException();
 }
 
 abstract class ProfileRepository {
   Future<UserProfile> loadProfile(AuthSession? session);
   Future<UserStaticMetrics> loadMetrics(AuthSession? session);
-  Future<UserProfile> saveProfile(AuthSession? session, UserProfile profile);
+  Future<UserProfile> saveProfile(
+    AuthSession? session,
+    UserProfile profile, {
+    bool onboardingCompleted = false,
+  });
   Future<UserStaticMetrics> saveMetrics(
     AuthSession? session,
     UserStaticMetrics metrics,
@@ -101,7 +246,6 @@ abstract class ProfileRepository {
     AuthSession? session,
     UserProfile profile,
     OnboardingAnswersDto answers,
-    AtlasOnboardingAccount? account,
   );
   Future<UserStaticMetrics> loadAtlasMetrics(AuthSession? session);
   Future<UserStaticMetrics> patchAtlasProfile(
@@ -116,7 +260,10 @@ abstract class WorkoutRepository {
   Future<WorkoutTemplateDraft> loadTemplate(AuthSession? session);
   Future<List<WorkoutScheduleEntry>> loadSchedule(AuthSession? session);
   Future<WorkoutLogDraft> loadWorkoutLog(AuthSession? session);
-  Future<List<ExerciseSuggestion>> searchExercises(String query);
+  Future<List<ExerciseSuggestion>> searchExercises(
+    String query, [
+    AuthSession? session,
+  ]);
   Future<WorkoutTemplateDraft> saveTemplate(
     AuthSession? session,
     WorkoutTemplateDraft template,
@@ -130,7 +277,7 @@ abstract class WorkoutRepository {
     AuthSession? session,
     WorkoutScheduleEntry entry,
   );
-  Future<WorkoutLogDraft> saveWorkoutLog(
+  Future<WorkoutMutationResult> saveWorkoutLog(
     AuthSession? session,
     WorkoutLogDraft log,
   );
@@ -140,12 +287,37 @@ abstract class WorkoutRepository {
 abstract class NutritionRepository {
   Future<List<FoodLogDraft>> loadFoodLogs(AuthSession? session);
   Future<DailyNutritionSummary> loadSummary(AuthSession? session);
-  Future<List<FoodSuggestion>> searchFoods(String query);
-  Future<List<FoodLogDraft>> saveFoodLogs(
+  Future<List<FoodSuggestion>> searchFoods(
+    String query, [
+    AuthSession? session,
+  ]);
+  Future<NutritionMutationResult> saveFoodLogs(
     AuthSession? session,
     List<FoodLogDraft> logs,
   );
   Future<void> flushPending(AuthSession? session);
+}
+
+abstract interface class TemplateLoadMetadata {
+  bool get templatesAreStale;
+}
+
+abstract interface class PendingWorkoutMutationSource {
+  Future<WorkoutMutationResult?> loadPendingWorkoutMutation(
+    AuthSession? session,
+  );
+}
+
+abstract interface class IdempotentWorkoutCompletionRepository {
+  Future<WorkoutMutationResult> finishWorkout(
+    AuthSession? session,
+    WorkoutLogDraft log, {
+    required String mutationId,
+  });
+}
+
+abstract interface class WorkoutHistoryRepository {
+  Future<List<WorkoutLogDraft>> loadWorkoutHistory(AuthSession? session);
 }
 
 abstract class ConsistencyRepository {
@@ -219,7 +391,7 @@ abstract class SearchRepository {
   Future<List<SearchResultGroup>> search(AuthSession? session, String query);
 }
 
-class MockAuthRepository implements AuthRepository {
+class MockAuthRepository implements AuthRepository, EmailSignUpRepository {
   AuthSession? _session;
 
   @override
@@ -247,6 +419,14 @@ class MockAuthRepository implements AuthRepository {
   }
 
   @override
+  Future<AuthSession> signUpWithEmailPassword({
+    required String email,
+    required String password,
+  }) {
+    return signInWithEmailPassword(email: email, password: password);
+  }
+
+  @override
   Future<void> signOut() async {
     _session = null;
   }
@@ -254,15 +434,118 @@ class MockAuthRepository implements AuthRepository {
 
 class MockAccountRepository implements AccountRepository {
   @override
+  Future<ApplicationUserProvisioningResult> provisionAuthenticatedUser(
+    AuthSession session,
+  ) async {
+    return ApplicationUserProvisioningResult(
+      applicationUserId: session.userId,
+    );
+  }
+
+  @override
   Future<AccountDeletionResult> deleteAccount(AuthSession session) async {
     return const AccountDeletionResult(deleted: true);
   }
 }
 
 class FastApiAccountRepository implements AccountRepository {
-  FastApiAccountRepository(this._dio);
+  FastApiAccountRepository(
+    this._dio, {
+    AccessTokenProvider? tokenProvider,
+    AccessTokenProvider? refreshTokenProvider,
+  })  : _tokenProvider = tokenProvider ?? _getCurrentSupabaseToken,
+        _refreshTokenProvider =
+            refreshTokenProvider ?? tokenProvider ?? _refreshSupabaseToken;
 
   final Dio _dio;
+  final AccessTokenProvider _tokenProvider;
+  final AccessTokenProvider _refreshTokenProvider;
+
+  @override
+  Future<ApplicationUserProvisioningResult> provisionAuthenticatedUser(
+    AuthSession session,
+  ) async {
+    try {
+      final response = await _requestWithSessionRetry(
+        _dio,
+        session,
+        (headers) => _dio.get<dynamic>(
+          '/supabase/profile',
+          options: Options(headers: headers),
+        ),
+        tokenProvider: _tokenProvider,
+        refreshTokenProvider: _refreshTokenProvider,
+      );
+      _throwIfRequestFailed(
+        response,
+        source:
+            'lib/core/repositories/app_repositories.dart -> FastApiAccountRepository.provisionAuthenticatedUser',
+        session: session,
+      );
+      final rawEnvelope = _asMap(response.data);
+      final rawData = rawEnvelope['data'];
+      if (kDebugMode) {
+        debugPrint(
+          'Profile lookup response: status=${response.statusCode} '
+          'success=${rawEnvelope['success']} hasData=${rawData is Map} '
+          'dataType=${rawData.runtimeType}. No profile values logged.',
+        );
+      }
+      final profileDto = _decodeProfileResponse(response.data);
+      final onboardingCompleted = profileDto.isOnboardingComplete;
+      if (kDebugMode) {
+        debugPrint(
+          'Profile lookup onboarding flag: '
+          'onboardingCompleted=$onboardingCompleted.',
+        );
+      }
+      final profile = profileDto.toDomain(
+        fallbackName: session.displayName,
+      );
+      if (kDebugMode) {
+        debugPrint(
+          'Profile lookup parse: profileParsed=true. '
+          'No profile values logged.',
+        );
+      }
+      return ApplicationUserProvisioningResult(
+        applicationUserId: profileDto.userId,
+        reconciled: profileDto.reconciled,
+        profile: profile,
+        profileDto: profileDto,
+        onboardingCompleted: onboardingCompleted,
+      );
+    } on AuthSessionExpiredException {
+      rethrow;
+    } on AppError {
+      rethrow;
+    } on DioException {
+      rethrow;
+    } on ProfileSchemaException catch (error) {
+      _logProfileDecodeFailure(error);
+      rethrow;
+    } on UserProvisioningException {
+      rethrow;
+    } catch (error) {
+      if (kDebugMode) {
+        debugPrint(
+          'Profile lookup failed. '
+          'code=MALFORMED_RESPONSE error_type=${error.runtimeType}. '
+          'No token or profile payload logged.',
+        );
+      }
+      throw AppError(
+        code: AppErrorCode.malformedResponse,
+        userMessage:
+            'JimBro received profile data it could not read. Please try again or sign out.',
+        diagnostics: const AppErrorDiagnostics(
+          method: 'GET',
+          route: '/supabase/profile',
+          retryable: false,
+        ),
+      );
+    }
+  }
 
   @override
   Future<AccountDeletionResult> deleteAccount(AuthSession session) async {
@@ -279,6 +562,14 @@ class FastApiAccountRepository implements AccountRepository {
             },
           ),
         ),
+        tokenProvider: _tokenProvider,
+        refreshTokenProvider: _refreshTokenProvider,
+      );
+      _throwIfRequestFailed(
+        response,
+        source:
+            'lib/core/repositories/app_repositories.dart -> FastApiAccountRepository.deleteAccount',
+        session: session,
       );
       final body = _asMap(response.data);
       final data = _asMap(body['data']);
@@ -290,20 +581,28 @@ class FastApiAccountRepository implements AccountRepository {
         deleted: true,
         alreadyDeleted: data['already_deleted'] == true,
       );
+    } on AuthSessionExpiredException {
+      rethrow;
     } catch (_) {
       throw const AccountDeletionException();
     }
   }
 }
 
-class FastApiAuthRepository implements AuthRepository {
-  FastApiAuthRepository(this._dio);
+class FastApiAuthRepository implements AuthRepository, EmailSignUpRepository {
+  FastApiAuthRepository(
+    this._dio, {
+    SecureAuthSessionStore? sessionStore,
+  }) : _sessionStore = sessionStore ?? const FlutterSecureAuthSessionStore();
 
   final Dio _dio;
+  final SecureAuthSessionStore _sessionStore;
   AuthSession? _session;
 
   @override
-  Future<AuthSession?> currentSession() async => _session;
+  Future<AuthSession?> currentSession() async {
+    return _session ??= await _sessionStore.read();
+  }
 
   @override
   Future<AuthSession> signInWithMockProvider(String provider) async {
@@ -315,9 +614,6 @@ class FastApiAuthRepository implements AuthRepository {
     required String email,
     required String password,
   }) async {
-    final requestUrl = '${_dio.options.baseUrl}/auth/login';
-    const requestPayloadShape =
-        '{"email":"user@example.com","password":"string"}';
     final requestBody = {
       'email': email.trim(),
       'password': password,
@@ -345,32 +641,25 @@ class FastApiAuthRepository implements AuthRepository {
       final refreshToken = payload['refresh_token']?.toString() ??
           rawMap['refresh_token']?.toString();
       if (response.statusCode != null && response.statusCode! >= 400) {
-        throw Exception(
-          _buildAuthDiagnosticMessage(
-            source:
-                'lib/core/repositories/app_repositories.dart -> FastApiAuthRepository.signInWithEmailPassword',
-            requestUrl: requestUrl,
-            statusCode: response.statusCode,
-            responseHeaders: response.headers.map,
-            responseBody: rawBody,
-            fallback: 'Authentication request failed.',
-            requestPayloadShape: requestPayloadShape,
-          ),
+        throw appHttpError(
+          code: AppErrorCode.authFailed,
+          userMessage: 'Invalid email or password.',
+          request: response.requestOptions,
+          statusCode: response.statusCode,
+          retryable: false,
+          correlationId: response.headers.value('x-correlation-id') ??
+              response.headers.value('x-request-id'),
         );
       }
       if (token.isEmpty) {
-        throw Exception(
-          _buildAuthDiagnosticMessage(
-            source:
-                'lib/core/repositories/app_repositories.dart -> FastApiAuthRepository.signInWithEmailPassword',
-            requestUrl: requestUrl,
-            statusCode: response.statusCode,
-            responseHeaders: response.headers.map,
-            responseBody: rawBody,
-            fallback:
-                'Login succeeded without an access token in the response body.',
-            requestPayloadShape: requestPayloadShape,
-          ),
+        throw appHttpError(
+          code: AppErrorCode.authFailed,
+          userMessage: 'Authentication failed. Please try again.',
+          request: response.requestOptions,
+          statusCode: response.statusCode,
+          retryable: true,
+          correlationId: response.headers.value('x-correlation-id') ??
+              response.headers.value('x-request-id'),
         );
       }
 
@@ -395,19 +684,108 @@ class FastApiAuthRepository implements AuthRepository {
         refreshToken: refreshToken,
         provider: 'fastapi',
       );
+      await _sessionStore.write(_session!);
       return _session!;
     } on DioException catch (error) {
-      throw Exception(
-        _buildAuthDiagnosticMessage(
-          source:
-              'lib/core/repositories/app_repositories.dart -> FastApiAuthRepository.signInWithEmailPassword',
-          requestUrl: requestUrl,
-          statusCode: error.response?.statusCode,
-          responseHeaders: error.response?.headers.map,
-          responseBody: error.response?.data,
-          fallback: _networkFallbackMessage(error),
-          requestPayloadShape: requestPayloadShape,
+      throw mapAppError(
+        error,
+        fallbackMessage: 'Authentication failed. Please try again.',
+      );
+    }
+  }
+
+  @override
+  Future<AuthSession> signUpWithEmailPassword({
+    required String email,
+    required String password,
+  }) async {
+    try {
+      final response = await _dio.post<dynamic>(
+        '/auth/register',
+        data: jsonEncode({
+          'email': email.trim(),
+          'password': password,
+        }),
+        options: Options(
+          contentType: 'application/json',
+          headers: const {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
         ),
+      );
+      if (response.statusCode != null && response.statusCode! >= 400) {
+        throw appHttpError(
+          code: AppErrorCode.authFailed,
+          userMessage: _safeApiErrorMessage(
+            response.data,
+            fallback: 'Could not create your account. Please try again.',
+          ),
+          request: response.requestOptions,
+          statusCode: response.statusCode,
+          retryable: false,
+          correlationId: response.headers.value('x-correlation-id') ??
+              response.headers.value('x-request-id'),
+        );
+      }
+      final payload = _asMap(_unwrapData(response.data));
+      final root = _asMap(response.data);
+      final token = _firstNonEmptyString([
+        payload['access_token'],
+        payload['token'],
+        root['access_token'],
+        root['token'],
+      ]);
+      if (token == null) {
+        throw const AuthVerificationRequiredException();
+      }
+      final jwtPayload = _decodeJwtPayload(token);
+      final userPayload = _asMap(payload['user']);
+      final tokenEmail = _firstNonEmptyString([
+            jwtPayload['email'],
+            userPayload['email'],
+            email,
+          ]) ??
+          email.trim();
+      final userId = _firstNonEmptyString([
+            jwtPayload['sub'],
+            userPayload['id'],
+            userPayload['user_id'],
+          ]) ??
+          tokenEmail;
+      _session = AuthSession(
+        userId: userId,
+        displayName: _firstNonEmptyString([
+              userPayload['username'],
+              userPayload['name'],
+              jwtPayload['preferred_username'],
+            ]) ??
+            tokenEmail.split('@').first,
+        email: tokenEmail,
+        accessToken: token,
+        refreshToken: _firstNonEmptyString([
+          payload['refresh_token'],
+          root['refresh_token'],
+        ]),
+        provider: 'fastapi',
+      );
+      await _sessionStore.write(_session!);
+      return _session!;
+    } on AuthVerificationRequiredException {
+      rethrow;
+    } on DioException catch (error) {
+      throw mapAppError(
+        error,
+        fallbackMessage: 'Could not create your account. Please try again.',
+      );
+    } catch (error) {
+      if (error is Exception) {
+        rethrow;
+      }
+      throw const AppError(
+        code: AppErrorCode.authFailed,
+        userMessage: 'Could not create your account. Please try again.',
+        diagnostics: AppErrorDiagnostics(retryable: true),
       );
     }
   }
@@ -415,10 +793,11 @@ class FastApiAuthRepository implements AuthRepository {
   @override
   Future<void> signOut() async {
     _session = null;
+    await _sessionStore.clear();
   }
 }
 
-class SupabaseAuthRepository implements AuthRepository {
+class SupabaseAuthRepository implements AuthRepository, EmailSignUpRepository {
   SupabaseAuthRepository(this._client);
 
   final SupabaseClient _client;
@@ -449,28 +828,78 @@ class SupabaseAuthRepository implements AuthRepository {
       );
       final session = response.session;
       if (session == null) {
-        final userEmail = response.user?.email ?? email.trim();
-        throw Exception(
-          'Supabase sign-in did not return a session.\n'
-          'source: lib/core/repositories/app_repositories.dart -> SupabaseAuthRepository.signInWithEmailPassword\n'
-          'provider: supabase\n'
-          'email: $userEmail',
+        throw const AppError(
+          code: AppErrorCode.authFailed,
+          userMessage: 'Authentication failed. Please try again.',
+          diagnostics: AppErrorDiagnostics(
+            method: 'POST',
+            route: '/auth/v1/token',
+            retryable: true,
+          ),
         );
       }
       return _mapSession(session);
-    } on AuthException catch (error) {
-      throw Exception(
-        'Supabase auth error: ${error.message}\n'
-        'source: lib/core/repositories/app_repositories.dart -> SupabaseAuthRepository.signInWithEmailPassword\n'
-        'provider: supabase\n'
-        'status: ${error.statusCode ?? 'unknown'}',
+    } on AuthException catch (_) {
+      throw const AppError(
+        code: AppErrorCode.authFailed,
+        userMessage: 'Invalid email or password.',
+        diagnostics: AppErrorDiagnostics(
+          method: 'POST',
+          route: '/auth/v1/token',
+          retryable: false,
+        ),
       );
-    } catch (error) {
-      throw Exception(
-        'Supabase sign-in failed.\n'
-        'source: lib/core/repositories/app_repositories.dart -> SupabaseAuthRepository.signInWithEmailPassword\n'
-        'provider: supabase\n'
-        'details: $error',
+    } on AppError {
+      rethrow;
+    } catch (_) {
+      throw const AppError(
+        code: AppErrorCode.authFailed,
+        userMessage: 'Authentication failed. Please try again.',
+        diagnostics: AppErrorDiagnostics(
+          method: 'POST',
+          route: '/auth/v1/token',
+          retryable: true,
+        ),
+      );
+    }
+  }
+
+  @override
+  Future<AuthSession> signUpWithEmailPassword({
+    required String email,
+    required String password,
+  }) async {
+    try {
+      final response = await _client.auth.signUp(
+        email: email.trim(),
+        password: password,
+      );
+      final session = response.session;
+      if (session == null) {
+        throw const AuthVerificationRequiredException();
+      }
+      return _mapSession(session);
+    } on AuthVerificationRequiredException {
+      rethrow;
+    } on AuthException catch (_) {
+      throw const AppError(
+        code: AppErrorCode.authFailed,
+        userMessage: 'Could not create your account. Please try again.',
+        diagnostics: AppErrorDiagnostics(
+          method: 'POST',
+          route: '/auth/v1/signup',
+          retryable: false,
+        ),
+      );
+    } catch (_) {
+      throw const AppError(
+        code: AppErrorCode.authFailed,
+        userMessage: 'Could not create your account. Please try again.',
+        diagnostics: AppErrorDiagnostics(
+          method: 'POST',
+          route: '/auth/v1/signup',
+          retryable: true,
+        ),
       );
     }
   }
@@ -538,10 +967,8 @@ class MockProfileRepository implements ProfileRepository {
   Future<UserStaticMetrics> loadMetrics(AuthSession? session) async => _metrics;
 
   @override
-  Future<UserProfile> saveProfile(
-    AuthSession? session,
-    UserProfile profile,
-  ) async {
+  Future<UserProfile> saveProfile(AuthSession? session, UserProfile profile,
+      {bool onboardingCompleted = false}) async {
     _profile = profile;
     return _profile;
   }
@@ -560,7 +987,6 @@ class MockProfileRepository implements ProfileRepository {
     AuthSession? session,
     UserProfile profile,
     OnboardingAnswersDto answers,
-    AtlasOnboardingAccount? account,
   ) async {
     _profile = profile;
     _metrics = _localMetricsForProfile(profile);
@@ -584,12 +1010,17 @@ class MockProfileRepository implements ProfileRepository {
   }
 }
 
-class FastApiProfileRepository implements ProfileRepository {
+class FastApiProfileRepository implements ProfileRepository, UserScopedCache {
   FastApiProfileRepository(this._dio, this._fallback);
 
   final Dio _dio;
   final ProfileRepository _fallback;
   final _profileCache = <String, _CacheEntry<UserProfile>>{};
+
+  @override
+  void clearUserCache(String userId) {
+    _profileCache.remove(userId);
+  }
 
   @override
   Future<UserProfile> loadProfile(AuthSession? session) async {
@@ -621,53 +1052,20 @@ class FastApiProfileRepository implements ProfileRepository {
     if (response.statusCode == 404) {
       return cached?.value ?? await _fallback.loadProfile(session);
     }
-    final data = _unwrapData(response.data);
-    if (data is! Map<String, dynamic>) {
-      throw Exception(
-        'Profile response shape mismatch.\n'
-        'source: lib/core/repositories/app_repositories.dart -> FastApiProfileRepository.loadProfile\n'
-        'request: GET ${_dio.options.baseUrl}/supabase/profile\n'
-        'expected_payload: {"success":true,"data":{...profile fields...}}\n'
-        'actual_response: ${_responseSnippet(response.data) ?? 'empty'}',
-      );
+    late final ProfileApiDto profileDto;
+    try {
+      profileDto = _decodeProfileResponse(response.data);
+    } on ProfileSchemaException catch (error) {
+      _logProfileDecodeFailure(error);
+      rethrow;
     }
-    final backendUpdatedAt = DateTime.tryParse(
-      data['updated_at']?.toString() ?? '',
-    );
+    final backendUpdatedAt = profileDto.updatedAt;
     if (cached != null &&
         (backendUpdatedAt == null ||
             !backendUpdatedAt.isAfter(cached.createdAt))) {
       return cached.value;
     }
-    final profile = UserProfile(
-      name: data['username']?.toString() ??
-          data['name']?.toString() ??
-          session.displayName,
-      goal: _profileGoalLabel(
-        data['goal'] ?? data['fitness_goal'] ?? 'Build muscle',
-      ),
-      coachingPreference:
-          data['coaching_preference']?.toString() ?? 'Contextual + concise',
-      userLevel: _parseUserLevel(
-        (data['user_level'] ?? data['experience_level'])?.toString(),
-      ),
-      age: _toInt(data['age'], 0),
-      heightCm: _toDouble(data['height_cm'], 0),
-      weightKg: _toDouble(data['weight_kg'], 0),
-      sex: data['sex']?.toString() ?? '',
-      availableTimeMinutes: _toInt(
-        data['available_time_min'] ?? data['available_time_minutes'],
-        0,
-      ),
-      trainingPreference: _profileEquipmentLabel(
-        data['training_preference'] ?? data['equipment_access'],
-      ),
-      activityLevel: _profileActivityLabel(data['activity_level']),
-      dietaryPreference: data['dietary_preference']?.toString() ?? '',
-      goalTimeframe: data['goal_timeframe']?.toString() ?? '',
-      weeksActive: _toInt(data['weeks_active'], 0),
-      prefersVoiceLogging: data['prefers_voice_logging'] == true,
-    );
+    final profile = profileDto.toDomain(fallbackName: session.displayName);
     _profileCache[session.userId] = _CacheEntry(
       profile,
       ttl: FrontendCachePolicy.profile,
@@ -681,14 +1079,19 @@ class FastApiProfileRepository implements ProfileRepository {
   }
 
   @override
-  Future<UserProfile> saveProfile(
-    AuthSession? session,
-    UserProfile profile,
-  ) async {
+  Future<UserProfile> saveProfile(AuthSession? session, UserProfile profile,
+      {bool onboardingCompleted = false}) async {
     if (session == null) {
-      return _fallback.saveProfile(session, profile);
+      return _fallback.saveProfile(
+        session,
+        profile,
+        onboardingCompleted: onboardingCompleted,
+      );
     }
-    final payload = profileBackendPayload(profile);
+    final payload = profileBackendPayload(
+      profile,
+      onboardingCompleted: onboardingCompleted,
+    );
     final response = await _requestWithSessionRetry(
       _dio,
       session,
@@ -698,49 +1101,6 @@ class FastApiProfileRepository implements ProfileRepository {
         options: Options(headers: headers),
       ),
     );
-    if (_isMissingBackendSupabaseServiceKey(response)) {
-      final saved = await _fallback.saveProfile(session, profile);
-      _profileCache[session.userId] = _CacheEntry(
-        saved,
-        ttl: FrontendCachePolicy.profile,
-      );
-      return saved;
-    }
-    if (response.statusCode == 400 || response.statusCode == 422) {
-      final legacyResponse = await _requestWithSessionRetry(
-        _dio,
-        session,
-        (headers) => _dio.post<dynamic>(
-          '/supabase/profile',
-          data: {
-            'username': profile.name,
-            'age': profile.age,
-            'height_cm': profile.heightCm,
-            'weight_kg': profile.weightKg,
-          },
-          options: Options(headers: headers),
-        ),
-      );
-      if (_isMissingBackendSupabaseServiceKey(legacyResponse)) {
-        final saved = await _fallback.saveProfile(session, profile);
-        _profileCache[session.userId] = _CacheEntry(
-          saved,
-          ttl: FrontendCachePolicy.profile,
-        );
-        return saved;
-      }
-      _throwIfRequestFailed(
-        legacyResponse,
-        source:
-            'lib/core/repositories/app_repositories.dart -> FastApiProfileRepository.saveProfile legacy retry',
-        session: session,
-      );
-      _profileCache[session.userId] = _CacheEntry(
-        profile,
-        ttl: FrontendCachePolicy.profile,
-      );
-      return profile;
-    }
     _throwIfRequestFailed(
       response,
       source:
@@ -767,27 +1127,19 @@ class FastApiProfileRepository implements ProfileRepository {
     AuthSession? session,
     UserProfile profile,
     OnboardingAnswersDto answers,
-    AtlasOnboardingAccount? account,
   ) async {
     if (session == null) {
       return _fallback.submitAtlasOnboarding(
         session,
         profile,
         answers,
-        account,
-      );
-    }
-    if (account == null) {
-      throw const AtlasOnboardingCredentialException(
-        'Your setup is saved on this device. Jim will sync it when the coaching service is available.',
       );
     }
     final payload = atlasOnboardingPayloadFromProfile(
       profile,
       answers: answers,
-      account: account,
     );
-    _validateAtlasPayloadCanSync(payload);
+    _validateAtlasOnboardingPayload(payload);
     final response = await _requestWithSessionRetry(
       _dio,
       session,
@@ -887,10 +1239,15 @@ class FastApiProfileRepository implements ProfileRepository {
   }
 }
 
-class MockWorkoutRepository implements WorkoutRepository {
+class MockWorkoutRepository
+    implements
+        WorkoutRepository,
+        IdempotentWorkoutCompletionRepository,
+        WorkoutHistoryRepository {
   final List<WorkoutTemplateDraft> _templates = [];
   final List<WorkoutScheduleEntry> _schedule = [];
   WorkoutLogDraft _workoutLog = WorkoutLogDraft.empty;
+  final List<WorkoutLogDraft> _history = [];
   int _nextTemplateId = 1;
   int _nextScheduleId = 1;
 
@@ -913,7 +1270,16 @@ class MockWorkoutRepository implements WorkoutRepository {
       _workoutLog;
 
   @override
-  Future<List<ExerciseSuggestion>> searchExercises(String query) async {
+  Future<List<WorkoutLogDraft>> loadWorkoutHistory(
+    AuthSession? session,
+  ) async =>
+      List.unmodifiable(_history.reversed);
+
+  @override
+  Future<List<ExerciseSuggestion>> searchExercises(
+    String query, [
+    AuthSession? session,
+  ]) async {
     final normalized = query.trim().toLowerCase();
     if (normalized.isEmpty) {
       return const [];
@@ -992,34 +1358,86 @@ class MockWorkoutRepository implements WorkoutRepository {
   }
 
   @override
-  Future<WorkoutLogDraft> saveWorkoutLog(
+  Future<WorkoutMutationResult> saveWorkoutLog(
     AuthSession? session,
     WorkoutLogDraft log,
   ) async {
     _workoutLog = log;
-    return _workoutLog;
+    if (log.endedAtLabel.trim().isNotEmpty) {
+      _history.add(log);
+    }
+    return WorkoutMutationResult(
+      localWorkoutId: 'mock-workout',
+      serverLogId: _workoutLog.workoutLogId,
+      mutationId: 'mock-mutation',
+      syncStatus: WorkoutSyncStatus.synced,
+      errorCode: null,
+      retryable: false,
+      authoritativeWorkout: _workoutLog,
+    );
+  }
+
+  @override
+  Future<WorkoutMutationResult> finishWorkout(
+    AuthSession? session,
+    WorkoutLogDraft log, {
+    required String mutationId,
+  }) async {
+    _workoutLog = log.copyWith(workoutLogId: _workoutLog.workoutLogId ?? 1);
+    if (!_history.any(
+      (item) => item.workoutLogId == _workoutLog.workoutLogId,
+    )) {
+      _history.add(_workoutLog);
+    }
+    return WorkoutMutationResult(
+      localWorkoutId: 'mock-$mutationId',
+      serverLogId: _workoutLog.workoutLogId,
+      mutationId: mutationId,
+      syncStatus: WorkoutSyncStatus.synced,
+      errorCode: null,
+      retryable: false,
+      authoritativeWorkout: _workoutLog,
+    );
   }
 
   @override
   Future<void> flushPending(AuthSession? session) async {}
 }
 
-class FastApiWorkoutRepository implements WorkoutRepository {
+class FastApiWorkoutRepository
+    implements
+        WorkoutRepository,
+        UserScopedCache,
+        TemplateLoadMetadata,
+        PendingWorkoutMutationSource,
+        IdempotentWorkoutCompletionRepository,
+        WorkoutHistoryRepository {
   FastApiWorkoutRepository(
     this._dio, {
     LocalWorkoutScheduleStore? scheduleFallback,
     OfflineOutboxStore? outbox,
+    Duration searchCacheTtl = FrontendCachePolicy.exerciseSearch,
   })  : _scheduleFallback =
             scheduleFallback ?? const LocalWorkoutScheduleStore(),
-        _outbox = outbox ?? const OfflineOutboxStore();
+        _outbox = outbox ?? const OfflineOutboxStore(),
+        _searchCacheTtl = searchCacheTtl;
 
   final Dio _dio;
   final LocalWorkoutScheduleStore _scheduleFallback;
   final OfflineOutboxStore _outbox;
+  final Duration _searchCacheTtl;
   final _exerciseSearchCache =
       <String, _CacheEntry<List<ExerciseSuggestion>>>{};
   final _templatesCache = <String, _CacheEntry<List<WorkoutTemplateDraft>>>{};
-  static bool? _workoutScheduleBackendSupported;
+  bool _templatesAreStale = false;
+
+  @override
+  bool get templatesAreStale => _templatesAreStale;
+
+  @override
+  void clearUserCache(String userId) {
+    _templatesCache.remove(userId);
+  }
 
   @override
   Future<List<WorkoutTemplateDraft>> loadTemplates(AuthSession? session) async {
@@ -1038,6 +1456,7 @@ class FastApiWorkoutRepository implements WorkoutRepository {
       ),
     );
     if (response == null) {
+      _templatesAreStale = cached != null;
       return cached?.value ?? const [];
     }
     _throwIfRequestFailed(
@@ -1046,10 +1465,19 @@ class FastApiWorkoutRepository implements WorkoutRepository {
           'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.loadTemplates',
     );
     final data = _unwrapData(response.data);
-    if (data is! List || data.isEmpty) {
-      return cached?.value ?? const [];
+    if (data is! List) {
+      throw const AppError(
+        code: AppErrorCode.malformedResponse,
+        userMessage: 'Workout templates could not be loaded. Please retry.',
+        diagnostics: AppErrorDiagnostics(
+          method: 'GET',
+          route: '/workout-templates',
+          retryable: true,
+        ),
+      );
     }
     final templates = data.map(_mapWorkoutTemplate).toList();
+    _templatesAreStale = false;
     _templatesCache[session.userId] = _CacheEntry(
       templates,
       ttl: FrontendCachePolicy.templates,
@@ -1068,46 +1496,24 @@ class FastApiWorkoutRepository implements WorkoutRepository {
 
   @override
   Future<List<WorkoutScheduleEntry>> loadSchedule(AuthSession? session) async {
-    final local = await _scheduleFallback.load(session);
-    if (session == null || _workoutScheduleBackendSupported == false) {
-      return local;
-    }
-    final response = await _recoverableLoadRequest(
-      () => _requestWithSessionRetry(
-        _dio,
-        session,
-        (headers) => _dio.get<dynamic>(
-          '/workout-schedule',
-          options: Options(headers: headers),
-        ),
-      ),
-    );
-    if (response == null) {
-      return local;
-    }
-    if (_routeLooksUnsupported(response)) {
-      _markWorkoutScheduleUnsupported(response);
-      return local;
-    }
-    _throwIfRequestFailed(
-      response,
-      source:
-          'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.loadSchedule',
-    );
-    final data = _unwrapData(response.data);
-    if (data is! List) {
-      return local;
-    }
-    _workoutScheduleBackendSupported = true;
-    final remote = data.map(_mapWorkoutScheduleEntry).toList();
-    await _scheduleFallback.replace(session, remote);
-    return remote;
+    return _scheduleFallback.load(session);
   }
 
   @override
   Future<WorkoutLogDraft> loadWorkoutLog(AuthSession? session) async {
-    if (session == null) {
+    final history = await loadWorkoutHistory(session);
+    if (history.isEmpty) {
       return WorkoutLogDraft.empty;
+    }
+    return history.first;
+  }
+
+  @override
+  Future<List<WorkoutLogDraft>> loadWorkoutHistory(
+    AuthSession? session,
+  ) async {
+    if (session == null) {
+      return const [];
     }
     final response = await _recoverableLoadRequest(
       () => _requestWithSessionRetry(
@@ -1120,7 +1526,7 @@ class FastApiWorkoutRepository implements WorkoutRepository {
       ),
     );
     if (response == null) {
-      return WorkoutLogDraft.empty;
+      return const [];
     }
     _throwIfRequestFailed(
       response,
@@ -1129,14 +1535,22 @@ class FastApiWorkoutRepository implements WorkoutRepository {
     );
     final data = _unwrapData(response.data);
     if (data is! List || data.isEmpty) {
-      return WorkoutLogDraft.empty;
+      return const [];
     }
-    final log = _pickMostRecentMap(data, 'created_at');
-    return _mapWorkoutLog(log);
+    final history = data.map(_mapWorkoutLog).toList(growable: false);
+    history.sort((left, right) {
+      final leftDate = DateTime.tryParse(left.endedAtLabel) ?? DateTime(0);
+      final rightDate = DateTime.tryParse(right.endedAtLabel) ?? DateTime(0);
+      return rightDate.compareTo(leftDate);
+    });
+    return history;
   }
 
   @override
-  Future<List<ExerciseSuggestion>> searchExercises(String query) async {
+  Future<List<ExerciseSuggestion>> searchExercises(
+    String query, [
+    AuthSession? session,
+  ]) async {
     final normalized = query.trim().toLowerCase();
     if (normalized.isEmpty) {
       return const [];
@@ -1146,16 +1560,29 @@ class FastApiWorkoutRepository implements WorkoutRepository {
       return cached.value;
     }
     try {
-      final response = await _dio.get<dynamic>(
-        '/exercises/search',
-        queryParameters: {'q': normalized},
-      ).timeout(const Duration(milliseconds: 1500));
-      if (response.statusCode == null || response.statusCode! >= 400) {
-        return cached?.value ?? const [];
-      }
+      final request = session == null
+          ? _dio.get<dynamic>(
+              '/exercises/search',
+              queryParameters: {'q': normalized},
+            )
+          : _requestWithSessionRetry(
+              _dio,
+              session,
+              (headers) => _dio.get<dynamic>(
+                '/exercises/search',
+                queryParameters: {'q': normalized},
+                options: Options(headers: headers),
+              ),
+            );
+      final response = await request.timeout(const Duration(seconds: 5));
+      _throwIfRequestFailed(
+        response,
+        source:
+            'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.searchExercises',
+      );
       final data = _unwrapData(response.data);
       if (data is! List) {
-        return cached?.value ?? const [];
+        throw _malformedSearchResponse('/exercises/search');
       }
       final suggestions = data
           .map<ExerciseSuggestion?>((item) {
@@ -1178,13 +1605,26 @@ class FastApiWorkoutRepository implements WorkoutRepository {
           })
           .whereType<ExerciseSuggestion>()
           .toList();
+      if (data.isNotEmpty && suggestions.isEmpty) {
+        throw _malformedSearchResponse('/exercises/search');
+      }
       _exerciseSearchCache[normalized] = _CacheEntry(
         suggestions,
-        ttl: FrontendCachePolicy.exerciseSearch,
+        ttl: _searchCacheTtl,
       );
       return suggestions;
-    } catch (_) {
-      return cached?.value ?? const [];
+    } catch (error) {
+      final mapped = _mapFeatureSearchError(
+        error,
+        route: '/exercises/search',
+      );
+      if (cached != null && _isOfflineSearchError(mapped)) {
+        throw CachedSearchResultsException<ExerciseSuggestion>(
+          results: cached.value,
+          error: mapped,
+        );
+      }
+      throw mapped;
     }
   }
 
@@ -1194,13 +1634,14 @@ class FastApiWorkoutRepository implements WorkoutRepository {
     WorkoutTemplateDraft template,
   ) async {
     if (session == null) {
-      throw Exception(
-        'Authentication session missing in workout template repository.\n'
-        'source: lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.saveTemplate\n'
-        'problem: saveTemplate received session == null, so no Authorization header could be created.\n'
-        'backend_request_sent: false\n'
-        'expected: AppDraftController should resolve AuthSession before calling this repository.\n'
-        'fix: Verify authSessionProvider and AuthRepository.currentSession() both contain the Supabase session after login.',
+      throw const AppError(
+        code: AppErrorCode.sessionExpired,
+        userMessage: 'Your session expired. Please sign in again.',
+        diagnostics: AppErrorDiagnostics(
+          method: 'POST',
+          route: '/workout-templates',
+          retryable: false,
+        ),
       );
     }
     final normalized = _validateWorkoutTemplateDraft(template);
@@ -1216,10 +1657,12 @@ class FastApiWorkoutRepository implements WorkoutRepository {
       normalized,
       resolvedExercises,
     );
+    final mutationId = _stableTemplateMutationId(session, normalized);
     final response = await _sendWorkoutTemplatePayload(
       session,
       normalized.templateId,
       richPayload,
+      mutationId: mutationId,
     );
     _throwIfRequestFailed(
       response,
@@ -1229,11 +1672,20 @@ class FastApiWorkoutRepository implements WorkoutRepository {
     final mapped = _mapWorkoutTemplate(_unwrapData(response.data));
     final responseTemplateId =
         _toNullableInt(_asMap(_unwrapData(response.data))['template_id']);
-    final saved = mapped.name.trim().isEmpty
-        ? normalized.copyWith(
-            templateId: responseTemplateId ?? normalized.templateId,
-          )
-        : mapped;
+    final stableId = responseTemplateId ?? mapped.templateId;
+    if (stableId == null || mapped.name.trim().isEmpty) {
+      throw const AppError(
+        code: AppErrorCode.malformedResponse,
+        userMessage:
+            'The template was not confirmed by the server. Your draft is still available.',
+        diagnostics: AppErrorDiagnostics(
+          method: 'POST',
+          route: '/workout-templates',
+          retryable: true,
+        ),
+      );
+    }
+    final saved = mapped.copyWith(templateId: stableId);
     final readBack = await _readBackTemplateIfSupported(session, saved);
     _cacheSavedTemplate(session, readBack);
     return readBack;
@@ -1242,8 +1694,9 @@ class FastApiWorkoutRepository implements WorkoutRepository {
   Future<Response<dynamic>> _sendWorkoutTemplatePayload(
     AuthSession session,
     int? templateId,
-    Map<String, Object?> payload,
-  ) {
+    Map<String, Object?> payload, {
+    required String mutationId,
+  }) {
     return templateId == null
         ? _requestWithSessionRetry(
             _dio,
@@ -1251,7 +1704,10 @@ class FastApiWorkoutRepository implements WorkoutRepository {
             (headers) => _dio.post<dynamic>(
               '/workout-templates',
               data: payload,
-              options: Options(headers: headers),
+              options: Options(headers: {
+                ...headers,
+                'Idempotency-Key': mutationId,
+              }),
             ),
           )
         : _requestWithSessionRetry(
@@ -1260,7 +1716,10 @@ class FastApiWorkoutRepository implements WorkoutRepository {
             (headers) => _dio.patch<dynamic>(
               '/workout-templates/$templateId',
               data: payload,
-              options: Options(headers: headers),
+              options: Options(headers: {
+                ...headers,
+                'Idempotency-Key': mutationId,
+              }),
             ),
           );
   }
@@ -1298,11 +1757,14 @@ class FastApiWorkoutRepository implements WorkoutRepository {
   @override
   Future<void> deleteTemplate(AuthSession? session, int templateId) async {
     if (session == null) {
-      throw Exception(
-        'Authentication session missing in workout template repository.\n'
-        'source: lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.deleteTemplate\n'
-        'problem: deleteTemplate received session == null, so no Authorization header could be created.\n'
-        'backend_request_sent: false',
+      throw const AppError(
+        code: AppErrorCode.sessionExpired,
+        userMessage: 'Your session expired. Please sign in again.',
+        diagnostics: AppErrorDiagnostics(
+          method: 'DELETE',
+          route: '/workout-templates',
+          retryable: false,
+        ),
       );
     }
     final response = await _requestWithSessionRetry(
@@ -1354,57 +1816,7 @@ class FastApiWorkoutRepository implements WorkoutRepository {
     AuthSession? session,
     WorkoutScheduleEntry entry,
   ) async {
-    if (session == null) {
-      return _scheduleFallback.save(session, entry);
-    }
-    if (_workoutScheduleBackendSupported == false) {
-      return _scheduleFallback.save(session, entry);
-    }
-    final payload = _workoutSchedulePayload(session, entry);
-    final scheduleId = entry.scheduleId;
-    try {
-      final response = scheduleId == null || scheduleId.startsWith('local-')
-          ? await _requestWithSessionRetry(
-              _dio,
-              session,
-              (headers) => _dio.post<dynamic>(
-                '/workout-schedule',
-                data: payload,
-                options: Options(headers: headers),
-              ),
-            )
-          : await _requestWithSessionRetry(
-              _dio,
-              session,
-              (headers) => _dio.patch<dynamic>(
-                '/workout-schedule/$scheduleId',
-                data: payload,
-                options: Options(headers: headers),
-              ),
-            );
-      if (_routeLooksUnsupported(response)) {
-        _markWorkoutScheduleUnsupported(response);
-        return _scheduleFallback.save(session, entry);
-      }
-      _throwIfRequestFailed(
-        response,
-        source:
-            'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.saveScheduleEntry',
-      );
-      final saved = _mapWorkoutScheduleEntry(_unwrapData(response.data));
-      await _scheduleFallback.save(session, saved);
-      _workoutScheduleBackendSupported = true;
-      return saved;
-    } on DioException catch (error) {
-      if (_isRecoverableLoadFailure(error) ||
-          _routeLooksUnsupported(error.response)) {
-        if (_routeLooksUnsupported(error.response)) {
-          _markWorkoutScheduleUnsupported(error.response);
-        }
-        return _scheduleFallback.save(session, entry);
-      }
-      rethrow;
-    }
+    return _scheduleFallback.save(session, entry);
   }
 
   @override
@@ -1412,103 +1824,156 @@ class FastApiWorkoutRepository implements WorkoutRepository {
     AuthSession? session,
     WorkoutScheduleEntry entry,
   ) async {
-    if (session == null) {
-      await _scheduleFallback.delete(session, entry);
-      return;
-    }
-    if (_workoutScheduleBackendSupported == false) {
-      await _scheduleFallback.delete(session, entry);
-      return;
-    }
-    final scheduleId = entry.scheduleId;
-    if (scheduleId == null || scheduleId.startsWith('local-')) {
-      await _scheduleFallback.delete(session, entry);
-      return;
-    }
-    try {
-      final response = await _requestWithSessionRetry(
-        _dio,
-        session,
-        (headers) => _dio.delete<dynamic>(
-          '/workout-schedule/$scheduleId',
-          options: Options(headers: headers),
-        ),
-      );
-      if (!_routeLooksUnsupported(response)) {
-        _throwIfRequestFailed(
-          response,
-          source:
-              'lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.deleteScheduleEntry',
-        );
-        _workoutScheduleBackendSupported = true;
-      } else {
-        _markWorkoutScheduleUnsupported(response);
-      }
-    } on DioException catch (error) {
-      if (!_isRecoverableLoadFailure(error) &&
-          !_routeLooksUnsupported(error.response)) {
-        rethrow;
-      }
-      if (_routeLooksUnsupported(error.response)) {
-        _markWorkoutScheduleUnsupported(error.response);
-      }
-    }
     await _scheduleFallback.delete(session, entry);
   }
 
-  void _markWorkoutScheduleUnsupported(Response<dynamic>? response) {
-    _workoutScheduleBackendSupported = false;
-    if (kDebugMode) {
-      debugPrint(
-        'JimBro schedule backend unsupported status=${response?.statusCode ?? 'unknown'} route=/workout-schedule; using local schedule store.',
-      );
-    }
+  @override
+  Future<WorkoutMutationResult> saveWorkoutLog(
+    AuthSession? session,
+    WorkoutLogDraft log,
+  ) {
+    return _saveWorkoutLogWithMutation(
+      session,
+      log,
+      mutationId: _newMutationUuid(),
+    );
   }
 
   @override
-  Future<WorkoutLogDraft> saveWorkoutLog(
+  Future<WorkoutMutationResult> finishWorkout(
     AuthSession? session,
-    WorkoutLogDraft log,
-  ) async {
+    WorkoutLogDraft log, {
+    required String mutationId,
+  }) {
+    return _saveWorkoutLogWithMutation(
+      session,
+      log,
+      mutationId: mutationId,
+    );
+  }
+
+  Future<WorkoutMutationResult> _saveWorkoutLogWithMutation(
+    AuthSession? session,
+    WorkoutLogDraft log, {
+    required String mutationId,
+  }) async {
     if (session == null) {
-      throw Exception(
-        'Authentication session missing in workout log repository.\n'
-        'source: lib/core/repositories/app_repositories.dart -> FastApiWorkoutRepository.saveWorkoutLog\n'
-        'problem: saveWorkoutLog received session == null, so no Authorization header could be created.\n'
-        'backend_request_sent: false\n'
-        'expected: AppDraftController should resolve AuthSession before calling this repository.\n'
-        'fix: Verify authSessionProvider and AuthRepository.currentSession() both contain the Supabase session after login.',
+      throw const AppError(
+        code: AppErrorCode.sessionExpired,
+        userMessage: 'Your session expired. Please sign in again.',
+        diagnostics: AppErrorDiagnostics(
+          method: 'POST',
+          route: '/workout-logs',
+          retryable: false,
+        ),
       );
     }
+    final localWorkoutId = 'local-$mutationId';
+    late final WorkoutLogDraft normalized;
     try {
-      final saved = await _saveWorkoutLogOnline(session, log);
-      await flushPending(session);
-      return saved;
-    } on DioException catch (error) {
-      if (_shouldQueueOffline(error)) {
-        final normalized = _validateWorkoutLogDraft(log);
-        await _outbox.enqueue(
-          session,
-          OfflineOutboxItem(
-            localId: _localMutationId('workout-log'),
-            operationType: 'workout_log_create',
-            payload: workoutLogDraftToJson(normalized),
-            createdAt: DateTime.now(),
-            retryCount: 0,
-            lastErrorCode: _dioErrorCode(error),
-            lastErrorMessage: _safeErrorSummary(error),
+      normalized = _validateWorkoutLogDraft(log);
+    } catch (_) {
+      return WorkoutMutationResult(
+        localWorkoutId: localWorkoutId,
+        mutationId: mutationId,
+        syncStatus: WorkoutSyncStatus.needsReview,
+        errorCode: AppErrorCode.validationFailed,
+        retryable: false,
+        authoritativeWorkout: log,
+      );
+    }
+    final queued = OfflineOutboxItem(
+      localId: mutationId,
+      operationType: 'workout_log_create',
+      payload: {'workout': workoutLogOutboxPayload(normalized)},
+      createdAt: DateTime.now(),
+      retryCount: 0,
+    );
+    await _outbox.enqueue(session, queued);
+    try {
+      final saved = await _saveWorkoutLogOnline(
+        session,
+        normalized,
+        mutationId: mutationId,
+      );
+      final serverLogId = saved.workoutLogId;
+      if (serverLogId == null) {
+        throw const AppError(
+          code: AppErrorCode.malformedResponse,
+          userMessage:
+              'The workout was not confirmed by the server. It remains queued.',
+          diagnostics: AppErrorDiagnostics(
+            method: 'POST',
+            route: '/workout-logs',
+            retryable: true,
           ),
         );
-        return normalized;
       }
-      rethrow;
+      await _outbox.remove(session, mutationId);
+      await flushPending(session);
+      return WorkoutMutationResult(
+        localWorkoutId: localWorkoutId,
+        serverLogId: serverLogId,
+        mutationId: mutationId,
+        syncStatus: WorkoutSyncStatus.synced,
+        errorCode: null,
+        retryable: false,
+        authoritativeWorkout: saved,
+      );
+    } on DioException catch (error) {
+      final status = error.response?.statusCode ?? 0;
+      final needsReview = status == 400 || status == 422;
+      final retryable = _shouldQueueOffline(error);
+      await _outbox.update(
+        session,
+        queued.copyWith(
+          lastErrorCode: _dioErrorCode(error),
+          lastErrorMessage: _safeErrorSummary(error),
+          needsReview: needsReview || !retryable,
+        ),
+      );
+      return WorkoutMutationResult(
+        localWorkoutId: localWorkoutId,
+        mutationId: mutationId,
+        syncStatus: needsReview
+            ? WorkoutSyncStatus.needsReview
+            : retryable
+                ? WorkoutSyncStatus.pendingSync
+                : WorkoutSyncStatus.failed,
+        errorCode:
+            needsReview ? AppErrorCode.validationFailed : _dioErrorCode(error),
+        retryable: retryable && !needsReview,
+        authoritativeWorkout: normalized,
+      );
+    } on AppError catch (error) {
+      final needsReview = error.code == AppErrorCode.validationFailed ||
+          !error.diagnostics.retryable;
+      await _outbox.update(
+        session,
+        queued.copyWith(
+          lastErrorCode: error.code,
+          lastErrorMessage: error.userMessage,
+          needsReview: needsReview,
+        ),
+      );
+      return WorkoutMutationResult(
+        localWorkoutId: localWorkoutId,
+        mutationId: mutationId,
+        syncStatus: needsReview
+            ? WorkoutSyncStatus.needsReview
+            : WorkoutSyncStatus.pendingSync,
+        errorCode: error.code,
+        retryable: error.diagnostics.retryable && !needsReview,
+        authoritativeWorkout: normalized,
+      );
     }
   }
 
   Future<WorkoutLogDraft> _saveWorkoutLogOnline(
     AuthSession session,
-    WorkoutLogDraft log,
-  ) async {
+    WorkoutLogDraft log, {
+    required String mutationId,
+  }) async {
     final normalized = _validateWorkoutLogDraft(log);
     final resolvedExercises = <WorkoutExerciseDraft>[];
     for (final exercise in normalized.exercises) {
@@ -1518,7 +1983,10 @@ class FastApiWorkoutRepository implements WorkoutRepository {
         ),
       );
     }
-    final richPayload = workoutLogRichPayload(normalized, resolvedExercises);
+    final richPayload = {
+      ...workoutLogRichPayload(normalized, resolvedExercises),
+      'client_mutation_id': mutationId,
+    };
     if (normalized.workoutLogId != null) {
       final response = await _requestWithSessionRetry(
         _dio,
@@ -1526,7 +1994,10 @@ class FastApiWorkoutRepository implements WorkoutRepository {
         (headers) => _dio.patch<dynamic>(
           '/workout-logs/${normalized.workoutLogId}',
           data: workoutLogMetadataPatchPayload(normalized),
-          options: Options(headers: headers),
+          options: Options(headers: {
+            ...headers,
+            'Idempotency-Key': mutationId,
+          }),
         ),
       );
       _throwIfRequestFailed(
@@ -1543,7 +2014,10 @@ class FastApiWorkoutRepository implements WorkoutRepository {
       (headers) => _dio.post<dynamic>(
         '/workout-logs',
         data: richPayload,
-        options: Options(headers: headers),
+        options: Options(headers: {
+          ...headers,
+          'Idempotency-Key': mutationId,
+        }),
       ),
     );
     _throwIfRequestFailed(
@@ -1571,9 +2045,15 @@ class FastApiWorkoutRepository implements WorkoutRepository {
         continue;
       }
       try {
-        await _saveWorkoutLogOnline(
-            session, workoutLogDraftFromJson(item.payload));
-        await _outbox.remove(session, item.localId);
+        final rawWorkout = item.payload['workout'] ?? item.payload;
+        final saved = await _saveWorkoutLogOnline(
+          session,
+          workoutLogDraftFromJson(rawWorkout),
+          mutationId: item.localId,
+        );
+        if (saved.workoutLogId != null) {
+          await _outbox.remove(session, item.localId);
+        }
       } on AuthSessionExpiredException {
         return;
       } on DioException catch (error) {
@@ -1595,6 +2075,34 @@ class FastApiWorkoutRepository implements WorkoutRepository {
         }
       }
     }
+  }
+
+  @override
+  Future<WorkoutMutationResult?> loadPendingWorkoutMutation(
+    AuthSession? session,
+  ) async {
+    if (session == null) {
+      return null;
+    }
+    final items = await _outbox.load(session);
+    for (final item in items.reversed) {
+      if (item.operationType != 'workout_log_create') {
+        continue;
+      }
+      final rawWorkout = item.payload['workout'] ?? item.payload;
+      final workout = workoutLogDraftFromJson(rawWorkout);
+      return WorkoutMutationResult(
+        localWorkoutId: 'local-${item.localId}',
+        mutationId: item.localId,
+        syncStatus: item.needsReview
+            ? WorkoutSyncStatus.needsReview
+            : WorkoutSyncStatus.pendingSync,
+        errorCode: item.lastErrorCode,
+        retryable: !item.needsReview,
+        authoritativeWorkout: workout,
+      );
+    }
+    return null;
   }
 
   Future<WorkoutLogDraft> _readBackWorkoutLogIfSupported(
@@ -1640,7 +2148,10 @@ class MockNutritionRepository implements NutritionRepository {
       _summaryFor(_foodLogs);
 
   @override
-  Future<List<FoodSuggestion>> searchFoods(String query) async {
+  Future<List<FoodSuggestion>> searchFoods(
+    String query, [
+    AuthSession? session,
+  ]) async {
     final normalized = query.trim().toLowerCase();
     if (normalized.isEmpty) {
       return const [];
@@ -1649,12 +2160,23 @@ class MockNutritionRepository implements NutritionRepository {
   }
 
   @override
-  Future<List<FoodLogDraft>> saveFoodLogs(
+  Future<NutritionMutationResult> saveFoodLogs(
     AuthSession? session,
     List<FoodLogDraft> logs,
   ) async {
-    _foodLogs = logs;
-    return _foodLogs;
+    _foodLogs = logs.asMap().entries.map((entry) {
+      return entry.value.copyWith(
+        foodLogId: entry.value.foodLogId ?? 'mock-food-${entry.key + 1}',
+        isDirty: false,
+      );
+    }).toList(growable: false);
+    return NutritionMutationResult(
+      entries: _foodLogs,
+      summary: _summaryFor(_foodLogs),
+      mutationId: 'mock-nutrition-mutation',
+      revision: 'mock-revision',
+      syncStatus: NutritionMutationSyncStatus.synced,
+    );
   }
 
   @override
@@ -1687,17 +2209,29 @@ class MockNutritionRepository implements NutritionRepository {
   }
 }
 
-class FastApiNutritionRepository implements NutritionRepository {
+class FastApiNutritionRepository
+    implements NutritionRepository, UserScopedCache {
   FastApiNutritionRepository(
     this._dio, {
     OfflineOutboxStore? outbox,
-  }) : _outbox = outbox ?? const OfflineOutboxStore();
+    Duration searchCacheTtl = FrontendCachePolicy.foodSearch,
+  })  : _outbox = outbox ?? const OfflineOutboxStore(),
+        _searchCacheTtl = searchCacheTtl;
 
   final Dio _dio;
   final OfflineOutboxStore _outbox;
+  final Duration _searchCacheTtl;
   final _foodSearchCache = <String, _CacheEntry<List<FoodSuggestion>>>{};
   final _todayFoodLogCache = <String, _CacheEntry<List<FoodLogDraft>>>{};
   final _summaryCache = <String, _CacheEntry<DailyNutritionSummary>>{};
+  final _dayRevisions = <String, String>{};
+
+  @override
+  void clearUserCache(String userId) {
+    final prefix = '$userId:';
+    _todayFoodLogCache.removeWhere((key, _) => key.startsWith(prefix));
+    _summaryCache.removeWhere((key, _) => key.startsWith(prefix));
+  }
 
   @override
   Future<List<FoodLogDraft>> loadFoodLogs(AuthSession? session) async {
@@ -1730,6 +2264,11 @@ class FastApiNutritionRepository implements NutritionRepository {
       return cached?.value ?? const [];
     }
     final logs = data.map<FoodLogDraft>((item) => _mapFoodLog(item)).toList();
+    final revision = response.headers.value('etag') ??
+        response.headers.value('x-day-revision');
+    if (revision != null && revision.trim().isNotEmpty) {
+      _dayRevisions[cacheKey] = revision.trim();
+    }
     _todayFoodLogCache[cacheKey] = _CacheEntry(
       logs,
       ttl: FrontendCachePolicy.todayFoodLog,
@@ -1785,7 +2324,10 @@ class FastApiNutritionRepository implements NutritionRepository {
   }
 
   @override
-  Future<List<FoodSuggestion>> searchFoods(String query) async {
+  Future<List<FoodSuggestion>> searchFoods(
+    String query, [
+    AuthSession? session,
+  ]) async {
     final normalized = query.trim().toLowerCase();
     if (normalized.isEmpty) {
       return const [];
@@ -1795,16 +2337,29 @@ class FastApiNutritionRepository implements NutritionRepository {
       return cached.value;
     }
     try {
-      final response = await _dio.get<dynamic>(
-        '/food/search',
-        queryParameters: {'q': normalized},
-      ).timeout(const Duration(seconds: 5));
-      if (response.statusCode == null || response.statusCode! >= 400) {
-        return cached?.value ?? const [];
-      }
+      final request = session == null
+          ? _dio.get<dynamic>(
+              '/food/search',
+              queryParameters: {'q': normalized},
+            )
+          : _requestWithSessionRetry(
+              _dio,
+              session,
+              (headers) => _dio.get<dynamic>(
+                '/food/search',
+                queryParameters: {'q': normalized},
+                options: Options(headers: headers),
+              ),
+            );
+      final response = await request.timeout(const Duration(seconds: 5));
+      _throwIfRequestFailed(
+        response,
+        source:
+            'lib/core/repositories/app_repositories.dart -> FastApiNutritionRepository.searchFoods',
+      );
       final data = _unwrapData(response.data);
       if (data is! List) {
-        return cached?.value ?? const [];
+        throw _malformedSearchResponse('/food/search');
       }
       final suggestions = data
           .map<FoodSuggestion?>((item) {
@@ -1818,174 +2373,177 @@ class FastApiNutritionRepository implements NutritionRepository {
           })
           .whereType<FoodSuggestion>()
           .toList();
+      if (data.isNotEmpty && suggestions.isEmpty) {
+        throw _malformedSearchResponse('/food/search');
+      }
       _foodSearchCache[normalized] = _CacheEntry(
         suggestions,
-        ttl: FrontendCachePolicy.foodSearch,
+        ttl: _searchCacheTtl,
       );
       return suggestions;
-    } catch (_) {
-      return cached?.value ?? const [];
+    } catch (error) {
+      final mapped = _mapFeatureSearchError(error, route: '/food/search');
+      if (cached != null && _isOfflineSearchError(mapped)) {
+        throw CachedSearchResultsException<FoodSuggestion>(
+          results: cached.value,
+          error: mapped,
+        );
+      }
+      throw mapped;
     }
   }
 
   @override
-  Future<List<FoodLogDraft>> saveFoodLogs(
+  Future<NutritionMutationResult> saveFoodLogs(
     AuthSession? session,
     List<FoodLogDraft> logs,
   ) async {
     if (session == null) {
       throw Exception('You must be signed in to save nutrition logs.');
     }
+    final normalized = logs.map(_validateFoodLogDraft).toList(growable: false);
+    final date = _formatDate(
+      normalized.isEmpty
+          ? DateTime.now()
+          : (normalized.first.logDate ?? DateTime.now()),
+    );
+    if (normalized.any(
+      (entry) => _formatDate(entry.logDate ?? DateTime.now()) != date,
+    )) {
+      throw const AppError(
+        code: AppErrorCode.validationFailed,
+        userMessage: 'A nutrition save can only contain one day.',
+        diagnostics: AppErrorDiagnostics(retryable: false),
+      );
+    }
+    final mutationId = _newMutationUuid();
+    final revisionKey = '${session.userId}:$date';
+    final queued = OfflineOutboxItem(
+      localId: mutationId,
+      operationType: 'nutrition_logs_replace',
+      payload: {
+        'date': date,
+        'previous_revision': _dayRevisions[revisionKey],
+        'entries': normalized.map(foodLogDraftToJson).toList(),
+      },
+      createdAt: DateTime.now(),
+      retryCount: 0,
+    );
+    await _outbox.enqueue(session, queued);
     try {
-      final saved = await _saveFoodLogsOnline(session, logs);
+      final committed = await _commitFoodDay(
+        session,
+        date: date,
+        entries: normalized,
+        mutationId: mutationId,
+        previousRevision: _dayRevisions[revisionKey],
+      );
+      await _outbox.remove(session, mutationId);
       await flushPending(session);
-      return saved;
+      return committed;
+    } on NutritionMutationConflictException {
+      await _outbox.update(session, queued.copyWith(needsReview: true));
+      rethrow;
     } on DioException catch (error) {
+      if (error.response?.statusCode == 409) {
+        await _outbox.update(session, queued.copyWith(needsReview: true));
+        throw const NutritionMutationConflictException(
+          'This day changed on another device. Reload before saving again.',
+        );
+      }
       if (_shouldQueueOffline(error)) {
-        final normalized = logs.map(_validateFoodLogDraft).toList();
-        _cacheTodayFoodLogs(session, normalized);
-        await _outbox.enqueue(
+        await _outbox.update(
           session,
-          OfflineOutboxItem(
-            localId: _localMutationId('nutrition-batch'),
-            operationType: 'nutrition_logs_replace',
-            payload: {
-              'logs': normalized.map(foodLogDraftToJson).toList(),
-            },
-            createdAt: DateTime.now(),
-            retryCount: 0,
+          queued.copyWith(
             lastErrorCode: _dioErrorCode(error),
             lastErrorMessage: _safeErrorSummary(error),
           ),
         );
-        return normalized;
+        throw const NutritionMutationPendingException(
+          'Nutrition changes are waiting to sync. The current day was kept.',
+        );
       }
+      await _outbox.update(session, queued.copyWith(needsReview: true));
       rethrow;
     }
   }
 
-  Future<List<FoodLogDraft>> _saveFoodLogsOnline(
-    AuthSession session,
-    List<FoodLogDraft> logs,
-  ) async {
-    final existingLogs = await loadFoodLogs(session);
-    final existingById = {
-      for (final log in existingLogs)
-        if (log.foodLogId != null) log.foodLogId!: log,
-    };
-    final keptIds =
-        logs.map((log) => log.foodLogId).whereType<String>().toSet();
-    for (final existing in existingLogs) {
-      final id = existing.foodLogId;
-      if (id != null && !keptIds.contains(id)) {
-        final response = await _requestWithSessionRetry(
-          _dio,
-          session,
-          (headers) => _dio.delete<dynamic>(
-            '/food-log/$id',
-            options: Options(headers: headers),
-          ),
-        );
-        _throwIfRequestFailed(
-          response,
-          source:
-              'lib/core/repositories/app_repositories.dart -> FastApiNutritionRepository.saveFoodLogs.delete',
-        );
-      }
+  Future<NutritionMutationResult> _commitFoodDay(
+    AuthSession session, {
+    required String date,
+    required List<FoodLogDraft> entries,
+    required String mutationId,
+    required String? previousRevision,
+  }) async {
+    final response = await _requestWithSessionRetry(
+      _dio,
+      session,
+      (headers) => _dio.put<dynamic>(
+        '/food-log/day/$date',
+        data: {
+          'date': date,
+          'client_mutation_id': mutationId,
+          'previous_revision': previousRevision,
+          'entries': entries.map(foodLogDraftToJson).toList(),
+        },
+        options: Options(headers: {
+          ...headers,
+          'Idempotency-Key': mutationId,
+        }),
+      ),
+    );
+    if (response.statusCode == 409) {
+      throw const NutritionMutationConflictException(
+        'This day changed on another device. Reload before saving again.',
+      );
     }
-
-    final saved = <FoodLogDraft>[];
-    for (final log in logs) {
-      final normalized = _validateFoodLogDraft(log);
-      final previous = normalized.foodLogId == null
-          ? null
-          : existingById[normalized.foodLogId!];
-      final requiresNewFood = previous == null ||
-          normalized.foodId == null ||
-          previous.foodName != normalized.foodName ||
-          !_sameNumber(previous.calories, normalized.calories) ||
-          !_sameNumber(previous.protein, normalized.protein) ||
-          !_sameNumber(previous.carbs, normalized.carbs) ||
-          !_sameNumber(previous.fat, normalized.fat);
-      final foodId = requiresNewFood
-          ? await _createFoodForLog(session, normalized)
-          : (normalized.foodId ?? previous.foodId);
-      if (foodId == null || foodId.isEmpty) {
-        throw Exception(
-            'Could not resolve a food_id for ${normalized.foodName}.');
-      }
-      final date = _formatDate(normalized.logDate ?? DateTime.now());
-      final canPatchExisting = normalized.foodLogId != null &&
-          previous != null &&
-          previous.foodId == foodId &&
-          previous.mealType == normalized.mealType &&
-          _sameDay(previous.logDate, normalized.logDate);
-
-      if (canPatchExisting) {
-        final response = await _requestWithSessionRetry(
-          _dio,
-          session,
-          (headers) => _dio.patch<dynamic>(
-            '/food-log/${normalized.foodLogId}',
-            data: {
-              'quantity_grams': normalized.quantityGrams,
-            },
-            options: Options(headers: headers),
-          ),
-        );
-        _throwIfRequestFailed(
-          response,
-          source:
-              'lib/core/repositories/app_repositories.dart -> FastApiNutritionRepository.saveFoodLogs.patch',
-        );
-        saved.add(_mapFoodLog(_unwrapData(response.data)));
-        continue;
-      }
-
-      if (normalized.foodLogId != null) {
-        final deleteResponse = await _requestWithSessionRetry(
-          _dio,
-          session,
-          (headers) => _dio.delete<dynamic>(
-            '/food-log/${normalized.foodLogId}',
-            options: Options(headers: headers),
-          ),
-        );
-        _throwIfRequestFailed(
-          deleteResponse,
-          source:
-              'lib/core/repositories/app_repositories.dart -> FastApiNutritionRepository.saveFoodLogs.recreateDelete',
-        );
-      }
-
-      final createResponse = await _requestWithSessionRetry(
-        _dio,
-        session,
-        (headers) => _dio.post<dynamic>(
-          '/food-log',
-          data: foodLogBackendPayload(normalized, foodId: foodId, date: date),
-          options: Options(headers: headers),
+    _throwIfRequestFailed(
+      response,
+      source:
+          'lib/core/repositories/app_repositories.dart -> FastApiNutritionRepository.saveFoodLogs.atomicDay',
+    );
+    final data = _asMap(_unwrapData(response.data));
+    final rawEntries = data['entries'] ?? data['food_logs'];
+    final revision = data['revision']?.toString().trim() ?? '';
+    final rawTotals = _asMap(data['totals'] ?? data['summary']);
+    if (rawEntries is! List || revision.isEmpty || rawTotals.isEmpty) {
+      throw const AppError(
+        code: AppErrorCode.malformedResponse,
+        userMessage:
+            'The nutrition save could not be confirmed. The current day was kept.',
+        diagnostics: AppErrorDiagnostics(
+          method: 'PUT',
+          route: '/food-log/day/{date}',
+          retryable: true,
         ),
       );
-      _throwIfRequestFailed(
-        createResponse,
-        source:
-            'lib/core/repositories/app_repositories.dart -> FastApiNutritionRepository.saveFoodLogs.create',
-      );
-      saved.add(_mapFoodLog(_unwrapData(createResponse.data)));
     }
-    _cacheTodayFoodLogs(session, saved);
-    return saved;
+    final committedEntries =
+        rawEntries.map<FoodLogDraft>(_mapFoodLog).toList(growable: false);
+    final summary = dailyNutritionSummaryFromBackend(rawTotals);
+    _dayRevisions['${session.userId}:$date'] = revision;
+    _cacheTodayFoodLogs(session, committedEntries, summary: summary);
+    return NutritionMutationResult(
+      entries: committedEntries,
+      summary: summary,
+      mutationId: mutationId,
+      revision: revision,
+      syncStatus: NutritionMutationSyncStatus.synced,
+    );
   }
 
-  void _cacheTodayFoodLogs(AuthSession session, List<FoodLogDraft> logs) {
+  void _cacheTodayFoodLogs(
+    AuthSession session,
+    List<FoodLogDraft> logs, {
+    DailyNutritionSummary? summary,
+  }) {
     final cacheKey = '${session.userId}:${_todayIso()}';
     _todayFoodLogCache[cacheKey] = _CacheEntry(
       logs,
       ttl: FrontendCachePolicy.todayFoodLog,
     );
     _summaryCache[cacheKey] = _CacheEntry(
-      nutritionSummaryFromFoodLogs(logs),
+      summary ?? nutritionSummaryFromFoodLogs(logs),
       ttl: FrontendCachePolicy.dashboard,
     );
   }
@@ -2001,12 +2559,21 @@ class FastApiNutritionRepository implements NutritionRepository {
         continue;
       }
       try {
-        final rawLogs = item.payload['logs'];
-        final logs = rawLogs is List
-            ? rawLogs.map(foodLogDraftFromJson).toList(growable: false)
+        final rawEntries = item.payload['entries'] ?? item.payload['logs'];
+        final entries = rawEntries is List
+            ? rawEntries.map(foodLogDraftFromJson).toList(growable: false)
             : const <FoodLogDraft>[];
-        await _saveFoodLogsOnline(session, logs);
+        final date = item.payload['date']?.toString() ?? _todayIso();
+        await _commitFoodDay(
+          session,
+          date: date,
+          entries: entries,
+          mutationId: item.localId,
+          previousRevision: item.payload['previous_revision']?.toString(),
+        );
         await _outbox.remove(session, item.localId);
+      } on NutritionMutationConflictException {
+        await _outbox.update(session, item.copyWith(needsReview: true));
       } on AuthSessionExpiredException {
         return;
       } on DioException catch (error) {
@@ -2025,53 +2592,6 @@ class FastApiNutritionRepository implements NutritionRepository {
         );
       }
     }
-  }
-
-  Future<String?> _createFoodForLog(
-    AuthSession session,
-    FoodLogDraft log,
-  ) async {
-    final existingFoodId = await _resolveFoodId(_dio, log);
-    if (existingFoodId != null) {
-      return existingFoodId;
-    }
-    if (log.calories <= 0 &&
-        log.protein <= 0 &&
-        log.carbs <= 0 &&
-        log.fat <= 0) {
-      throw Exception(
-        'Select a food suggestion or enter calories/macros before saving "${log.foodName}".',
-      );
-    }
-    final quantity = log.quantityGrams <= 0 ? 100 : log.quantityGrams;
-    final factor = 100 / quantity;
-    final response = await _requestWithSessionRetry(
-      _dio,
-      session,
-      (headers) => _dio.post<dynamic>(
-        '/food',
-        data: customFoodBackendPayload(log, factor: factor),
-        options: Options(headers: headers),
-      ),
-    );
-    if (_routeLooksUnsupported(response)) {
-      throw Exception(
-        'Custom food creation is not available on this backend yet. Select a catalog result from search or retry when /food is enabled.',
-      );
-    }
-    _throwIfRequestFailed(
-      response,
-      source:
-          'lib/core/repositories/app_repositories.dart -> FastApiNutritionRepository._createFoodForLog',
-    );
-    final data = _asMap(_unwrapData(response.data));
-    final foodId = data['food_id']?.toString();
-    if (foodId == null || foodId.isEmpty) {
-      throw Exception(
-        'The backend created "${log.foodName}" but did not return a food_id.',
-      );
-    }
-    return foodId;
   }
 }
 
@@ -2876,11 +3396,21 @@ class OfflineOutboxItem {
 }
 
 class OfflineOutboxStore {
-  const OfflineOutboxStore();
+  const OfflineOutboxStore({
+    FlutterSecureStorage storage = const FlutterSecureStorage(),
+  }) : _storage = storage;
+
+  final FlutterSecureStorage _storage;
 
   Future<List<OfflineOutboxItem>> load(AuthSession? session) async {
     final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_key(session));
+    await prefs.remove(_legacyKey(session));
+    late final String? raw;
+    try {
+      raw = await _storage.read(key: _key(session));
+    } on PlatformException {
+      throw const SecureOutboxUnavailableException();
+    }
     if (raw == null || raw.isEmpty) {
       return const [];
     }
@@ -2893,7 +3423,8 @@ class OfflineOutboxStore {
           .map(OfflineOutboxItem.fromJson)
           .whereType<OfflineOutboxItem>()
           .toList(growable: false);
-    } catch (_) {
+    } on FormatException {
+      await _storage.delete(key: _key(session));
       return const [];
     }
   }
@@ -2911,10 +3442,19 @@ class OfflineOutboxStore {
     List<OfflineOutboxItem> items,
   ) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-      _key(session),
-      jsonEncode(items.map((item) => item.toJson()).toList()),
-    );
+    await prefs.remove(_legacyKey(session));
+    try {
+      if (items.isEmpty) {
+        await _storage.delete(key: _key(session));
+      } else {
+        await _storage.write(
+          key: _key(session),
+          value: jsonEncode(items.map((item) => item.toJson()).toList()),
+        );
+      }
+    } on PlatformException {
+      throw const SecureOutboxUnavailableException();
+    }
   }
 
   Future<void> remove(AuthSession? session, String localId) async {
@@ -2927,7 +3467,12 @@ class OfflineOutboxStore {
 
   Future<void> clear(AuthSession? session) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_key(session));
+    await prefs.remove(_legacyKey(session));
+    try {
+      await _storage.delete(key: _key(session));
+    } on PlatformException {
+      throw const SecureOutboxUnavailableException();
+    }
   }
 
   Future<void> update(AuthSession? session, OfflineOutboxItem item) async {
@@ -2941,6 +3486,10 @@ class OfflineOutboxStore {
   }
 
   String _key(AuthSession? session) {
+    return 'jimbro.secure_outbox.v2.${Uri.encodeComponent(session?.userId ?? 'anonymous')}';
+  }
+
+  String _legacyKey(AuthSession? session) {
     return 'offline_outbox_${session?.userId ?? 'anonymous'}';
   }
 }
@@ -3034,27 +3583,185 @@ class LocalWorkoutScheduleStore {
   }
 }
 
+class WorkoutTemplateDraftStore {
+  const WorkoutTemplateDraftStore();
+
+  Future<WorkoutTemplateDraft?> load(AuthSession? session) async {
+    if (session == null) {
+      return null;
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final key = _key(session);
+      final raw = prefs.getString(key);
+      if (raw == null || raw.isEmpty) {
+        return null;
+      }
+      final map = _asMap(jsonDecode(raw));
+      if (map.isEmpty) {
+        await prefs.remove(key);
+        return null;
+      }
+      return _workoutTemplateDraftFromJson(map);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> write(
+    AuthSession? session,
+    WorkoutTemplateDraft draft,
+  ) async {
+    if (session == null) {
+      return;
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _key(session),
+        jsonEncode(_workoutTemplateDraftToJson(draft)),
+      );
+    } catch (_) {
+      // Draft persistence is best-effort; the in-memory draft remains intact.
+    }
+  }
+
+  Future<void> clear(AuthSession? session) async {
+    if (session == null) {
+      return;
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_key(session));
+    } catch (_) {
+      // A missing preferences channel must not block sign-out.
+    }
+  }
+
+  String _key(AuthSession session) =>
+      'jimbro.workout_template_draft.v1.${Uri.encodeComponent(session.userId)}';
+}
+
+class ActiveWorkoutCheckpointLoad {
+  const ActiveWorkoutCheckpointLoad({
+    this.session,
+    this.corrupted = false,
+  });
+
+  final ActiveWorkoutSession? session;
+  final bool corrupted;
+}
+
+class ActiveWorkoutCheckpointStore {
+  const ActiveWorkoutCheckpointStore();
+
+  Future<ActiveWorkoutCheckpointLoad> load(AuthSession? authSession) async {
+    if (authSession == null) {
+      return const ActiveWorkoutCheckpointLoad();
+    }
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_key(authSession));
+    if (raw == null || raw.isEmpty) {
+      return const ActiveWorkoutCheckpointLoad();
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) {
+        throw const FormatException('Invalid active workout checkpoint.');
+      }
+      final session = ActiveWorkoutSession.fromJson(
+        Map<String, dynamic>.from(decoded),
+      );
+      if (session.lifecycle == ActiveWorkoutLifecycle.discarded) {
+        await prefs.remove(_key(authSession));
+        return const ActiveWorkoutCheckpointLoad();
+      }
+      return ActiveWorkoutCheckpointLoad(session: session);
+    } catch (_) {
+      await prefs.remove(_key(authSession));
+      return const ActiveWorkoutCheckpointLoad(corrupted: true);
+    }
+  }
+
+  Future<void> write(
+    AuthSession? authSession,
+    ActiveWorkoutSession session,
+  ) async {
+    if (authSession == null) {
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_key(authSession), jsonEncode(session.toJson()));
+  }
+
+  Future<void> clear(AuthSession? authSession) async {
+    if (authSession == null) {
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_key(authSession));
+  }
+
+  String _key(AuthSession authSession) =>
+      'jimbro.active_workout.v1.${Uri.encodeComponent(authSession.userId)}';
+}
+
 class LocalAccountDataStore {
   const LocalAccountDataStore({
     this.outbox = const OfflineOutboxStore(),
     this.workoutSchedule = const LocalWorkoutScheduleStore(),
+    this.workoutTemplateDraft = const WorkoutTemplateDraftStore(),
+    this.activeWorkoutCheckpoint = const ActiveWorkoutCheckpointStore(),
   });
 
   final OfflineOutboxStore outbox;
   final LocalWorkoutScheduleStore workoutSchedule;
+  final WorkoutTemplateDraftStore workoutTemplateDraft;
+  final ActiveWorkoutCheckpointStore activeWorkoutCheckpoint;
 
   Future<void> clearDeletedAccount(AuthSession session) async {
-    await outbox.clear(session);
-    await workoutSchedule.clear(session);
+    Object? cleanupError;
+    try {
+      await outbox.clear(session);
+    } catch (error) {
+      cleanupError = error;
+    }
+    try {
+      await workoutSchedule.clear(session);
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    try {
+      await workoutTemplateDraft.clear(session);
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    try {
+      await activeWorkoutCheckpoint.clear(session);
+    } catch (error) {
+      cleanupError ??= error;
+    }
     final prefs = await SharedPreferences.getInstance();
     final encodedUserId = Uri.encodeComponent(session.userId);
     await prefs.remove('jimbro.onboarding.v1.$encodedUserId');
     await prefs.remove('jimbro.onboarding.v1.$encodedUserId.tmp');
+    if (cleanupError != null) {
+      throw cleanupError;
+    }
   }
 }
 
 final localAccountDataStoreProvider = Provider<LocalAccountDataStore>(
   (ref) => const LocalAccountDataStore(),
+);
+
+final workoutTemplateDraftStoreProvider = Provider<WorkoutTemplateDraftStore>(
+  (ref) => const WorkoutTemplateDraftStore(),
+);
+
+final activeWorkoutCheckpointStoreProvider =
+    Provider<ActiveWorkoutCheckpointStore>(
+  (ref) => const ActiveWorkoutCheckpointStore(),
 );
 
 final accountRepositoryProvider = Provider<AccountRepository>((ref) {
@@ -3137,98 +3844,94 @@ final searchRepositoryProvider = Provider<SearchRepository>(
   (ref) => MockSearchRepository(),
 );
 
-Future<String?> _getValidToken() async {
-  final refreshed = await Supabase.instance.client.auth.refreshSession();
-  return refreshed.session?.accessToken;
-}
+Future<String?>? _supabaseRefreshInFlight;
 
-Session? _safeCurrentSupabaseSession() {
+Future<String?> _getCurrentSupabaseToken() async {
   try {
-    return Supabase.instance.client.auth.currentSession;
+    final session = Supabase.instance.client.auth.currentSession;
+    if (session == null) {
+      return null;
+    }
+    final expiresAt = session.expiresAt;
+    final nowSeconds = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    if (expiresAt != null && expiresAt <= nowSeconds + 30) {
+      return _refreshSupabaseToken();
+    }
+    return session.accessToken;
   } catch (_) {
     return null;
   }
 }
 
-Map<String, String> _tokenDiagnostics(String? token) {
-  if (token == null || token.isEmpty) {
-    return const {'token_state': 'missing'};
+Future<String?> _refreshSupabaseToken() {
+  final existing = _supabaseRefreshInFlight;
+  if (existing != null) {
+    return existing;
   }
-  final parts = token.split('.');
-  final payload = parts.length >= 2 ? _decodeJwtPayload(token) : const {};
-  final exp = _toNullableInt(payload['exp']);
-  final nowSeconds = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-  final expiresIn = exp == null ? null : exp - nowSeconds;
-  return {
-    'token_state': 'present',
-    'token_parts': '${parts.length}',
-    if (payload['iss'] != null) 'jwt_iss': payload['iss'].toString(),
-    if (payload['aud'] != null) 'jwt_aud': payload['aud'].toString(),
-    if (exp != null) 'jwt_exp': '$exp',
-    if (expiresIn != null) 'jwt_expires_in_seconds': '$expiresIn',
-  };
+  final operation = _performSupabaseRefresh();
+  _supabaseRefreshInFlight = operation;
+  operation.then<void>(
+    (_) {
+      if (identical(_supabaseRefreshInFlight, operation)) {
+        _supabaseRefreshInFlight = null;
+      }
+    },
+    onError: (Object _, StackTrace __) {
+      if (identical(_supabaseRefreshInFlight, operation)) {
+        _supabaseRefreshInFlight = null;
+      }
+    },
+  );
+  return operation;
 }
 
-Future<Map<String, String>> _authHeaders(AuthSession session) async {
+Future<String?> _performSupabaseRefresh() async {
+  final refreshed = await Supabase.instance.client.auth.refreshSession();
+  return refreshed.session?.accessToken;
+}
+
+Future<Map<String, String>> _authHeaders(
+  AuthSession session, {
+  AccessTokenProvider? tokenProvider,
+}) async {
   if (session.provider != 'supabase') {
     if (session.accessToken.trim().isEmpty) {
-      throw Exception(
-        'Authentication token missing before protected backend request.\n'
-        'source: lib/core/repositories/app_repositories.dart -> _authHeaders\n'
-        'provider: ${session.provider}\n'
-        'backend_request_sent: false\n'
-        'fix: Sign in again so the app can attach a bearer token.',
+      throw const AuthSessionExpiredException(
+        'Your session expired. Please sign in again.',
       );
     }
     return session.fastApiHeaders;
   }
 
   try {
-    final token = await _getValidToken();
-    if (token != null && token.isNotEmpty) {
+    final token = await (tokenProvider ?? _getCurrentSupabaseToken)() ??
+        session.accessToken;
+    if (token.isNotEmpty) {
       return {'Authorization': 'Bearer $token'};
     }
-  } catch (error) {
-    if (_safeCurrentSupabaseSession() != null) {
-      throw Exception(
-        'Supabase session refresh failed while creating auth headers.\n'
-        'source: lib/core/repositories/app_repositories.dart -> _authHeaders\n'
-        'provider: ${session.provider}\n'
-        'problem: Supabase had a current session, but refreshSession() failed before the backend request.\n'
-        'backend_request_sent: false\n'
-        '${kDebugMode ? 'debug_error_type: ${error.runtimeType}\n' : ''}'
-        'fix: Sign out/in once. If it repeats, verify Supabase.initialize() is called and .env has SUPABASE_ANON_KEY on one line.',
-      );
-    }
-    throw Exception(
-      'Supabase is not initialized while creating auth headers.\n'
-      'source: lib/core/repositories/app_repositories.dart -> _authHeaders\n'
-      'provider: ${session.provider}\n'
-      'problem: The active session is marked supabase, but Supabase.instance is unavailable.\n'
-      'backend_request_sent: false\n'
-      'likely_cause: .env SUPABASE_ANON_KEY is missing/blank/malformed, so main.dart skipped Supabase.initialize().\n'
-      'fix: Put SUPABASE_ANON_KEY=<anon key> on one line in Flutter .env, hot restart the app, then sign in again.\n'
-      '${kDebugMode ? 'debug_error_type: ${error.runtimeType}' : ''}',
+  } catch (_) {
+    throw const AuthSessionExpiredException(
+      'Your session could not be refreshed. Please sign in again.',
     );
   }
 
-  throw Exception(
-    'Supabase session refresh returned no usable access token.\n'
-    'source: lib/core/repositories/app_repositories.dart -> _authHeaders\n'
-    'provider: ${session.provider}\n'
-    'backend_request_sent: false\n'
-    'fix: Sign out and sign in again; the app refused to send a stale token to FastAPI.',
+  throw const AuthSessionExpiredException(
+    'Your session could not be refreshed. Please sign in again.',
   );
 }
 
 Future<Response<dynamic>> _requestWithSessionRetry(
   Dio dio,
   AuthSession session,
-  Future<Response<dynamic>> Function(Map<String, String> headers) send,
-) async {
+  Future<Response<dynamic>> Function(Map<String, String> headers) send, {
+  AccessTokenProvider? tokenProvider,
+  AccessTokenProvider? refreshTokenProvider,
+}) async {
   Response<dynamic> response;
   try {
-    response = await send(await _authHeaders(session));
+    response = await send(
+      await _authHeaders(session, tokenProvider: tokenProvider),
+    );
   } on DioException catch (error) {
     final failedResponse = error.response;
     if (failedResponse == null) {
@@ -3238,7 +3941,14 @@ Future<Response<dynamic>> _requestWithSessionRetry(
   }
   if (response.statusCode == 401 && session.provider == 'supabase') {
     try {
-      final refreshedToken = await _getValidToken();
+      if (kDebugMode) {
+        debugPrint(
+          'JimBro auth retry: status=401 refreshAttempted=true. '
+          'No token logged.',
+        );
+      }
+      final refreshedToken =
+          await (refreshTokenProvider ?? _refreshSupabaseToken)();
       if (refreshedToken != null && refreshedToken.isNotEmpty) {
         try {
           response = await send({'Authorization': 'Bearer $refreshedToken'});
@@ -3324,8 +4034,33 @@ String _safeErrorSummary(DioException error) {
   };
 }
 
-String _localMutationId(String prefix) {
-  return '$prefix-${DateTime.now().microsecondsSinceEpoch}';
+String _newMutationUuid() {
+  final bytes = List<int>.generate(16, (_) => Random.secure().nextInt(256));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  final hex = bytes.map((value) => value.toRadixString(16).padLeft(2, '0'));
+  final value = hex.join();
+  return '${value.substring(0, 8)}-${value.substring(8, 12)}-'
+      '${value.substring(12, 16)}-${value.substring(16, 20)}-'
+      '${value.substring(20)}';
+}
+
+String _stableTemplateMutationId(
+  AuthSession session,
+  WorkoutTemplateDraft template,
+) {
+  final canonical = jsonEncode({
+    'user_id': session.userId,
+    'template': _workoutTemplateDraftToJson(template),
+  });
+  var hash = BigInt.parse('cbf29ce484222325', radix: 16);
+  final prime = BigInt.parse('100000001b3', radix: 16);
+  final mask = BigInt.parse('7fffffffffffffff', radix: 16);
+  for (final byte in utf8.encode(canonical)) {
+    hash ^= BigInt.from(byte);
+    hash = (hash * prime) & mask;
+  }
+  return 'template-${hash.toRadixString(16).padLeft(16, '0')}';
 }
 
 bool _isMissingBackendSupabaseServiceKey(Response<dynamic> response) {
@@ -3345,19 +4080,22 @@ bool _routeLooksUnsupported(Response<dynamic>? response) {
 Map<String, Object?> atlasOnboardingPayloadFromProfile(
   UserProfile profile, {
   required OnboardingAnswersDto answers,
-  required AtlasOnboardingAccount account,
 }) {
   final enums = BackendProfileEnums.fromOnboarding(profile, answers);
+  final dietaryPreference = answers.dietaryPreference ??
+      OnboardingDietaryPreference.fromWireValue(profile.dietaryPreference);
+  if (dietaryPreference == null) {
+    throw const InvalidDietaryPreferenceException();
+  }
   final payload = <String, Object?>{
-    'username': account.username,
-    'email': account.email,
-    'password': account.password,
+    'username': profile.name,
     'age': answers.age ?? profile.age,
     'height_cm': answers.heightCm ?? profile.heightCm,
     'weight_kg': answers.weightKg ?? profile.weightKg,
     'activity_level': enums.activityLevel,
     'fitness_goal': enums.fitnessGoal,
     'experience_level': enums.experienceLevel,
+    'dietary_preference': dietaryPreference.wireValue,
     'available_time_min':
         answers.availableTimeMin ?? profile.availableTimeMinutes,
     'equipment_access': enums.equipmentAccess,
@@ -3416,6 +4154,18 @@ Map<String, Object?> atlasProfilePatchPayload({
     previousEnums.equipmentAccess,
     nextEnums.equipmentAccess,
   );
+  final previousDietaryPreference =
+      OnboardingDietaryPreference.fromWireValue(previous.dietaryPreference);
+  final nextDietaryPreference =
+      OnboardingDietaryPreference.fromWireValue(next.dietaryPreference);
+  if (nextDietaryPreference == null) {
+    throw const InvalidDietaryPreferenceException();
+  }
+  putIfChanged(
+    'dietary_preference',
+    previousDietaryPreference?.wireValue,
+    nextDietaryPreference.wireValue,
+  );
   final nextSex = _atlasSex(next.sex);
   if (nextSex != null && _atlasSex(previous.sex) != nextSex) {
     payload['sex'] = nextSex;
@@ -3423,25 +4173,24 @@ Map<String, Object?> atlasProfilePatchPayload({
   return payload;
 }
 
-void _validateAtlasPayloadCanSync(Map<String, Object?> payload) {
-  for (final key in const ['username', 'email', 'password']) {
-    final value = payload[key]?.toString().trim();
-    if (value == null || value.isEmpty) {
-      throw const AtlasOnboardingCredentialException(
-        'Your setup is saved on this device. Jim will sync it when the coaching service is available.',
-      );
-    }
-  }
-  final sex = payload['sex'];
-  if (sex == null) {
+void _validateAtlasOnboardingPayload(Map<String, Object?> payload) {
+  final username = payload['username']?.toString().trim() ?? '';
+  if (username.isEmpty) {
     throw const AtlasProfileSyncException(
-      'Atlas metrics need sex set to Male or Female. Keeping local estimates for now.',
+      'Add your name before saving onboarding.',
     );
+  }
+  final dietaryPreference = payload['dietary_preference']?.toString();
+  if (dietaryPreference == null ||
+      !OnboardingDietaryPreference.allowedWireValues.contains(
+        dietaryPreference,
+      )) {
+    throw const InvalidDietaryPreferenceException();
   }
 }
 
-String? _atlasSex(String value) {
-  final normalized = _normalizeWire(value);
+String? _atlasSex(String? value) {
+  final normalized = _normalizeWire(value ?? '');
   if (normalized == 'male' || normalized == 'm') {
     return 'male';
   }
@@ -3469,7 +4218,7 @@ class BackendProfileEnums {
       goal: profile.goal,
       activityLevel: profile.activityLevel,
       equipmentAccess: profile.trainingPreference,
-      experienceLevel: profile.userLevel.name,
+      experienceLevel: profile.userLevel?.name,
     );
   }
 
@@ -3483,21 +4232,21 @@ class BackendProfileEnums {
       equipmentAccess:
           answers.trainingPreference?.wireValue ?? profile.trainingPreference,
       experienceLevel:
-          answers.experienceLevel?.wireValue ?? profile.userLevel.name,
+          answers.experienceLevel?.wireValue ?? profile.userLevel?.name,
     );
   }
 
   factory BackendProfileEnums.fromValues({
-    required String goal,
-    required String activityLevel,
-    required String equipmentAccess,
-    required String experienceLevel,
+    required String? goal,
+    required String? activityLevel,
+    required String? equipmentAccess,
+    required String? experienceLevel,
   }) {
     return BackendProfileEnums(
-      fitnessGoal: _backendFitnessGoal(goal),
-      activityLevel: _backendActivityLevel(activityLevel),
-      equipmentAccess: _backendEquipmentAccess(equipmentAccess),
-      experienceLevel: _backendExperienceLevel(experienceLevel),
+      fitnessGoal: _backendFitnessGoal(goal ?? ''),
+      activityLevel: _backendActivityLevel(activityLevel ?? ''),
+      equipmentAccess: _backendEquipmentAccess(equipmentAccess ?? ''),
+      experienceLevel: _backendExperienceLevel(experienceLevel ?? ''),
     );
   }
 }
@@ -3600,10 +4349,6 @@ List<String> _atlasConstraints(OnboardingAnswersDto answers) {
       break;
   }
   switch (answers.dietaryPreference) {
-    case OnboardingDietaryPreference.notNow:
-      constraints.add('minimal_nutrition_tracking');
-    case OnboardingDietaryPreference.simple:
-      constraints.add('simple_meals');
     case _:
       break;
   }
@@ -3743,32 +4488,74 @@ void _throwIfRequestFailed(
   final errorMap = _asMap(body['error']);
   final errorCode =
       errorMap['code']?.toString() ?? body['code']?.toString() ?? '';
-  final fallback = statusCode == 401 && errorCode == 'AUTH_INVALID_CREDENTIALS'
-      ? 'Backend rejected the Supabase bearer token.'
-      : 'Backend request failed.';
-  final message = _buildAuthDiagnosticMessage(
-    source: source,
-    requestUrl:
-        '${response.requestOptions.baseUrl}${response.requestOptions.path}',
-    requestMethod: response.requestOptions.method,
-    fallback: fallback,
-    requestPayloadShape: response.requestOptions.data?.toString() ?? 'n/a',
-    statusCode: statusCode,
-    responseHeaders: response.headers.map,
-    responseBody: response.data,
-    tokenDiagnostics: _tokenDiagnostics(
-      response.requestOptions.headers['Authorization']
-          ?.toString()
-          .replaceFirst(RegExp(r'^Bearer\s+'), ''),
-    ),
-    sessionDiagnostics: {
-      if (session != null) 'session_provider': session.provider,
-    },
-  );
   if (statusCode == 401) {
-    throw AuthSessionExpiredException(message);
+    throw const AuthSessionExpiredException(
+      'Your session expired. Please sign in again.',
+    );
   }
-  throw Exception(message);
+  if (errorCode == AppErrorCode.invalidDietaryPreference) {
+    throw const InvalidDietaryPreferenceException();
+  }
+  final mappedCode = switch (statusCode) {
+    422 => AppErrorCode.validationFailed,
+    final int value when value >= 500 => AppErrorCode.serverUnavailable,
+    _ => AppErrorCode.serverRejectedRequest,
+  };
+  final userMessage = switch (statusCode) {
+    422 => 'Some information was not accepted. Review it and try again.',
+    final int value when value >= 500 =>
+      'The service is temporarily unavailable. Please try again.',
+    _ => 'The request could not be completed. Please try again.',
+  };
+  throw appHttpError(
+    code: mappedCode,
+    userMessage: userMessage,
+    request: response.requestOptions,
+    statusCode: statusCode,
+    retryable: statusCode == null || statusCode >= 500,
+    correlationId: response.headers.value('x-correlation-id') ??
+        response.headers.value('x-request-id'),
+  );
+}
+
+AppError _malformedSearchResponse(String route) {
+  return AppError(
+    code: AppErrorCode.malformedResponse,
+    userMessage: 'Search returned an unreadable result. Please try again.',
+    diagnostics: AppErrorDiagnostics(
+      method: 'GET',
+      route: route,
+      retryable: true,
+    ),
+  );
+}
+
+AppError _mapFeatureSearchError(
+  Object error, {
+  required String route,
+}) {
+  if (error is TimeoutException) {
+    return AppError(
+      code: AppErrorCode.requestTimeout,
+      userMessage: 'Search took too long. Please try again.',
+      diagnostics: AppErrorDiagnostics(
+        method: 'GET',
+        route: route,
+        retryable: true,
+      ),
+    );
+  }
+  return mapAppError(
+    error,
+    fallbackMessage: 'Search is unavailable right now. Please try again.',
+    method: 'GET',
+    route: route,
+  );
+}
+
+bool _isOfflineSearchError(AppError error) {
+  return error.code == AppErrorCode.networkUnavailable ||
+      error.code == AppErrorCode.requestTimeout;
 }
 
 Map<String, dynamic> _asMap(dynamic value) {
@@ -3781,6 +4568,33 @@ Map<String, dynamic> _asMap(dynamic value) {
     );
   }
   return {};
+}
+
+String? _firstNonEmptyString(Iterable<Object?> values) {
+  for (final value in values) {
+    final text = value?.toString().trim() ?? '';
+    if (text.isNotEmpty) {
+      return text;
+    }
+  }
+  return null;
+}
+
+String _safeApiErrorMessage(
+  dynamic raw, {
+  required String fallback,
+}) {
+  final body = _asMap(raw);
+  final error = _asMap(body['error']);
+  final code = _firstNonEmptyString([error['code'], body['code']]);
+  return switch (code) {
+    'AUTH_USER_ALREADY_EXISTS' ||
+    'EMAIL_ALREADY_REGISTERED' =>
+      'An account already exists for this email. Try signing in.',
+    'INVALID_DIETARY_PREFERENCE' =>
+      'Choose one of the available dietary preferences.',
+    _ => fallback,
+  };
 }
 
 dynamic _unwrapData(dynamic raw) {
@@ -3810,139 +4624,12 @@ String? _programGenerationMessage(dynamic raw) {
   return message == null || message.isEmpty ? null : message;
 }
 
-String _extractErrorMessage(
-  dynamic body, {
-  int? statusCode,
-  String fallback = 'Authentication failed',
-}) {
-  if (_looksLikeHtmlError(body)) {
-    final text = body.toString();
-    if (text.contains('ERR_NGROK_3200') || text.contains('is offline')) {
-      return 'The ngrok backend endpoint is offline.';
-    }
-    return 'Backend returned an HTML error page instead of JSON.';
-  }
-  final map = _asMap(body);
-  final unwrapped = _asMap(_unwrapData(body));
-  final error = _asMap(map['error']);
-  final detail = map['detail'] ?? unwrapped['detail'];
-  final candidates = <String?>[
-    error['message']?.toString(),
-    error['detail']?.toString(),
-    map['message']?.toString(),
-    unwrapped['message']?.toString(),
-    map['error_description']?.toString(),
-    unwrapped['error_description']?.toString(),
-    detail is String ? detail : null,
-    _stringifyDetailList(detail),
-  ];
-
-  for (final candidate in candidates) {
-    final trimmed = candidate?.trim();
-    if (trimmed != null && trimmed.isNotEmpty) {
-      return trimmed;
-    }
-  }
-
-  if (statusCode == 401) {
-    return 'Invalid email or password.';
-  }
-  if (statusCode == 422) {
-    return 'Login request validation failed (422 Unprocessable Entity). The backend rejected the request body schema.';
-  }
-  return fallback;
-}
-
 bool _looksLikeHtmlError(dynamic body) {
   if (body is! String) {
     return false;
   }
   final trimmed = body.trimLeft().toLowerCase();
   return trimmed.startsWith('<!doctype html') || trimmed.startsWith('<html');
-}
-
-String _buildAuthDiagnosticMessage({
-  required String source,
-  required String requestUrl,
-  String requestMethod = 'POST',
-  required String fallback,
-  required String requestPayloadShape,
-  int? statusCode,
-  Map<String, List<String>>? responseHeaders,
-  dynamic responseBody,
-  Map<String, String> tokenDiagnostics = const {},
-  Map<String, String> sessionDiagnostics = const {},
-}) {
-  final ngrokCode = responseHeaders?['ngrok-error-code']?.first;
-  final extracted = _extractErrorMessage(
-    responseBody,
-    statusCode: statusCode,
-    fallback: fallback,
-  );
-  final snippet = _responseSnippet(responseBody);
-  final lines = <String>[
-    extracted,
-    'source: $source',
-    'request: $requestMethod $requestUrl',
-    'expected_payload: $requestPayloadShape',
-    if (statusCode != null) 'status: $statusCode',
-    if (ngrokCode != null && ngrokCode.isNotEmpty)
-      'ngrok_error_code: $ngrokCode',
-    ...sessionDiagnostics.entries
-        .map((entry) => '${entry.key}: ${entry.value}'),
-    ...tokenDiagnostics.entries.map((entry) => '${entry.key}: ${entry.value}'),
-  ];
-
-  if (ngrokCode == 'ERR_NGROK_3200' ||
-      responseBody.toString().contains('ERR_NGROK_3200')) {
-    lines.add(
-      'problem: The ngrok tunnel is offline, so Flutter cannot reach FastAPI.',
-    );
-    lines.add(
-      'fix: Restart the backend tunnel or replace FASTAPI_BASE_URL with the current live URL.',
-    );
-  } else if (statusCode == 401) {
-    lines.add(
-      'problem: FastAPI rejected the bearer token before payload validation. This is not a workout/template payload error.',
-    );
-    lines.add(
-      'fix: Check the backend detail above, confirm the live FastAPI process is running the patched auth_service.py, and verify the token issuer/email matches the backend user row.',
-    );
-    if (snippet != null) {
-      lines.add('response_snippet: $snippet');
-    }
-  } else if (snippet != null) {
-    lines.add('response_snippet: $snippet');
-  }
-
-  return lines.join('\n');
-}
-
-String? _stringifyDetailList(dynamic detail) {
-  if (detail is List) {
-    final parts = detail
-        .map((item) {
-          final entry = _asMap(item);
-          final loc = entry['loc'];
-          final msg = entry['msg']?.toString();
-          final type = entry['type']?.toString();
-          if (entry.isNotEmpty && msg != null) {
-            final locText = loc is List ? loc.join('.') : loc?.toString();
-            return [
-              if (locText != null && locText.isNotEmpty) 'loc=$locText',
-              'msg=$msg',
-              if (type != null && type.isNotEmpty) 'type=$type',
-            ].join(' ');
-          }
-          return item.toString();
-        })
-        .where((item) => item.trim().isNotEmpty)
-        .toList();
-    if (parts.isNotEmpty) {
-      return parts.join('\n');
-    }
-  }
-  return null;
 }
 
 Map<String, Object?> workoutTemplateRichPayload(
@@ -4095,11 +4782,19 @@ class ApiRequestDto {
   }
 }
 
-Map<String, Object?> profileBackendPayload(UserProfile profile) {
+Map<String, Object?> profileBackendPayload(
+  UserProfile profile, {
+  bool onboardingCompleted = false,
+}) {
   final enums = BackendProfileEnums.fromProfile(profile);
+  final dietaryPreference =
+      OnboardingDietaryPreference.fromWireValue(profile.dietaryPreference);
+  if (dietaryPreference == null) {
+    throw const InvalidDietaryPreferenceException();
+  }
   return ApiRequestDto(
     name: 'profile',
-    requiredFields: const ['username'],
+    requiredFields: const ['username', 'dietary_preference'],
     payload: {
       'username': profile.name,
       'age': profile.age,
@@ -4109,45 +4804,61 @@ Map<String, Object?> profileBackendPayload(UserProfile profile) {
       'fitness_goal': enums.fitnessGoal,
       'activity_level': enums.activityLevel,
       'experience_level': enums.experienceLevel,
-      'dietary_preference': profile.dietaryPreference,
+      'dietary_preference': dietaryPreference.wireValue,
       'available_time_min': profile.availableTimeMinutes,
       'equipment_access': enums.equipmentAccess,
       'coaching_preference': profile.coachingPreference,
       'goal_timeframe': profile.goalTimeframe,
       'prefers_voice_logging': profile.prefersVoiceLogging,
+      if (onboardingCompleted) 'onboarding_completed': true,
     },
   ).toJson();
 }
 
-String _profileGoalLabel(Object? raw) {
-  return switch (_normalizeWire(raw?.toString() ?? '')) {
-    'lose_fat' || 'lose_weight' => 'Lose fat',
-    'gain_muscle' || 'build_muscle' => 'Build muscle',
-    'athletic_performance' || 'get_stronger' => 'Get stronger',
-    'maintain' || 'stay_consistent' => 'Stay consistent',
-    'recomp' => 'Recomp',
-    _ => raw?.toString() ?? '',
-  };
+ProfileApiDto _decodeProfileResponse(Object? responseData) {
+  final envelope = ApiEnvelope.fromJson<ProfileApiDto>(
+    responseData,
+    (data, topLevelKeys) => ProfileApiDto.fromJson(
+      data,
+      topLevelKeys: topLevelKeys,
+    ),
+  );
+  if (!envelope.success) {
+    throw ProfileSchemaException(
+      stage: ProfileProcessingStage.envelopeExtraction,
+      sanitizedMessage: 'The profile response did not report success.',
+      exceptionType: 'ProfileContractViolation',
+      stackTrace: StackTrace.current,
+      topLevelKeys: envelope.topLevelKeys,
+    );
+  }
+  final profile = envelope.data;
+  if (profile == null) {
+    throw ProfileSchemaException(
+      stage: ProfileProcessingStage.envelopeExtraction,
+      sanitizedMessage: 'The profile response data field is null.',
+      exceptionType: 'Null',
+      stackTrace: StackTrace.current,
+      topLevelKeys: envelope.topLevelKeys,
+    );
+  }
+  return profile;
 }
 
-String _profileActivityLabel(Object? raw) {
-  return switch (_normalizeWire(raw?.toString() ?? '')) {
-    'sedentary' || 'mostly_sitting' => 'Mostly sitting',
-    'lightly_active' => 'Lightly active',
-    'moderately_active' || 'changes_a_lot' => 'Moderately active',
-    'very_active' => 'Very active',
-    _ => raw?.toString() ?? '',
-  };
-}
-
-String _profileEquipmentLabel(Object? raw) {
-  return switch (_normalizeWire(raw?.toString() ?? '')) {
-    'full_gym' || 'gym' => 'Gym workouts',
-    'home_gym' || 'home' => 'Home workouts',
-    'dumbbells_bench' || 'mixed' => 'A flexible mix',
-    'bodyweight_only' || 'bodyweight' => 'Bodyweight',
-    _ => raw?.toString() ?? '',
-  };
+void _logProfileDecodeFailure(ProfileSchemaException error) {
+  if (!kDebugMode) {
+    return;
+  }
+  debugPrint(
+    'Profile decode failed:\n'
+    'stage=${error.stage.name}\n'
+    'exceptionType=${error.exceptionType}\n'
+    'message=${error.sanitizedMessage}\n'
+    'topLevelKeys=${error.topLevelKeys}\n'
+    'dataKeys=${error.dataKeys}\n'
+    'fieldShapes=${error.fieldShapes}\n'
+    'stackTrace=${error.stackTrace}',
+  );
 }
 
 Map<String, dynamic> workoutLogDraftToJson(WorkoutLogDraft log) {
@@ -4160,6 +4871,53 @@ Map<String, dynamic> workoutLogDraftToJson(WorkoutLogDraft log) {
     'ended_at_label': log.endedAtLabel,
     'exercises': log.exercises.map(workoutExerciseDraftToJson).toList(),
   };
+}
+
+Map<String, dynamic> workoutLogOutboxPayload(WorkoutLogDraft log) {
+  return {
+    'workout_log_id': log.workoutLogId,
+    'template_id': log.templateId,
+    'name': log.name,
+    'notes': log.notes,
+    'started_at_label': log.startedAtLabel,
+    'ended_at_label': log.endedAtLabel,
+    'exercises': log.exercises.map((exercise) {
+      return {
+        'exercise_id': exercise.exerciseId,
+        'exercise_name': exercise.exerciseName,
+        'notes': exercise.notes,
+        'sets': exercise.sets.map(setDraftToJson).toList(),
+      };
+    }).toList(),
+  };
+}
+
+Map<String, dynamic> _workoutTemplateDraftToJson(
+  WorkoutTemplateDraft template,
+) {
+  return {
+    'template_id': template.templateId,
+    'name': template.name,
+    'description': template.description,
+    'duration_minutes': template.durationMinutes,
+    'goal': template.goal,
+    'exercises': template.exercises.map(workoutExerciseDraftToJson).toList(),
+  };
+}
+
+WorkoutTemplateDraft _workoutTemplateDraftFromJson(dynamic raw) {
+  final map = _asMap(raw);
+  final exercises = map['exercises'];
+  return WorkoutTemplateDraft(
+    templateId: _toNullableInt(map['template_id']),
+    name: map['name']?.toString() ?? '',
+    description: map['description']?.toString() ?? '',
+    durationMinutes: _toInt(map['duration_minutes'], 0),
+    goal: map['goal']?.toString() ?? '',
+    exercises: exercises is List
+        ? exercises.map(workoutExerciseDraftFromJson).toList(growable: false)
+        : const [],
+  );
 }
 
 WorkoutLogDraft workoutLogDraftFromJson(dynamic raw) {
@@ -4597,38 +5355,6 @@ double _roundNutrition(double value) {
   return double.parse(value.toStringAsFixed(2));
 }
 
-String _networkFallbackMessage(DioException error) {
-  switch (error.type) {
-    case DioExceptionType.connectionTimeout:
-    case DioExceptionType.sendTimeout:
-    case DioExceptionType.receiveTimeout:
-      return 'The server took too long to respond.';
-    case DioExceptionType.connectionError:
-      return 'Could not reach the backend. Check the API URL, tunnel, or server status.';
-    case DioExceptionType.badCertificate:
-      return 'The backend SSL certificate was rejected.';
-    case DioExceptionType.cancel:
-      return 'The login request was cancelled.';
-    case DioExceptionType.badResponse:
-    case DioExceptionType.unknown:
-      return 'Authentication failed.';
-  }
-}
-
-String? _responseSnippet(dynamic body) {
-  if (body == null) {
-    return null;
-  }
-  final asString = body.toString().replaceAll(RegExp(r'\s+'), ' ').trim();
-  if (asString.isEmpty) {
-    return null;
-  }
-  if (asString.length <= 220) {
-    return asString;
-  }
-  return '${asString.substring(0, 220)}...';
-}
-
 Map<String, dynamic> _decodeJwtPayload(String token) {
   try {
     final parts = token.split('.');
@@ -4641,6 +5367,15 @@ Map<String, dynamic> _decodeJwtPayload(String token) {
   } catch (_) {
     return {};
   }
+}
+
+bool _jwtIsExpired(String token) {
+  final exp = _toNullableInt(_decodeJwtPayload(token)['exp']);
+  if (exp == null) {
+    return true;
+  }
+  final nowSeconds = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+  return exp <= nowSeconds + 30;
 }
 
 UserLevel _parseUserLevel(String? raw) {
@@ -4740,21 +5475,6 @@ int _toNonNegativeInt(dynamic value, int fallback, {required int max}) {
   return parsed;
 }
 
-Map<String, dynamic> _pickMostRecentMap(List<dynamic> raw, String field) {
-  if (raw.isEmpty) {
-    return {};
-  }
-  final maps = raw.map(_asMap).toList();
-  maps.sort((a, b) {
-    final left = DateTime.tryParse(a[field]?.toString() ?? '') ??
-        DateTime.fromMillisecondsSinceEpoch(0);
-    final right = DateTime.tryParse(b[field]?.toString() ?? '') ??
-        DateTime.fromMillisecondsSinceEpoch(0);
-    return right.compareTo(left);
-  });
-  return maps.first;
-}
-
 WorkoutTemplateDraft _pickMostRecentTemplate(
   List<WorkoutTemplateDraft> templates,
 ) {
@@ -4793,25 +5513,6 @@ List<dynamic> _exercisesFromTemplateDays(dynamic raw) {
     }
   }
   return exercises;
-}
-
-WorkoutScheduleEntry _mapWorkoutScheduleEntry(dynamic raw) {
-  final map = _asMap(raw);
-  return WorkoutScheduleEntry.fromJson(map);
-}
-
-Map<String, Object?> _workoutSchedulePayload(
-  AuthSession session,
-  WorkoutScheduleEntry entry,
-) {
-  return {
-    'template_id': entry.templateId,
-    'user_id': session.userId,
-    'weekday': entry.weekday,
-    'time': entry.timeLabel,
-    'repeat_weekly': entry.repeatWeekly,
-    'active': entry.active,
-  };
 }
 
 WorkoutLogDraft _mapWorkoutLog(dynamic raw) {
@@ -5044,58 +5745,11 @@ String _normalizeExerciseName(String value) {
       .replaceAll(RegExp(r'\s+'), ' ');
 }
 
-Future<String?> _resolveFoodId(Dio dio, FoodLogDraft log) async {
-  if (log.foodId != null && log.foodId!.isNotEmpty) {
-    return log.foodId;
-  }
-  final name = log.foodName.trim();
-  if (name.length < 2) {
-    return null;
-  }
-  try {
-    final response = await dio.get<dynamic>(
-      '/food/search',
-      queryParameters: {'q': name},
-    ).timeout(const Duration(seconds: 5));
-    if (response.statusCode == null || response.statusCode! >= 400) {
-      return null;
-    }
-    final data = _unwrapData(response.data);
-    if (data is! List) {
-      return null;
-    }
-    for (final item in data) {
-      final map = _asMap(item);
-      final foodId = map['food_id']?.toString();
-      final foodName = map['name']?.toString() ?? '';
-      if (foodId != null &&
-          foodId.isNotEmpty &&
-          foodName.toLowerCase() == name.toLowerCase()) {
-        return foodId;
-      }
-    }
-    return null;
-  } catch (_) {
-    return null;
-  }
-}
-
 String _todayIso() => _formatDate(DateTime.now());
 
 String _formatDate(DateTime date) {
   return '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
 }
-
-bool _sameDay(DateTime? left, DateTime? right) {
-  if (left == null || right == null) {
-    return false;
-  }
-  return left.year == right.year &&
-      left.month == right.month &&
-      left.day == right.day;
-}
-
-bool _sameNumber(double left, double right) => (left - right).abs() < 0.001;
 
 int? _toNullableInt(dynamic value) {
   if (value == null) {

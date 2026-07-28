@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../core/errors/app_error.dart';
 import '../../../core/navigation/app_state.dart';
 import '../../../core/theme/jim_tokens.dart';
 import '../../../shared/components/backend_state_view.dart';
@@ -12,6 +13,7 @@ import '../../../shared/components/jim_page_scaffold.dart';
 import '../../../shared/components/jim_surface.dart';
 import '../../../shared/components/metric_tile.dart';
 import '../../../shared/models/app_models.dart';
+import '../../../shared/models/onboarding_models.dart';
 import '../../onboarding/application/onboarding_controller.dart';
 import '../../onboarding/presentation/onboarding_page.dart';
 
@@ -76,12 +78,9 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
     'Changes a lot',
   ];
 
-  static const _dietaryOptions = <String>[
-    'Keep it simple',
-    'Prioritize protein',
-    'Balanced meals',
-    'Not now',
-  ];
+  static final _dietaryOptions = OnboardingDietaryPreference.values
+      .map((preference) => preference.label)
+      .toList(growable: false);
 
   static const _trainingOptions = <String>[
     'Gym workouts',
@@ -126,14 +125,16 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
     _ageController.text = _positiveIntText(profile.age);
     _heightController.text = _positiveDoubleText(profile.heightCm);
     _weightController.text = _positiveDoubleText(profile.weightKg);
-    _goalController.text = profile.goal;
+    _goalController.text = profile.goal ?? '';
     _availableTimeController.text =
         _positiveIntText(profile.availableTimeMinutes);
-    _experienceLevel = profile.userLevel;
+    _experienceLevel = profile.userLevel ?? UserLevel.beginner;
     _sex = _optionOrDefault(profile.sex, _sexOptions);
     _activityLevel = _optionOrDefault(profile.activityLevel, _activityOptions);
-    _dietaryPreference =
-        _optionOrDefault(profile.dietaryPreference, _dietaryOptions);
+    _dietaryPreference = OnboardingDietaryPreference.fromWireValue(
+          profile.dietaryPreference,
+        )?.label ??
+        _dietaryOptions.first;
     _trainingPreference =
         _optionOrDefault(profile.trainingPreference, _trainingOptions);
   }
@@ -158,73 +159,87 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
       scrollKey: const ValueKey('profile-scroll-view'),
       children: [
         JimSurface(
-          child: Row(
-            children: [
-              JimCompanionAvatar(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final avatar = JimCompanionAvatar(
                 stage: draft.consistency.companionStage,
                 size: 88,
-              ),
-              const SizedBox(width: JimSpacing.md),
-              Expanded(
-                child: Column(
+              );
+              final details = Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(currentName, style: theme.textTheme.headlineSmall),
+                  const SizedBox(height: JimSpacing.xxs),
+                  Text(
+                    '${_levelLabel(_experienceLevel)} · $currentGoal',
+                    style: theme.textTheme.bodyLarge?.copyWith(
+                      color: JimColors.inkSoft,
+                    ),
+                  ),
+                  const SizedBox(height: JimSpacing.xxs),
+                  Text(
+                    '${_display(_activityLevel)} · ${_display(_trainingPreference)}',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: JimColors.inkMuted,
+                    ),
+                  ),
+                  if (kDebugMode) ...[
+                    const SizedBox(height: JimSpacing.sm),
+                    Wrap(
+                      spacing: JimSpacing.xs,
+                      runSpacing: JimSpacing.xs,
+                      children: [
+                        FilledButton.icon(
+                          key: const ValueKey('preview-onboarding-button'),
+                          onPressed: () {
+                            Navigator.of(context).pushNamed(
+                              OnboardingPreviewPage.routeName,
+                            );
+                          },
+                          icon: const Icon(
+                            Icons.play_circle_outline_rounded,
+                            size: 18,
+                          ),
+                          label: const Text('Preview Onboarding'),
+                        ),
+                        OutlinedButton.icon(
+                          key: const ValueKey(
+                            'restart-onboarding-dev-button',
+                          ),
+                          onPressed: () async {
+                            await ref
+                                .read(onboardingControllerProvider.notifier)
+                                .reset();
+                            ref
+                                .read(forceShowOnboardingProvider.notifier)
+                                .state = true;
+                          },
+                          icon: const Icon(Icons.replay_rounded, size: 18),
+                          label: const Text('Restart Onboarding (Dev)'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+              );
+              if (constraints.maxWidth < 300) {
+                return Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(currentName, style: theme.textTheme.headlineSmall),
-                    const SizedBox(height: JimSpacing.xxs),
-                    Text(
-                      '${_levelLabel(_experienceLevel)} · $currentGoal',
-                      style: theme.textTheme.bodyLarge?.copyWith(
-                        color: JimColors.inkSoft,
-                      ),
-                    ),
-                    const SizedBox(height: JimSpacing.xxs),
-                    Text(
-                      '${_display(_activityLevel)} · ${_display(_trainingPreference)}',
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: JimColors.inkMuted,
-                      ),
-                    ),
-                    if (kDebugMode) ...[
-                      const SizedBox(height: JimSpacing.sm),
-                      Wrap(
-                        spacing: JimSpacing.xs,
-                        runSpacing: JimSpacing.xs,
-                        children: [
-                          FilledButton.icon(
-                            key: const ValueKey('preview-onboarding-button'),
-                            onPressed: () {
-                              Navigator.of(context).pushNamed(
-                                OnboardingPreviewPage.routeName,
-                              );
-                            },
-                            icon: const Icon(
-                              Icons.play_circle_outline_rounded,
-                              size: 18,
-                            ),
-                            label: const Text('Preview Onboarding'),
-                          ),
-                          OutlinedButton.icon(
-                            key: const ValueKey(
-                              'restart-onboarding-dev-button',
-                            ),
-                            onPressed: () async {
-                              await ref
-                                  .read(onboardingControllerProvider.notifier)
-                                  .reset();
-                              ref
-                                  .read(forceShowOnboardingProvider.notifier)
-                                  .state = true;
-                            },
-                            icon: const Icon(Icons.replay_rounded, size: 18),
-                            label: const Text('Restart Onboarding (Dev)'),
-                          ),
-                        ],
-                      ),
-                    ],
+                    avatar,
+                    const SizedBox(height: JimSpacing.md),
+                    details,
                   ],
-                ),
-              ),
-            ],
+                );
+              }
+              return Row(
+                children: [
+                  avatar,
+                  const SizedBox(width: JimSpacing.md),
+                  Expanded(child: details),
+                ],
+              );
+            },
           ),
         ),
         const SizedBox(height: JimSpacing.md),
@@ -294,6 +309,7 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
                 const SizedBox(height: JimSpacing.sm),
                 DropdownButtonFormField<UserLevel>(
                   initialValue: _experienceLevel,
+                  isExpanded: true,
                   items: UserLevel.values
                       .map(
                         (level) => DropdownMenuItem(
@@ -445,7 +461,10 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
         heightCm: double.parse(_heightController.text.trim()),
         weightKg: double.parse(_weightController.text.trim()),
         activityLevel: _activityLevel,
-        dietaryPreference: _dietaryPreference,
+        dietaryPreference:
+            OnboardingDietaryPreference.fromLabel(_dietaryPreference)
+                    ?.wireValue ??
+                '',
         availableTimeMinutes: int.parse(_availableTimeController.text.trim()),
         trainingPreference: _trainingPreference,
       );
@@ -467,7 +486,7 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
         return;
       }
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
+        SnackBar(
           content: Text(
             'Could not save profile. Your latest edits are still here.',
           ),
@@ -528,13 +547,21 @@ class _ProfileContentState extends ConsumerState<_ProfileContent> {
     setState(() => _isDeletingAccount = true);
     try {
       await ref.read(appDraftProvider.notifier).deleteAccount();
-    } catch (_) {
+    } catch (error) {
       if (!mounted) {
         return;
       }
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Unable to delete your account. Please try again.'),
+        SnackBar(
+          content: Text(
+            presentAppError(
+              error,
+              fallbackMessage:
+                  'Unable to delete your account. Please try again.',
+              method: 'DELETE',
+              route: '/account',
+            ),
+          ),
         ),
       );
     } finally {
@@ -661,7 +688,12 @@ class _DeleteAccountButton extends StatelessWidget {
             else
               const Icon(Icons.delete_forever_rounded, size: 18),
             const SizedBox(width: 10),
-            Text(isLoading ? 'Deleting...' : 'Delete Account'),
+            Flexible(
+              child: Text(
+                isLoading ? 'Deleting...' : 'Delete Account',
+                textAlign: TextAlign.center,
+              ),
+            ),
           ],
         ),
       ),
@@ -745,43 +777,62 @@ class _TargetSummary extends StatelessWidget {
                 ),
           ),
           const SizedBox(height: JimSpacing.md),
-          GridView(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 2,
-              crossAxisSpacing: JimSpacing.sm,
-              mainAxisSpacing: JimSpacing.sm,
-              childAspectRatio: 1.55,
-            ),
-            children: [
-              JimMetricCard(
-                label: 'Calorie target',
-                value: hasTargets
-                    ? '${metrics.targetCalories.round()} kcal'
-                    : 'Not set',
-                icon: Icons.local_fire_department_rounded,
-              ),
-              JimMetricCard(
-                label: 'Protein target',
-                value: hasTargets ? '${metrics.proteinG.round()} g' : 'Not set',
-                icon: Icons.egg_alt_outlined,
-              ),
-              JimMetricCard(
-                label: 'Hydration target',
-                value: hasTargets
-                    ? '${metrics.hydrationL.toStringAsFixed(1)} L'
-                    : 'Not set',
-                icon: Icons.water_drop_outlined,
-              ),
-              JimMetricCard(
-                label: 'TDEE',
-                value: metrics.tdee > 0
-                    ? '${metrics.tdee.round()} kcal'
-                    : 'Not set',
-                icon: Icons.speed_rounded,
-              ),
-            ],
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final cards = <Widget>[
+                JimMetricCard(
+                  label: 'Calorie target',
+                  value: hasTargets
+                      ? '${metrics.targetCalories.round()} kcal'
+                      : 'Not set',
+                  icon: Icons.local_fire_department_rounded,
+                ),
+                JimMetricCard(
+                  label: 'Protein target',
+                  value:
+                      hasTargets ? '${metrics.proteinG.round()} g' : 'Not set',
+                  icon: Icons.egg_alt_outlined,
+                ),
+                JimMetricCard(
+                  label: 'Hydration target',
+                  value: hasTargets
+                      ? '${metrics.hydrationL.toStringAsFixed(1)} L'
+                      : 'Not set',
+                  icon: Icons.water_drop_outlined,
+                ),
+                JimMetricCard(
+                  label: 'TDEE',
+                  value: metrics.tdee > 0
+                      ? '${metrics.tdee.round()} kcal'
+                      : 'Not set',
+                  icon: Icons.speed_rounded,
+                ),
+              ];
+              final useSingleColumn = constraints.maxWidth < 320 ||
+                  MediaQuery.textScalerOf(context).scale(1) >= 1.3;
+              if (useSingleColumn) {
+                return Column(
+                  children: [
+                    for (var index = 0; index < cards.length; index++) ...[
+                      cards[index],
+                      if (index != cards.length - 1)
+                        const SizedBox(height: JimSpacing.sm),
+                    ],
+                  ],
+                );
+              }
+              return GridView(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: 2,
+                  crossAxisSpacing: JimSpacing.sm,
+                  mainAxisSpacing: JimSpacing.sm,
+                  mainAxisExtent: 140,
+                ),
+                children: cards,
+              );
+            },
           ),
           if (metrics.cutIntensity.isNotEmpty) ...[
             const SizedBox(height: JimSpacing.sm),
@@ -821,6 +872,7 @@ class _OptionField extends StatelessWidget {
         : options;
     return DropdownButtonFormField<String>(
       initialValue: value,
+      isExpanded: true,
       items: dropdownOptions
           .map(
             (option) => DropdownMenuItem(
@@ -904,7 +956,6 @@ class _DevOnboardingControls extends ConsumerWidget {
               key: const ValueKey('reset-onboarding-flag-dev-button'),
               onPressed: () async {
                 await ref.read(onboardingControllerProvider.notifier).reset();
-                ref.read(hasCompletedOnboardingProvider.notifier).state = false;
                 ref.read(forceShowOnboardingProvider.notifier).state = true;
               },
               icon: const Icon(Icons.flag_outlined),
@@ -917,10 +968,11 @@ class _DevOnboardingControls extends ConsumerWidget {
   }
 }
 
-String _positiveIntText(int value) => value > 0 ? value.toString() : '';
+String _positiveIntText(int? value) =>
+    value != null && value > 0 ? value.toString() : '';
 
-String _positiveDoubleText(double value) {
-  if (value <= 0) {
+String _positiveDoubleText(double? value) {
+  if (value == null || value <= 0) {
     return '';
   }
   return value == value.roundToDouble()
@@ -928,8 +980,8 @@ String _positiveDoubleText(double value) {
       : value.toStringAsFixed(1);
 }
 
-String _optionOrDefault(String value, List<String> options) {
-  final trimmed = value.trim();
+String _optionOrDefault(String? value, List<String> options) {
+  final trimmed = value?.trim() ?? '';
   if (trimmed.isEmpty) {
     return options.first;
   }

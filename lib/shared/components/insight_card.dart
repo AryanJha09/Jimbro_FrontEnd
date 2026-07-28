@@ -30,20 +30,22 @@ class InsightCard extends StatelessWidget {
         children: [
           Row(
             children: [
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 6,
-                ),
-                decoration: BoxDecoration(
-                  color: accent.withValues(alpha: .12),
-                  borderRadius: BorderRadius.circular(JimRadius.pill),
-                ),
-                child: Text(
-                  insight.isMythBust ? 'MYTH / REALITY' : 'ATLAS NOTE',
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: accent,
-                    letterSpacing: 1.1,
+              Flexible(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: accent.withValues(alpha: .12),
+                    borderRadius: BorderRadius.circular(JimRadius.pill),
+                  ),
+                  child: Text(
+                    insight.isMythBust ? 'MYTH / REALITY' : 'ATLAS NOTE',
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: accent,
+                      letterSpacing: 1.1,
+                    ),
                   ),
                 ),
               ),

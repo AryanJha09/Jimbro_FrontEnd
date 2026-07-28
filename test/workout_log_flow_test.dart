@@ -3,16 +3,32 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:jimbro/core/errors/app_error.dart';
 import 'package:jimbro/core/navigation/app_state.dart';
 import 'package:jimbro/core/notifications/workout_notification_service.dart';
 import 'package:jimbro/core/repositories/app_repositories.dart';
+import 'package:jimbro/features/workouts/application/active_workout_controller.dart';
 import 'package:jimbro/shared/models/app_models.dart';
+
+const _searchSession = AuthSession(
+  userId: 'search-user',
+  displayName: 'Search User',
+  email: 'search@example.com',
+  accessToken: 'search-token',
+  provider: 'test',
+);
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   SharedPreferences.setMockInitialValues({});
+  FlutterSecureStorage.setMockInitialValues({});
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+    FlutterSecureStorage.setMockInitialValues({});
+  });
 
   test('workout log preserves full name notes exercises and sets', () async {
     final workoutRepository = _CapturingWorkoutRepository();
@@ -92,7 +108,7 @@ void main() {
     )..httpClientAdapter = adapter;
     final repository = FastApiWorkoutRepository(dio);
 
-    await repository.saveWorkoutLog(
+    final result = await repository.saveWorkoutLog(
       _ReadyAuthRepository._session,
       const WorkoutLogDraft(
         templateId: 20,
@@ -127,6 +143,9 @@ void main() {
     expect(payload['template_id'], 20);
     expect(payload['notes'], 'Moved well. Add 2.5 kg next time.');
     expect(payload, contains('exercises'));
+    expect(result.syncStatus, WorkoutSyncStatus.synced);
+    expect(result.serverLogId, 10);
+    expect(result.authoritativeWorkout?.workoutLogId, 10);
     expect(payload, isNot(contains('workout_exercises')));
     expect(payload, isNot(contains('started_at')));
     expect(payload, isNot(contains('duration_minutes')));
@@ -281,6 +300,134 @@ void main() {
     expect(adapter.queryParameters.single['q'], 'bench');
   });
 
+  test(
+      'exercise search trims, normalizes, authenticates and preserves partials',
+      () async {
+    final adapter = _ExerciseSearchDioAdapter();
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiWorkoutRepository(dio);
+
+    expect(await repository.searchExercises('   ', _searchSession), isEmpty);
+    await repository.searchExercises(' BÉNCH & press ', _searchSession);
+
+    expect(adapter.queryParameters.single, {'q': 'bénch & press'});
+    expect(adapter.headers.single['Authorization'], 'Bearer search-token');
+  });
+
+  test('exercise search distinguishes empty, malformed and HTTP failures',
+      () async {
+    final adapter = _ExerciseSearchDioAdapter()..empty = true;
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiWorkoutRepository(
+      dio,
+      searchCacheTtl: Duration.zero,
+    );
+
+    expect(await repository.searchExercises('none', _searchSession), isEmpty);
+    adapter
+      ..empty = false
+      ..malformed = true;
+    await expectLater(
+      repository.searchExercises('bad', _searchSession),
+      throwsA(isA<AppError>().having(
+        (error) => error.code,
+        'code',
+        AppErrorCode.malformedResponse,
+      )),
+    );
+
+    adapter
+      ..malformed = false
+      ..statusCode = 401;
+    await expectLater(
+      repository.searchExercises('private', _searchSession),
+      throwsA(isA<AppError>().having(
+        (error) => error.code,
+        'code',
+        AppErrorCode.sessionExpired,
+      )),
+    );
+    adapter.statusCode = 422;
+    await expectLater(
+      repository.searchExercises('invalid', _searchSession),
+      throwsA(isA<AppError>().having(
+        (error) => error.code,
+        'code',
+        AppErrorCode.validationFailed,
+      )),
+    );
+    adapter.statusCode = 500;
+    await expectLater(
+      repository.searchExercises('server', _searchSession),
+      throwsA(isA<AppError>().having(
+        (error) => error.code,
+        'code',
+        AppErrorCode.serverUnavailable,
+      )),
+    );
+  });
+
+  test('exercise search exposes cached offline results and timeout', () async {
+    final adapter = _ExerciseSearchDioAdapter();
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiWorkoutRepository(
+      dio,
+      searchCacheTtl: Duration.zero,
+    );
+
+    await repository.searchExercises('bench', _searchSession);
+    adapter.offline = true;
+    await expectLater(
+      repository.searchExercises('bench', _searchSession),
+      throwsA(
+        isA<CachedSearchResultsException<ExerciseSuggestion>>().having(
+          (error) => error.results.single.name,
+          'cached result',
+          'Bench Press',
+        ),
+      ),
+    );
+
+    adapter
+      ..offline = false
+      ..timeout = true;
+    await expectLater(
+      repository.searchExercises('timeout', _searchSession),
+      throwsA(isA<AppError>().having(
+        (error) => error.code,
+        'code',
+        AppErrorCode.requestTimeout,
+      )),
+    );
+  });
+
+  test('search request generations ignore stale and cleared responses', () {
+    final gate = SearchRequestGate();
+    final older = gate.begin('bench');
+    final newer = gate.begin('squat');
+
+    expect(gate.isCurrent(older, 'bench'), isFalse);
+    expect(gate.isCurrent(newer, 'squat'), isTrue);
+
+    gate.clear();
+    expect(gate.isCurrent(newer, 'squat'), isFalse);
+  });
+
   test('workout log mapper rejects exercises without nested sets', () {
     expect(
       () => workoutLogRichPayload(
@@ -331,43 +478,41 @@ void main() {
     )..httpClientAdapter = adapter;
     final repository = FastApiWorkoutRepository(dio);
 
-    await expectLater(
-      repository.saveWorkoutLog(
-        _ReadyAuthRepository._session,
-        const WorkoutLogDraft(
-          name: 'Push',
-          notes: '',
-          startedAtLabel: '2026-06-06T10:00:00.000',
-          endedAtLabel: '2026-06-06T10:42:00.000',
-          exercises: [
-            WorkoutExerciseDraft(
-              exerciseId: 111,
-              exerciseName: 'Bench Press (Barbell)',
-              notes: '',
-              targetSets: 1,
-              targetReps: 8,
-              sets: [
-                SetDraft(
-                  setNumber: 1,
-                  weightKg: 60,
-                  reps: 8,
-                  isWarmup: false,
-                  isCompleted: true,
-                  rpe: 7,
-                ),
-              ],
-            ),
-          ],
-        ),
+    final rejected = await repository.saveWorkoutLog(
+      _ReadyAuthRepository._session,
+      const WorkoutLogDraft(
+        name: 'Push',
+        notes: '',
+        startedAtLabel: '2026-06-06T10:00:00.000',
+        endedAtLabel: '2026-06-06T10:42:00.000',
+        exercises: [
+          WorkoutExerciseDraft(
+            exerciseId: 111,
+            exerciseName: 'Bench Press (Barbell)',
+            notes: '',
+            targetSets: 1,
+            targetReps: 8,
+            sets: [
+              SetDraft(
+                setNumber: 1,
+                weightKg: 60,
+                reps: 8,
+                isWarmup: false,
+                isCompleted: true,
+                rpe: 7,
+              ),
+            ],
+          ),
+        ],
       ),
-      throwsA(isA<Exception>()),
     );
 
+    expect(rejected.syncStatus, WorkoutSyncStatus.needsReview);
     expect(adapter.workoutLogPayloads, hasLength(1));
     expect(adapter.workoutLogPayloads.single, contains('exercises'));
   });
 
-  test('workout log repository surfaces FastAPI 422 validation detail',
+  test('workout log repository redacts FastAPI 422 validation detail',
       () async {
     final adapter = _CapturingDioAdapter()
       ..validationError = {
@@ -387,50 +532,35 @@ void main() {
     )..httpClientAdapter = adapter;
     final repository = FastApiWorkoutRepository(dio);
 
-    expect(
-      () => repository.saveWorkoutLog(
-        _ReadyAuthRepository._session,
-        const WorkoutLogDraft(
-          name: 'Push',
-          notes: '',
-          startedAtLabel: '',
-          exercises: [
-            WorkoutExerciseDraft(
-              exerciseId: 111,
-              exerciseName: 'Bench Press (Barbell)',
-              notes: '',
-              targetSets: 1,
-              targetReps: 8,
-              sets: [
-                SetDraft(
-                  setNumber: 1,
-                  weightKg: 60,
-                  reps: 8,
-                  isWarmup: false,
-                  isCompleted: false,
-                  rpe: 7,
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-      throwsA(
-        isA<Exception>()
-            .having(
-              (error) => error.toString(),
-              'message',
-              contains(
-                'loc=body.exercises msg=Field required type=missing',
+    final rejected = await repository.saveWorkoutLog(
+      _ReadyAuthRepository._session,
+      const WorkoutLogDraft(
+        name: 'Push',
+        notes: '',
+        startedAtLabel: '',
+        exercises: [
+          WorkoutExerciseDraft(
+            exerciseId: 111,
+            exerciseName: 'Bench Press (Barbell)',
+            notes: '',
+            targetSets: 1,
+            targetReps: 8,
+            sets: [
+              SetDraft(
+                setNumber: 1,
+                weightKg: 60,
+                reps: 8,
+                isWarmup: false,
+                isCompleted: false,
+                rpe: 7,
               ),
-            )
-            .having(
-              (error) => error.toString(),
-              'payload',
-              contains('exercises'),
-            ),
+            ],
+          ),
+        ],
       ),
     );
+    expect(rejected.syncStatus, WorkoutSyncStatus.needsReview);
+    expect(rejected.errorCode, AppErrorCode.validationFailed);
   });
 
   test('template created saved visible opened and starts workout', () async {
@@ -680,7 +810,8 @@ void main() {
     expect(current.workoutLog.startedAtLabel, isNotEmpty);
   });
 
-  test('schedule 404 marks backend unsupported and saves locally', () async {
+  test('schedule is device-local and never probes unsupported endpoints',
+      () async {
     SharedPreferences.setMockInitialValues({});
     final adapter = _ScheduleUnsupportedDioAdapter();
     final dio = Dio(
@@ -706,10 +837,37 @@ void main() {
     );
     final loaded = await repository.loadSchedule(_ReadyAuthRepository._session);
 
-    expect(adapter.scheduleCalls, 1);
+    expect(adapter.scheduleCalls, 0);
     expect(second.scheduleId, startsWith('local-'));
     expect(loaded, hasLength(1));
     expect(loaded.single.timeLabel, '08:00');
+  });
+
+  test('device-local schedule survives restart and isolates users', () async {
+    SharedPreferences.setMockInitialValues({});
+    const store = LocalWorkoutScheduleStore();
+    await store.save(
+      _ReadyAuthRepository._session,
+      const WorkoutScheduleEntry(
+        templateId: 7,
+        templateName: 'Monday Push',
+        weekday: DateTime.monday,
+        timeLabel: '07:30',
+      ),
+    );
+    const otherUser = AuthSession(
+      userId: 'other-user',
+      displayName: 'Other User',
+      email: 'other@example.test',
+      accessToken: 'other-token',
+      provider: 'test',
+    );
+
+    expect(
+        await const LocalWorkoutScheduleStore()
+            .load(_ReadyAuthRepository._session),
+        hasLength(1));
+    expect(await const LocalWorkoutScheduleStore().load(otherUser), isEmpty);
   });
 
   test('workout log queues on connection error and flushes later', () async {
@@ -753,13 +911,26 @@ void main() {
       ),
     );
 
-    expect(local.name, 'Offline Push');
-    expect(await outbox.load(_ReadyAuthRepository._session), hasLength(1));
+    expect(local.syncStatus, WorkoutSyncStatus.pendingSync);
+    expect(local.authoritativeWorkout?.name, 'Offline Push');
+    final queued = await outbox.load(_ReadyAuthRepository._session);
+    expect(queued, hasLength(1));
+    final restored = await repository
+        .loadPendingWorkoutMutation(_ReadyAuthRepository._session);
+    expect(restored?.syncStatus, WorkoutSyncStatus.pendingSync);
+    expect(restored?.mutationId, queued.single.localId);
+    expect(restored?.authoritativeWorkout?.name, 'Offline Push');
 
     adapter.offline = false;
     await repository.flushPending(_ReadyAuthRepository._session);
 
     expect(adapter.workoutLogPayloads, isNotEmpty);
+    expect(
+      adapter.workoutLogPayloads
+          .map((payload) => payload['client_mutation_id'])
+          .toSet(),
+      {queued.single.localId},
+    );
     expect(await outbox.load(_ReadyAuthRepository._session), isEmpty);
   });
 
@@ -888,7 +1059,367 @@ void main() {
     expect(adapter.templatePayloads, hasLength(1));
     expect(adapter.templatePayloads.single, contains('exercises'));
     expect(adapter.templatePayloads.single, isNot(contains('days')));
+    expect(adapter.templateIdempotencyKeys.single, startsWith('template-'));
   });
+
+  test('template create rejects a success body without a stable id', () async {
+    final adapter = _CapturingDioAdapter()..omitTemplateId = true;
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiWorkoutRepository(dio);
+
+    await expectLater(
+      repository.saveTemplate(
+        _ReadyAuthRepository._session,
+        const WorkoutTemplateDraft(
+          name: 'Unconfirmed draft',
+          description: '',
+          durationMinutes: 0,
+          goal: '',
+          exercises: [
+            WorkoutExerciseDraft(
+              exerciseId: 111,
+              exerciseName: 'Bench Press',
+              notes: '',
+              targetSets: 3,
+              targetReps: 8,
+              sets: [],
+            ),
+          ],
+        ),
+      ),
+      throwsA(
+        isA<AppError>().having(
+          (error) => error.code,
+          'code',
+          AppErrorCode.malformedResponse,
+        ),
+      ),
+    );
+  });
+
+  test('authoritative empty template list clears the previous cache', () async {
+    final adapter = _CapturingDioAdapter()
+      ..templateList = [
+        {
+          'template_id': 20,
+          'name': 'Cached template',
+          'description': '',
+          'exercises': <Object>[],
+        },
+      ];
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiWorkoutRepository(dio);
+
+    expect(await repository.loadTemplates(_ReadyAuthRepository._session),
+        hasLength(1));
+    adapter.templateList = [];
+
+    expect(
+        await repository.loadTemplates(_ReadyAuthRepository._session), isEmpty);
+    expect(repository.templatesAreStale, isFalse);
+  });
+
+  test('dirty template checkpoint survives a store restart', () async {
+    SharedPreferences.setMockInitialValues({});
+    const store = WorkoutTemplateDraftStore();
+    const draft = WorkoutTemplateDraft(
+      name: 'Recovered draft',
+      description: 'Still editing',
+      durationMinutes: 45,
+      goal: 'Strength',
+      exercises: [],
+    );
+
+    await store.write(_ReadyAuthRepository._session, draft);
+    final recovered = await const WorkoutTemplateDraftStore()
+        .load(_ReadyAuthRepository._session);
+
+    expect(recovered?.name, 'Recovered draft');
+    expect(recovered?.description, 'Still editing');
+  });
+
+  test('active session is unique, isolated from template, and restarts',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final container = _activeTestContainer(MockWorkoutRepository());
+    await container.read(appDraftProvider.future);
+    await container.read(activeWorkoutProvider.future);
+    final controller = container.read(activeWorkoutProvider.notifier);
+
+    const template = WorkoutTemplateDraft(
+      templateId: 42,
+      name: 'Durable Push',
+      description: '',
+      durationMinutes: 0,
+      goal: '',
+      exercises: [
+        WorkoutExerciseDraft(
+          exerciseId: 111,
+          exerciseName: 'Bench Press',
+          notes: '',
+          targetSets: 1,
+          targetReps: 8,
+          sets: [
+            SetDraft(
+              setNumber: 1,
+              weightKg: 60,
+              reps: 8,
+              isWarmup: false,
+              isCompleted: false,
+              rpe: 7,
+            ),
+          ],
+        ),
+      ],
+    );
+
+    final first = await controller.startOrResume(template);
+    final repeated = await controller.startOrResume(template);
+    expect(repeated.sessionId, first.sessionId);
+
+    controller.updateSet(
+      0,
+      0,
+      first.exercises.single.sets.single.copyWith(
+        reps: 10,
+        weightKg: 65,
+      ),
+    );
+    for (var index = 0; index < 8; index++) {
+      controller.updateNotes('rapid edit $index');
+    }
+    await Future.wait([controller.checkpointNow(), controller.checkpointNow()]);
+
+    final checkpoint = await const ActiveWorkoutCheckpointStore()
+        .load(_ReadyAuthRepository._session);
+    expect(checkpoint.session?.notes, 'rapid edit 7');
+    expect(checkpoint.session?.exercises.single.sets.single.reps, 10);
+    expect(
+        checkpoint.session?.localStatus, ActiveWorkoutLocalStatus.checkpointed);
+    expect(template.exercises.single.sets.single.reps, 8);
+    expect(template.exercises.single.sets.single.weightKg, 60);
+
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    controller.setRestDeadline(deadline);
+    expect(controller.restRemaining(DateTime.now()).inSeconds,
+        inInclusiveRange(28, 30));
+    await controller.checkpointNow();
+    container.dispose();
+
+    final restoredContainer = _activeTestContainer(MockWorkoutRepository());
+    addTearDown(restoredContainer.dispose);
+    await restoredContainer.read(appDraftProvider.future);
+    final restored = await restoredContainer.read(activeWorkoutProvider.future);
+    expect(restored.session?.sessionId, first.sessionId);
+    expect(restored.session?.notes, 'rapid edit 7');
+    expect(restored.session?.restDeadline, deadline);
+  });
+
+  test('finish is exactly once and creates read-only completed history',
+      () async {
+    final repository = _CountingCompletionRepository();
+    final container = _activeTestContainer(repository);
+    addTearDown(container.dispose);
+    await container.read(appDraftProvider.future);
+    await container.read(activeWorkoutProvider.future);
+    final controller = container.read(activeWorkoutProvider.notifier);
+    final active = await controller.startOrResume(
+      const WorkoutTemplateDraft(
+        templateId: 7,
+        name: 'Finish Once',
+        description: '',
+        durationMinutes: 0,
+        goal: '',
+        exercises: [],
+      ),
+    );
+
+    final results =
+        await Future.wait([controller.finish(), controller.finish()]);
+    expect(repository.finishCount, 1);
+    expect(results.whereType<WorkoutMutationResult>(), hasLength(2));
+    expect(container.read(activeWorkoutProvider).value?.session, isNull);
+    final completed = container.read(appDraftProvider).value!.workoutLog;
+    expect(completed.workoutLogId, 1);
+    expect(completed.endedAtLabel, isNotEmpty);
+    expect(completed.isInProgress, isFalse);
+    expect(repository.lastMutationId, active.sessionId);
+  });
+
+  test('network-pending finish remains durable until explicit discard',
+      () async {
+    final container = _activeTestContainer(_PendingCompletionRepository());
+    addTearDown(container.dispose);
+    await container.read(appDraftProvider.future);
+    await container.read(activeWorkoutProvider.future);
+    final controller = container.read(activeWorkoutProvider.notifier);
+    await controller.startOrResume(
+      const WorkoutTemplateDraft(
+        templateId: 8,
+        name: 'Offline Finish',
+        description: '',
+        durationMinutes: 0,
+        goal: '',
+        exercises: [],
+      ),
+    );
+
+    final result = await controller.finish();
+    expect(result?.syncStatus, WorkoutSyncStatus.pendingSync);
+    expect(container.read(activeWorkoutProvider).value?.session?.isFinishing,
+        isTrue);
+    expect(
+      (await const ActiveWorkoutCheckpointStore()
+              .load(_ReadyAuthRepository._session))
+          .session,
+      isNotNull,
+    );
+
+    await controller.discard();
+    expect(container.read(activeWorkoutProvider).value?.session, isNull);
+    expect(
+      (await const ActiveWorkoutCheckpointStore()
+              .load(_ReadyAuthRepository._session))
+          .session,
+      isNull,
+    );
+  });
+
+  test('token expiry keeps the active checkpoint for later recovery', () async {
+    final container = _activeTestContainer(_ExpiredCompletionRepository());
+    addTearDown(container.dispose);
+    await container.read(appDraftProvider.future);
+    await container.read(activeWorkoutProvider.future);
+    final controller = container.read(activeWorkoutProvider.notifier);
+    await controller.startOrResume(
+      const WorkoutTemplateDraft(
+        templateId: 9,
+        name: 'Token Refresh Session',
+        description: '',
+        durationMinutes: 0,
+        goal: '',
+        exercises: [],
+      ),
+    );
+
+    await expectLater(
+        controller.finish(), throwsA(isA<AuthSessionExpiredException>()));
+    expect(
+      (await const ActiveWorkoutCheckpointStore()
+              .load(_ReadyAuthRepository._session))
+          .session,
+      isNotNull,
+    );
+  });
+
+  test('corrupted checkpoint is removed and user checkpoints are isolated',
+      () async {
+    SharedPreferences.setMockInitialValues({
+      'jimbro.active_workout.v1.test-user': '{damaged',
+    });
+    const store = ActiveWorkoutCheckpointStore();
+    final damaged = await store.load(_ReadyAuthRepository._session);
+    expect(damaged.corrupted, isTrue);
+    expect(damaged.session, isNull);
+
+    const other = AuthSession(
+      userId: 'other-user',
+      displayName: 'Other',
+      email: 'other@example.test',
+      accessToken: 'other-token',
+      provider: 'test',
+    );
+    final now = DateTime.now();
+    await store.write(
+      _ReadyAuthRepository._session,
+      ActiveWorkoutSession(
+        sessionId: 'owned-session',
+        sourceTemplateId: null,
+        name: 'Owned',
+        notes: '',
+        exercises: const [],
+        startedAt: now,
+        lastCheckpointAt: now,
+        revision: 1,
+        restDeadline: null,
+        localStatus: ActiveWorkoutLocalStatus.checkpointed,
+        remoteStatus: ActiveWorkoutRemoteStatus.localOnly,
+        lifecycle: ActiveWorkoutLifecycle.active,
+      ),
+    );
+    expect((await store.load(other)).session, isNull);
+  });
+}
+
+ProviderContainer _activeTestContainer(WorkoutRepository repository) {
+  return ProviderContainer(
+    overrides: [
+      authRepositoryProvider.overrideWithValue(_ReadyAuthRepository()),
+      profileRepositoryProvider.overrideWithValue(MockProfileRepository()),
+      workoutRepositoryProvider.overrideWithValue(repository),
+      nutritionRepositoryProvider.overrideWithValue(MockNutritionRepository()),
+      consistencyRepositoryProvider.overrideWithValue(
+        MockConsistencyRepository(),
+      ),
+      atlasRepositoryProvider.overrideWithValue(MockAtlasRepository()),
+      searchRepositoryProvider.overrideWithValue(MockSearchRepository()),
+    ],
+  );
+}
+
+class _CountingCompletionRepository extends MockWorkoutRepository {
+  int finishCount = 0;
+  String? lastMutationId;
+
+  @override
+  Future<WorkoutMutationResult> finishWorkout(
+    AuthSession? session,
+    WorkoutLogDraft log, {
+    required String mutationId,
+  }) {
+    finishCount += 1;
+    lastMutationId = mutationId;
+    return super.finishWorkout(session, log, mutationId: mutationId);
+  }
+}
+
+class _PendingCompletionRepository extends MockWorkoutRepository {
+  @override
+  Future<WorkoutMutationResult> finishWorkout(
+    AuthSession? session,
+    WorkoutLogDraft log, {
+    required String mutationId,
+  }) async {
+    return WorkoutMutationResult(
+      localWorkoutId: 'pending-$mutationId',
+      mutationId: mutationId,
+      syncStatus: WorkoutSyncStatus.pendingSync,
+      errorCode: 'NETWORK_UNAVAILABLE',
+      retryable: true,
+      authoritativeWorkout: log,
+    );
+  }
+}
+
+class _ExpiredCompletionRepository extends MockWorkoutRepository {
+  @override
+  Future<WorkoutMutationResult> finishWorkout(
+    AuthSession? session,
+    WorkoutLogDraft log, {
+    required String mutationId,
+  }) {
+    throw const AuthSessionExpiredException('Expired during finish.');
+  }
 }
 
 class _ReadyAuthRepository implements AuthRepository {
@@ -944,12 +1475,21 @@ class _CapturingWorkoutRepository implements WorkoutRepository {
   }
 
   @override
-  Future<WorkoutLogDraft> saveWorkoutLog(
+  Future<WorkoutMutationResult> saveWorkoutLog(
     AuthSession? session,
     WorkoutLogDraft log,
   ) async {
     capturedLog = log;
-    return log.copyWith(workoutLogId: 1);
+    final saved = log.copyWith(workoutLogId: 1);
+    return WorkoutMutationResult(
+      localWorkoutId: 'local-test',
+      serverLogId: 1,
+      mutationId: 'test-mutation',
+      syncStatus: WorkoutSyncStatus.synced,
+      errorCode: null,
+      retryable: false,
+      authoritativeWorkout: saved,
+    );
   }
 
   @override
@@ -978,7 +1518,10 @@ class _CapturingWorkoutRepository implements WorkoutRepository {
   ) async {}
 
   @override
-  Future<List<ExerciseSuggestion>> searchExercises(String query) async {
+  Future<List<ExerciseSuggestion>> searchExercises(
+    String query, [
+    AuthSession? session,
+  ]) async {
     return const [];
   }
 
@@ -1009,6 +1552,12 @@ class _FakeWorkoutNotificationService implements WorkoutNotificationService {
 
 class _ExerciseSearchDioAdapter implements HttpClientAdapter {
   final queryParameters = <Map<String, dynamic>>[];
+  final headers = <Map<String, dynamic>>[];
+  int statusCode = 200;
+  bool offline = false;
+  bool timeout = false;
+  bool empty = false;
+  bool malformed = false;
 
   @override
   void close({bool force = false}) {}
@@ -1021,6 +1570,34 @@ class _ExerciseSearchDioAdapter implements HttpClientAdapter {
   ) async {
     if (options.method == 'GET' && options.path == '/exercises/search') {
       queryParameters.add(Map<String, dynamic>.from(options.queryParameters));
+      headers.add(Map<String, dynamic>.from(options.headers));
+      if (offline) {
+        throw DioException(
+          requestOptions: options,
+          type: DioExceptionType.connectionError,
+          error: 'offline',
+        );
+      }
+      if (timeout) {
+        throw DioException(
+          requestOptions: options,
+          type: DioExceptionType.receiveTimeout,
+        );
+      }
+      if (statusCode != 200) {
+        return _json(statusCode, {'detail': 'search rejected'});
+      }
+      if (empty) {
+        return _json(200, {'success': true, 'data': <Object>[]});
+      }
+      if (malformed) {
+        return _json(200, {
+          'success': true,
+          'data': [
+            {'exercise_id': null, 'name': ''}
+          ],
+        });
+      }
       return _json(200, {
         'success': true,
         'data': [
@@ -1053,7 +1630,10 @@ class _CapturingDioAdapter implements HttpClientAdapter {
   Map<String, dynamic>? validationError;
   bool rejectRichTemplateOnce = false;
   bool rejectRichWorkoutLogOnce = false;
+  bool omitTemplateId = false;
+  List<Map<String, dynamic>> templateList = [];
   final List<Map<String, dynamic>> templatePayloads = [];
+  final List<String> templateIdempotencyKeys = [];
   final List<Map<String, dynamic>> workoutLogPayloads = [];
 
   @override
@@ -1068,6 +1648,8 @@ class _CapturingDioAdapter implements HttpClientAdapter {
     if (options.method == 'POST' && options.path == '/workout-templates') {
       lastTemplatePayload = Map<String, dynamic>.from(options.data as Map);
       templatePayloads.add(lastTemplatePayload!);
+      templateIdempotencyKeys
+          .add(options.headers['Idempotency-Key']?.toString() ?? '');
       if (rejectRichTemplateOnce &&
           templatePayloads.length == 1 &&
           lastTemplatePayload!.containsKey('exercises')) {
@@ -1091,10 +1673,19 @@ class _CapturingDioAdapter implements HttpClientAdapter {
         jsonEncode({
           'success': true,
           'data': {
-            'template_id': 20,
+            if (!omitTemplateId) 'template_id': 20,
             ...lastTemplatePayload!,
           },
         }),
+        200,
+        headers: {
+          Headers.contentTypeHeader: [Headers.jsonContentType],
+        },
+      );
+    }
+    if (options.method == 'GET' && options.path == '/workout-templates') {
+      return ResponseBody.fromString(
+        jsonEncode({'success': true, 'data': templateList}),
         200,
         headers: {
           Headers.contentTypeHeader: [Headers.jsonContentType],
@@ -1189,6 +1780,7 @@ class _WorkoutLogOfflineDioAdapter implements HttpClientAdapter {
     Future<void>? cancelFuture,
   ) async {
     if (options.method == 'POST' && options.path == '/workout-logs') {
+      workoutLogPayloads.add(Map<String, dynamic>.from(options.data as Map));
       if (offline) {
         throw DioException(
           requestOptions: options,
@@ -1196,7 +1788,6 @@ class _WorkoutLogOfflineDioAdapter implements HttpClientAdapter {
           error: 'offline',
         );
       }
-      workoutLogPayloads.add(Map<String, dynamic>.from(options.data as Map));
       return ResponseBody.fromString(
         jsonEncode({
           'success': true,

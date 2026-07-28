@@ -9,25 +9,38 @@ import '../../profile/presentation/profile_page.dart';
 import '../../workouts/presentation/workouts_page.dart';
 import 'home_page.dart';
 
-class HomeShell extends ConsumerWidget {
+class HomeShell extends ConsumerStatefulWidget {
   const HomeShell({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<HomeShell> createState() => _HomeShellState();
+}
+
+class _HomeShellState extends ConsumerState<HomeShell> {
+  static const _pageFactories = <Widget Function()>[
+    HomePage.new,
+    WorkoutsPage.new,
+    NutritionPage.new,
+    HistoryPage.new,
+    ProfilePage.new,
+  ];
+
+  late final List<Widget?> _pages =
+      List<Widget?>.filled(_pageFactories.length, null);
+
+  @override
+  Widget build(BuildContext context) {
     final currentTab = ref.watch(currentTabProvider);
-    final pages = const [
-      HomePage(),
-      WorkoutsPage(),
-      NutritionPage(),
-      HistoryPage(),
-      ProfilePage(),
-    ];
+    _pages[currentTab] ??= _pageFactories[currentTab]();
 
     return Scaffold(
       extendBody: true,
       body: IndexedStack(
         index: currentTab,
-        children: pages,
+        children: List<Widget>.generate(
+          _pages.length,
+          (index) => _pages[index] ?? const SizedBox.shrink(),
+        ),
       ),
       bottomNavigationBar: Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),

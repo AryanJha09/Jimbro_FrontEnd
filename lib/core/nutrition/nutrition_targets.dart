@@ -59,12 +59,18 @@ class NutritionTargetCalculator {
   static const _hydrationMlPerKg = 35.0;
 
   static NutritionTargetEstimate estimate(UserProfile profile) {
-    final hasRequiredProfile = profile.age > 0 &&
-        profile.heightCm > 0 &&
-        profile.weightKg > 0 &&
-        profile.sex.trim().isNotEmpty;
-
-    if (!hasRequiredProfile) {
+    final age = profile.age;
+    final heightCm = profile.heightCm;
+    final weightKg = profile.weightKg;
+    final sex = profile.sex;
+    if (age == null ||
+        age <= 0 ||
+        heightCm == null ||
+        heightCm <= 0 ||
+        weightKg == null ||
+        weightKg <= 0 ||
+        sex == null ||
+        sex.trim().isEmpty) {
       return const NutritionTargetEstimate(
         hasRequiredProfile: false,
         bmr: 0,
@@ -84,18 +90,15 @@ class NutritionTargetCalculator {
     }
 
     final bmr = _roundToNearest(
-      (10 * profile.weightKg) +
-          (6.25 * profile.heightCm) -
-          (5 * profile.age) +
-          _sexConstant(profile.sex),
+      (10 * weightKg) + (6.25 * heightCm) - (5 * age) + _sexConstant(sex),
       1,
     );
-    final activityMultiplier = _activityMultiplier(profile.activityLevel);
+    final activityMultiplier = _activityMultiplier(profile.activityLevel ?? '');
     final tdee = _roundToNearest(bmr * activityMultiplier, 10);
     final maintenance = tdee;
     final cut = _roundToNearest(tdee * (1 - _deficitRate), 10);
     final bulk = _roundToNearest(tdee * (1 + _muscleGainSurplusRate), 10);
-    final goal = _targetGoal(profile.goal);
+    final goal = _targetGoal(profile.goal ?? '');
     final calorieTarget = switch (goal) {
       _TargetGoal.fatLoss => cut,
       _TargetGoal.muscleGain => bulk,
@@ -107,11 +110,11 @@ class NutritionTargetCalculator {
     };
     final proteinPerKg = _proteinPerKg(
       goal: goal,
-      dietaryPreference: profile.dietaryPreference,
+      dietaryPreference: profile.dietaryPreference ?? '',
     );
-    final proteinG = _roundToNearest(profile.weightKg * proteinPerKg, 1);
+    final proteinG = _roundToNearest(weightKg * proteinPerKg, 1);
     final hydrationL = _roundToNearest(
-      (profile.weightKg * _hydrationMlPerKg / 1000).clamp(1.5, 5.0),
+      (weightKg * _hydrationMlPerKg / 1000).clamp(1.5, 5.0),
       0.1,
     );
     final fatG = _roundToNearest((calorieTarget * 0.25) / 9, 1);

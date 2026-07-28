@@ -1,167 +1,127 @@
-# Backend Atlas Onboarding Contract Request
+# Backend Authentication and Onboarding Contract
 
-## Status
+## Repository boundary
 
-The JimBro Flutter frontend now preserves onboarding/profile consistency safely:
+This checkout contains the JimBro Flutter client only. The FastAPI source,
+Supabase schema, migrations, triggers, and backend tests are not present. The
+client contract below is therefore the required deployment companion for the
+backend repository; it is not a substitute for a backend migration.
 
-- `POST /atlas/onboard` is called only when the current email/password auth flow still has a transient in-memory password.
-- Restored Supabase/FastAPI sessions do not expose plaintext password, so the frontend does not call `/atlas/onboard` in that state.
-- When Atlas onboarding cannot be called, the app saves the canonical profile locally/in app state, uses local profile-based metrics as a fallback, and shows a sync-pending message.
-- Passwords, bearer tokens, and environment values are not logged. Debug diagnostics only report non-secret status such as missing credential categories.
+## Dietary preference
 
-## Current Backend Blocker
+The canonical enum is exactly:
 
-The deployed backend currently requires this request body for `POST /atlas/onboard`:
-
-```json
-{
-  "username": "string",
-  "email": "string",
-  "password": "string",
-  "age": 13,
-  "height_cm": 100,
-  "weight_kg": 30,
-  "sex": "male",
-  "activity_level": "lightly_active",
-  "fitness_goal": "maintain",
-  "experience_level": "novice",
-  "available_time_min": 15,
-  "equipment_access": "full_gym",
-  "constraints_json": ["knee_sensitive"]
-}
+```text
+omnivore
+vegetarian
+vegan
+keto
+other
 ```
 
-Requiring `password` is incompatible with authenticated Supabase JWT sessions. After login or app restore, the frontend correctly has a bearer token/session, but it must not store or resend a plaintext password.
+Completed profile/onboarding requests always include one of these values as
+`dietary_preference`. Missing, `null`, and unknown values must return HTTP 422
+with `INVALID_DIETARY_PREFERENCE`; they must not be coerced to `omnivore`.
 
-## Requested Backend Change
+Provisioning that runs before onboarding data exists may use `omnivore` as the
+temporary database-compatible value. A completed onboarding write replaces it
+with the user's selection.
 
-Update `POST /atlas/onboard` to authenticate from `Authorization: Bearer <supabase_jwt>` and derive user identity from the validated token/session.
+## Canonical application-user bootstrap
 
-The request body should require only onboarding/profile fields:
+The Flutter bootstrap calls authenticated `GET /api/v1/supabase/profile`
+before entering the authenticated application. This existing profile route
+must call the backend's single idempotent user-provisioning service.
 
-```json
-{
-  "age": 13,
-  "height_cm": 100,
-  "weight_kg": 30,
-  "sex": "male",
-  "activity_level": "lightly_active",
-  "fitness_goal": "maintain",
-  "experience_level": "novice",
-  "available_time_min": 15,
-  "equipment_access": "full_gym",
-  "constraints_json": ["knee_sensitive"]
-}
-```
+The service must:
 
-Optional fields:
+- derive the Auth UUID and email from the verified bearer JWT;
+- insert the missing `public.users` row with every required column populated,
+  including provisional `dietary_preference = 'omnivore'`;
+- return an existing row without overwriting it;
+- use an upsert/transaction-safe equivalent backed by a unique Auth UUID;
+- log `AUTH_USER_RECONCILED` when it repairs an orphan, without tokens or
+  sensitive profile data.
 
-```json
-{
-  "username": "string"
-}
-```
-
-Backend should derive:
-
-- `user_id` from the authenticated bearer token subject/session user.
-- `email` from the authenticated token/session user.
-- `username` from request body if supplied, otherwise profile/user metadata/email prefix.
-
-Backend should not require:
-
-- `password`
-- frontend-resubmitted email
-- frontend-resubmitted user id
-
-## Proposed Response Shape
-
-Return updated profile and Atlas metrics in one response when possible:
+The successful response must include a stable application-user identifier:
 
 ```json
 {
   "success": true,
   "data": {
-    "profile": {
-      "user_id": "uuid",
-      "username": "string",
-      "email": "user@example.com",
-      "age": 13,
-      "height_cm": 100,
-      "weight_kg": 30,
-      "sex": "male",
-      "activity_level": "lightly_active",
-      "fitness_goal": "maintain",
-      "experience_level": "novice",
-      "available_time_min": 15,
-      "equipment_access": "full_gym",
-      "constraints_json": ["knee_sensitive"],
-      "updated_at": "2026-06-17T00:00:00Z"
-    },
-    "metrics": {
-      "bmr": 1600,
-      "tdee": 2200,
-      "target_calories": 2200,
-      "macros": {
-        "protein_g": 120,
-        "carbs_g": 250,
-        "fat_g": 70
-      },
-      "hydration_l": 2.5,
-      "updated_at": "2026-06-17T00:00:00Z"
-    }
+    "user_id": "application-user-id",
+    "auth_user_id": "supabase-auth-uuid",
+    "dietary_preference": "omnivore",
+    "onboarding_completed": false,
+    "reconciled": true
   }
 }
 ```
 
-If metrics cannot be generated immediately, return the saved profile and a clear non-fatal metrics status:
+If reconciliation fails, return a non-2xx response with
+`USER_PROVISIONING_FAILED`. Do not return a synthetic profile or HTTP 200.
 
-```json
-{
-  "success": true,
-  "data": {
-    "profile": {
-      "updated_at": "2026-06-17T00:00:00Z"
-    },
-    "metrics": null,
-    "metrics_status": "pending"
-  }
-}
-```
+## Profile and Atlas onboarding
 
-`GET /atlas/metrics` may continue returning `404 ATLAS_METRICS_NOT_FOUND` before generation exists; the frontend treats that as "metrics pending" and uses local estimates.
+`POST /api/v1/supabase/profile` is the canonical profile write. It must validate
+the entire request before mutation, ensure the application user exists, update
+the dietary preference, and set `onboarding_completed = true` in the same
+transaction only when the request includes that flag and all required profile
+fields were saved.
 
-## Compatibility Notes
+`POST /api/v1/atlas/onboard` is bearer-authenticated. The request contains
+profile fields, including `dietary_preference`, but never a password,
+client-provided auth UUID, or resubmitted account email. FastAPI must derive
+identity from the JWT.
 
-The frontend currently sends this legacy-safe payload only when a transient password exists:
+Example request:
 
 ```json
 {
   "username": "string",
-  "email": "user@example.com",
-  "password": "<redacted>",
-  "age": 13,
-  "height_cm": 100,
-  "weight_kg": 30,
+  "age": 30,
+  "height_cm": 180,
+  "weight_kg": 80,
   "sex": "male",
-  "activity_level": "lightly_active",
-  "fitness_goal": "maintain",
-  "experience_level": "novice",
-  "available_time_min": 15,
+  "activity_level": "moderately_active",
+  "fitness_goal": "gain_muscle",
+  "experience_level": "intermediate",
+  "dietary_preference": "vegetarian",
+  "available_time_min": 45,
   "equipment_access": "full_gym",
-  "constraints_json": ["knee_sensitive"]
+  "constraints_json": []
 }
 ```
 
-Once the backend accepts bearer-authenticated onboarding without password, the frontend can remove `password` from the Atlas onboarding DTO entirely.
+Atlas/program-generation failure may be returned as a separate recoverable
+error after the canonical profile commits. It must not roll back a successfully
+saved profile, and it must not claim profile success if the profile write failed.
 
-## Acceptance Criteria
+## Downstream identity and deletion
 
-- `POST /atlas/onboard` succeeds with a valid bearer token and no `password` field.
-- Backend derives user id/email from the token/session.
-- `username` is optional or derived.
-- Backend returns saved profile with `updated_at`.
-- Backend returns metrics when available, or a non-fatal pending status.
-- `GET /atlas/metrics` 404 for missing metrics remains non-fatal and documented.
-- No backend logs print bearer tokens or plaintext passwords.
-- Existing authenticated clients using Supabase JWT can complete onboarding after app restore.
+Workout, schedule, nutrition, analytics, Atlas, and program endpoints must
+resolve the application user from the verified JWT through the same
+provisioning service. The Flutter client intentionally does not send `user_id`
+for schedule writes.
+
+`DELETE /api/v1/account` must be idempotent and JWT-derived. It must delete a
+normal account and an orphaned Auth account. A missing `public.users` row is not
+an error and must not prevent deletion of the Supabase Auth user.
+
+## Migration invariants
+
+The backend migration must be authored against the real schema and should:
+
+1. ensure the enum/check constraint contains only the five values above;
+2. repair any null dietary preferences to `omnivore` before enforcing `NOT NULL`;
+3. give provisioning a valid `omnivore` default where the trigger/service runs
+   before onboarding;
+4. enforce uniqueness on the Supabase Auth UUID reference;
+5. preserve existing valid values and intentional foreign-key cascades;
+6. update any Auth trigger to populate all mandatory columns and make failures
+   observable.
+
+Required backend tests cover idempotent create/retry, orphan repair without
+overwrite, all five dietary values, 422 for missing/null/invalid onboarding
+values, failed-write onboarding flags, workout writes after repair, and normal
+plus orphan account deletion.

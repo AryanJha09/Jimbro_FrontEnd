@@ -368,5 +368,4 @@ const _draft = AppDraftState(
     weeklyCheckins: 0,
     totalLogs: 0,
   ),
-  search: SearchState(query: '', groups: []),
 );

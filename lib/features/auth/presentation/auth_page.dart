@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/config/app_config.dart';
+import '../../../core/errors/app_error.dart';
 import '../../../core/navigation/app_state.dart';
+import '../../../core/repositories/app_repositories.dart';
 import '../../../core/theme/jim_tokens.dart';
 import '../../../shared/components/jim_button.dart';
 import '../../../shared/components/jim_companion.dart';
@@ -20,8 +22,10 @@ class _AuthPageState extends ConsumerState<AuthPage> {
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
   final _phoneController = TextEditingController();
-  String _activeMethod = 'social';
+  String _activeMethod = 'email';
+  bool _isSignUp = false;
   bool _isSubmitting = false;
+  bool _provisioningFailed = false;
   String? _errorText;
 
   @override
@@ -33,6 +37,9 @@ class _AuthPageState extends ConsumerState<AuthPage> {
   }
 
   Future<void> _completeAuth(String provider) async {
+    if (_isSubmitting || !mounted) {
+      return;
+    }
     setState(() {
       _errorText = null;
       _isSubmitting = true;
@@ -42,38 +49,11 @@ class _AuthPageState extends ConsumerState<AuthPage> {
           .read(appDraftProvider.notifier)
           .signInWithMockProvider(provider);
     } catch (error) {
-      setState(() {
-        _errorText = error.toString();
-      });
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isSubmitting = false;
-        });
+      if (!mounted) {
+        return;
       }
-    }
-  }
-
-  Future<void> _submitEmailAuth() async {
-    final email = _emailController.text.trim();
-    final password = _passwordController.text;
-    if (email.isEmpty || password.isEmpty) {
       setState(() {
-        _errorText = 'Enter both your email and password.';
-      });
-      return;
-    }
-    setState(() {
-      _errorText = null;
-      _isSubmitting = true;
-    });
-    try {
-      await ref.read(appDraftProvider.notifier).signInWithEmailPassword(
-            email: email,
-            password: password,
-          );
-    } catch (error) {
-      setState(() {
+        _provisioningFailed = error is UserProvisioningException;
         _errorText = _formatAuthError(error);
       });
     } finally {
@@ -85,12 +65,85 @@ class _AuthPageState extends ConsumerState<AuthPage> {
     }
   }
 
-  String _formatAuthError(Object error) {
-    final message = error.toString();
-    if (message.startsWith('Exception: ')) {
-      return message.substring('Exception: '.length).trim();
+  Future<void> _submitEmailAuth() async {
+    if (_isSubmitting || !mounted) {
+      return;
     }
-    return message;
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+    if (email.isEmpty || password.isEmpty) {
+      setState(() {
+        _errorText = 'Enter both your email and password.';
+      });
+      return;
+    }
+    setState(() {
+      _errorText = null;
+      _provisioningFailed = false;
+      _isSubmitting = true;
+    });
+    try {
+      final controller = ref.read(appDraftProvider.notifier);
+      if (_isSignUp) {
+        await controller.signUpWithEmailPassword(
+          email: email,
+          password: password,
+        );
+      } else {
+        await controller.signInWithEmailPassword(
+          email: email,
+          password: password,
+        );
+      }
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _provisioningFailed = error is UserProvisioningException;
+        _errorText = _formatAuthError(error);
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSubmitting = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _retryProvisioning() async {
+    if (_isSubmitting || !mounted) {
+      return;
+    }
+    setState(() {
+      _isSubmitting = true;
+      _errorText = null;
+      _provisioningFailed = false;
+    });
+    try {
+      await ref.read(appDraftProvider.notifier).retryAccountProvisioning();
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _provisioningFailed = error is UserProvisioningException;
+          _errorText = _formatAuthError(error);
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isSubmitting = false);
+      }
+    }
+  }
+
+  String _formatAuthError(Object error) {
+    return presentAppError(
+      error,
+      fallbackMessage: 'Authentication failed. Please try again.',
+      method: 'POST',
+      route: '/auth',
+    );
   }
 
   @override
@@ -98,7 +151,8 @@ class _AuthPageState extends ConsumerState<AuthPage> {
     final theme = Theme.of(context);
     final config = ref.watch(appConfigProvider);
     final useLiveBackend = config.useLiveBackend;
-    final useSupabaseAuth = config.useSupabaseDirectAuth;
+    final hasProvisioningFailure = _provisioningFailed;
+    final visibleError = _errorText;
 
     return DecoratedBox(
       decoration: const BoxDecoration(
@@ -131,9 +185,7 @@ class _AuthPageState extends ConsumerState<AuthPage> {
             const SizedBox(height: 12),
             Text(
               useLiveBackend
-                  ? useSupabaseAuth
-                      ? 'Email and password now sign in directly with Supabase. The returned Supabase session token is then used for protected backend requests.'
-                      : 'Email and password now route through the documented FastAPI auth flow. Social providers stay disabled until they are configured.'
+                  ? 'Sign in to continue with your workouts, nutrition, and coaching plan.'
                   : 'A soft, smart training companion that grows stronger as you stay consistent. Sign in to shape your coaching style and start building momentum.',
               textAlign: TextAlign.center,
               style: theme.textTheme.bodyLarge?.copyWith(
@@ -145,26 +197,23 @@ class _AuthPageState extends ConsumerState<AuthPage> {
               radius: 34,
               child: Column(
                 children: [
-                  _AuthOptionTile(
-                    icon: Icons.g_mobiledata_rounded,
-                    title: 'Continue with Google',
-                    subtitle: useLiveBackend
-                        ? 'Not configured yet in Supabase'
-                        : 'Continue with your coaching setup',
-                    onTap:
-                        useLiveBackend ? null : () => _completeAuth('google'),
-                  ),
-                  const SizedBox(height: 12),
-                  _AuthOptionTile(
-                    icon: Icons.apple_rounded,
-                    title: 'Continue with Apple',
-                    subtitle: useLiveBackend
-                        ? 'Not configured yet in Supabase'
-                        : 'Continue with your JimBro profile',
-                    onTap: useLiveBackend ? null : () => _completeAuth('apple'),
-                  ),
-                  const SizedBox(height: 18),
-                  if (_errorText != null) ...[
+                  if (!useLiveBackend) ...[
+                    _AuthOptionTile(
+                      icon: Icons.g_mobiledata_rounded,
+                      title: 'Continue with Google',
+                      subtitle: 'Continue with your coaching setup',
+                      onTap: () => _completeAuth('google'),
+                    ),
+                    const SizedBox(height: 12),
+                    _AuthOptionTile(
+                      icon: Icons.apple_rounded,
+                      title: 'Continue with Apple',
+                      subtitle: 'Continue with your JimBro profile',
+                      onTap: () => _completeAuth('apple'),
+                    ),
+                    const SizedBox(height: 18),
+                  ],
+                  if (visibleError != null) ...[
                     Container(
                       width: double.infinity,
                       padding: const EdgeInsets.all(12),
@@ -174,35 +223,52 @@ class _AuthPageState extends ConsumerState<AuthPage> {
                         border: Border.all(color: const Color(0xFFFFCCC7)),
                       ),
                       child: SelectableText(
-                        _errorText!,
+                        visibleError,
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: JimColors.terracotta,
                           height: 1.35,
-                          fontFamily: 'monospace',
                         ),
                       ),
                     ),
-                    const SizedBox(height: 18),
-                  ],
-                  Row(
-                    children: [
-                      Expanded(
-                        child: _MethodToggle(
-                          label: 'Email',
-                          selected: _activeMethod == 'email',
-                          onTap: () => setState(() => _activeMethod = 'email'),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: _MethodToggle(
-                          label: 'Phone no',
-                          selected: _activeMethod == 'phone',
-                          onTap: () => setState(() => _activeMethod = 'phone'),
+                    if (hasProvisioningFailure) ...[
+                      const SizedBox(height: 10),
+                      SizedBox(
+                        width: double.infinity,
+                        child: JimSecondaryButton(
+                          key: const ValueKey('retry-provisioning-button'),
+                          label: _isSubmitting
+                              ? 'Retrying profile setup...'
+                              : 'Retry profile setup',
+                          onPressed: _isSubmitting ? () {} : _retryProvisioning,
+                          icon: Icons.refresh_rounded,
+                          expand: true,
                         ),
                       ),
                     ],
-                  ),
+                    const SizedBox(height: 18),
+                  ],
+                  if (!useLiveBackend)
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _MethodToggle(
+                            label: 'Email',
+                            selected: _activeMethod == 'email',
+                            onTap: () =>
+                                setState(() => _activeMethod = 'email'),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: _MethodToggle(
+                            label: 'Phone no',
+                            selected: _activeMethod == 'phone',
+                            onTap: () =>
+                                setState(() => _activeMethod = 'phone'),
+                          ),
+                        ),
+                      ],
+                    ),
                   const SizedBox(height: 18),
                   AnimatedSwitcher(
                     duration: JimMotion.gentle,
@@ -215,14 +281,37 @@ class _AuthPageState extends ConsumerState<AuthPage> {
                                   Expanded(
                                     child: Text(
                                       useLiveBackend
-                                          ? useSupabaseAuth
-                                              ? 'Supabase email sign in'
-                                              : 'Email sign in'
+                                          ? _isSignUp
+                                              ? 'Create your account'
+                                              : 'Welcome back'
                                           : 'Email sign in',
                                       style: theme.textTheme.titleMedium,
                                     ),
                                   ),
                                 ],
+                              ),
+                              const SizedBox(height: 10),
+                              SegmentedButton<bool>(
+                                segments: const [
+                                  ButtonSegment<bool>(
+                                    value: false,
+                                    label: Text('Sign in'),
+                                  ),
+                                  ButtonSegment<bool>(
+                                    value: true,
+                                    label: Text('Create account'),
+                                  ),
+                                ],
+                                selected: {_isSignUp},
+                                onSelectionChanged: _isSubmitting
+                                    ? null
+                                    : (selection) {
+                                        setState(() {
+                                          _isSignUp = selection.first;
+                                          _errorText = null;
+                                          _provisioningFailed = false;
+                                        });
+                                      },
                               ),
                               const SizedBox(height: 8),
                               TextField(
@@ -242,31 +331,24 @@ class _AuthPageState extends ConsumerState<AuthPage> {
                                   prefixIcon: Icon(Icons.lock_outline_rounded),
                                 ),
                               ),
-                              if (useLiveBackend) ...[
-                                const SizedBox(height: 10),
-                                Align(
-                                  alignment: Alignment.centerLeft,
-                                  child: Text(
-                                    useSupabaseAuth
-                                        ? 'This uses Supabase email/password auth and forwards the Supabase bearer token to future protected FastAPI requests.'
-                                        : 'This uses POST /api/v1/auth/login and sends the returned bearer token to future protected requests.',
-                                    style: theme.textTheme.bodySmall?.copyWith(
-                                      color: JimColors.inkSoft,
-                                    ),
-                                  ),
-                                ),
-                              ],
                               const SizedBox(height: 14),
                               SizedBox(
                                 width: double.infinity,
                                 child: JimPrimaryButton(
+                                  key: const ValueKey(
+                                    'email-auth-submit-button',
+                                  ),
                                   label: _isSubmitting
-                                      ? 'Signing in...'
+                                      ? _isSignUp
+                                          ? 'Creating account...'
+                                          : 'Signing in...'
                                       : useLiveBackend
-                                          ? useSupabaseAuth
-                                              ? 'Sign in with Supabase'
+                                          ? _isSignUp
+                                              ? 'Create account'
                                               : 'Sign in with email'
-                                          : 'Continue with email',
+                                          : _isSignUp
+                                              ? 'Create account'
+                                              : 'Continue with email',
                                   onPressed: _isSubmitting
                                       ? () {}
                                       : useLiveBackend

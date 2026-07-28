@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../shared/components/jim_companion.dart';
+import '../../shared/components/backend_state_view.dart';
 import '../../shared/models/app_models.dart';
 import '../../features/auth/presentation/auth_page.dart';
 import '../../features/home/presentation/home_shell.dart';
@@ -32,6 +33,8 @@ class _AppFlowState extends ConsumerState<AppFlow>
   double _settleTarget = 0;
   bool _bootResolved = false;
   bool _showApp = false;
+  AppBootstrapStatus? _lastLoggedRouteStatus;
+  String? _lastLoggedRoute;
 
   @override
   void initState() {
@@ -94,15 +97,69 @@ class _AppFlowState extends ConsumerState<AppFlow>
 
   @override
   Widget build(BuildContext context) {
-    final isAuthenticated = ref.watch(isAuthenticatedProvider);
-    final hasCompletedOnboarding = ref.watch(hasCompletedOnboardingProvider);
+    ref.watch(appDraftProvider);
+    final bootstrap = ref.watch(appBootstrapProvider);
     final forceShowOnboarding =
         kDebugMode && ref.watch(forceShowOnboardingProvider);
-    final destination = !isAuthenticated
-        ? const AuthPage()
-        : hasCompletedOnboarding && !forceShowOnboarding
-            ? const HomeShell()
-            : const OnboardingPage();
+    final destination = switch (bootstrap.status) {
+      AppBootstrapStatus.authenticating =>
+        const BackendLoadingView(message: 'Restoring your session...'),
+      AppBootstrapStatus.authenticatedProvisioning =>
+        const BackendLoadingView(message: 'Preparing your profile...'),
+      AppBootstrapStatus.onboardingRequired => const OnboardingPage(),
+      AppBootstrapStatus.ready when forceShowOnboarding =>
+        const OnboardingPage(),
+      AppBootstrapStatus.ready => const HomeShell(),
+      AppBootstrapStatus.recoverableError when bootstrap.session != null =>
+        AuthenticatedRecoveryView(
+          error: bootstrap.error ?? StateError('Profile service unavailable.'),
+          onRetry: () =>
+              ref.read(appDraftProvider.notifier).retryAccountProvisioning(),
+          onSignOut: () => ref.read(appDraftProvider.notifier).signOut(),
+        ),
+      AppBootstrapStatus.fatalError when bootstrap.session != null =>
+        AuthenticatedRecoveryView(
+          error: bootstrap.error ?? StateError('Profile response is invalid.'),
+          fatal: true,
+          onRetry: () =>
+              ref.read(appDraftProvider.notifier).retryAccountProvisioning(),
+          onSignOut: () => ref.read(appDraftProvider.notifier).signOut(),
+        ),
+      AppBootstrapStatus.fatalError => BackendErrorView(
+          error: bootstrap.error ?? StateError('App startup failed.'),
+          onRetry: () => ref.invalidate(appDraftProvider),
+        ),
+      AppBootstrapStatus.unauthenticated ||
+      AppBootstrapStatus.expired ||
+      AppBootstrapStatus.recoverableError =>
+        const AuthPage(),
+    };
+    if (kDebugMode) {
+      final route = switch (bootstrap.status) {
+        AppBootstrapStatus.onboardingRequired => 'onboarding',
+        AppBootstrapStatus.ready when forceShowOnboarding => 'onboarding',
+        AppBootstrapStatus.ready => 'home',
+        AppBootstrapStatus.unauthenticated ||
+        AppBootstrapStatus.expired =>
+          'auth',
+        AppBootstrapStatus.recoverableError =>
+          bootstrap.session == null ? 'auth' : 'authenticated-recovery',
+        AppBootstrapStatus.authenticating ||
+        AppBootstrapStatus.authenticatedProvisioning =>
+          'loading',
+        AppBootstrapStatus.fatalError =>
+          bootstrap.session == null ? 'error' : 'authenticated-profile-error',
+      };
+      if (_lastLoggedRouteStatus != bootstrap.status ||
+          _lastLoggedRoute != route) {
+        _lastLoggedRouteStatus = bootstrap.status;
+        _lastLoggedRoute = route;
+        debugPrint(
+          'AppFlow route decision: status=${bootstrap.status.name} '
+          'route=$route.',
+        );
+      }
+    }
 
     return Scaffold(
       body: Stack(

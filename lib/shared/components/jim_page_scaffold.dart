@@ -252,28 +252,35 @@ class JimLoadingState extends StatelessWidget {
   Widget build(BuildContext context) {
     return JimSurface(
       tone: JimSurfaceTone.soft,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 52,
-            height: 52,
-            padding: const EdgeInsets.all(13),
-            decoration: const BoxDecoration(
-              color: JimColors.accentSoft,
-              shape: BoxShape.circle,
-            ),
-            child: const CircularProgressIndicator(strokeWidth: 2.6),
-          ),
-          const SizedBox(height: JimSpacing.md),
-          Text(
-            message,
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  color: JimColors.inkSoft,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final compact =
+              constraints.hasBoundedHeight && constraints.maxHeight < 190;
+          final indicatorSize = compact ? 32.0 : 52.0;
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: indicatorSize,
+                height: indicatorSize,
+                padding: EdgeInsets.all(compact ? 8 : 13),
+                decoration: const BoxDecoration(
+                  color: JimColors.accentSoft,
+                  shape: BoxShape.circle,
                 ),
-          ),
-        ],
+                child: const CircularProgressIndicator(strokeWidth: 2.6),
+              ),
+              SizedBox(height: compact ? JimSpacing.xxs : JimSpacing.md),
+              Text(
+                message,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: JimColors.inkSoft,
+                    ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }

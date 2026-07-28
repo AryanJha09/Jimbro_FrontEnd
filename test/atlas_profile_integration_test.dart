@@ -25,27 +25,24 @@ void main() {
         activityLevel: OnboardingActivityLevel.moderatelyActive,
         availableTimeMin: 30,
         trainingPreference: OnboardingTrainingPreference.home,
-        dietaryPreference: OnboardingDietaryPreference.simple,
+        dietaryPreference: OnboardingDietaryPreference.vegetarian,
       ),
-      account: _account,
     );
 
     expect(payload, {
       'username': 'Test Athlete',
-      'email': 'test@example.com',
-      'password': 'test-password',
       'age': 31,
       'height_cm': 181.0,
       'weight_kg': 82.0,
       'activity_level': 'moderately_active',
       'fitness_goal': 'athletic_performance',
       'experience_level': 'intermediate',
+      'dietary_preference': 'vegetarian',
       'available_time_min': 30,
       'equipment_access': 'home_gym',
       'constraints_json': [
         'short_sessions',
         'home_equipment',
-        'simple_meals',
       ],
       'sex': 'male',
     });
@@ -141,6 +138,39 @@ void main() {
     expect(payload.containsKey('goal'), isFalse);
     expect(payload.containsKey('training_preference'), isFalse);
     expect(payload.containsKey('user_level'), isFalse);
+    expect(payload['dietary_preference'], 'omnivore');
+  });
+
+  test('all dietary preference values serialize and unknown values fail', () {
+    for (final preference in OnboardingDietaryPreference.values) {
+      final payload = profileBackendPayload(
+        _profile.copyWith(dietaryPreference: preference.wireValue),
+      );
+      expect(payload['dietary_preference'], preference.wireValue);
+    }
+
+    expect(
+      () => profileBackendPayload(
+        _profile.copyWith(dietaryPreference: 'unknown'),
+      ),
+      throwsA(isA<InvalidDietaryPreferenceException>()),
+    );
+    expect(
+      () => profileBackendPayload(
+        _profile.copyWith(dietaryPreference: ''),
+      ),
+      throwsA(isA<InvalidDietaryPreferenceException>()),
+    );
+  });
+
+  test('completed onboarding flag shares the canonical profile write', () {
+    final payload = profileBackendPayload(
+      _profile,
+      onboardingCompleted: true,
+    );
+
+    expect(payload['dietary_preference'], 'omnivore');
+    expect(payload['onboarding_completed'], isTrue);
   });
 
   test('fresh local profile wins over a stale backend profile response',
@@ -191,8 +221,8 @@ void main() {
         activityLevel: OnboardingActivityLevel.lightlyActive,
         availableTimeMin: 45,
         trainingPreference: OnboardingTrainingPreference.mixed,
+        dietaryPreference: OnboardingDietaryPreference.other,
       ),
-      account: _account,
     );
 
     expect(payload.containsKey('sex'), isFalse);
@@ -217,8 +247,9 @@ void main() {
 
     final state = container.read(appDraftProvider).value!;
     expect(adapter.lastOnboardPayload?['username'], 'Test Athlete');
-    expect(adapter.lastOnboardPayload?['email'], 'test@example.com');
-    expect(adapter.lastOnboardPayload?['password'], 'test-password');
+    expect(adapter.lastOnboardPayload?.containsKey('email'), isFalse);
+    expect(adapter.lastOnboardPayload?.containsKey('password'), isFalse);
+    expect(adapter.lastOnboardPayload?['dietary_preference'], 'omnivore');
     expect(adapter.lastOnboardPayload?['constraints_json'], isA<List>());
     expect(
         adapter.lastOnboardPayload?.containsKey('generate_program'), isFalse);
@@ -242,7 +273,7 @@ void main() {
     expect(state.atlasMetricsStatus, AtlasMetricsStatus.available);
   });
 
-  test('live onboarding saves locally when password is unavailable', () async {
+  test('restored session submits bearer-only onboarding', () async {
     final adapter = _AtlasAdapter();
     final container = _containerWithAtlas(adapter);
     addTearDown(container.dispose);
@@ -255,14 +286,15 @@ void main() {
           answers: _answers,
         );
 
-    expect(adapter.lastOnboardPayload, isNull);
+    expect(adapter.lastOnboardPayload, isNotNull);
+    expect(adapter.lastOnboardPayload?.containsKey('password'), isFalse);
     final state = container.read(appDraftProvider).value!;
-    expect(result?.warning, contains('saved on this device'));
+    expect(result?.warning, isNull);
     expect(state.profile.name, _profile.name);
     expect(state.metrics.targetCalories, greaterThan(0));
     expect(state.nutritionSummary.targetCalories, greaterThan(0));
-    expect(state.profileSyncStatus, ProfileSyncStatus.pending);
-    expect(state.atlasMetricsStatus, AtlasMetricsStatus.pending);
+    expect(state.profileSyncStatus, ProfileSyncStatus.synced);
+    expect(state.atlasMetricsStatus, AtlasMetricsStatus.available);
   });
 
   test('Atlas metrics 404 falls back without failing app load', () async {
@@ -493,12 +525,7 @@ const _answers = OnboardingAnswersDto(
   activityLevel: OnboardingActivityLevel.moderatelyActive,
   availableTimeMin: 45,
   trainingPreference: OnboardingTrainingPreference.gym,
-);
-
-const _account = AtlasOnboardingAccount(
-  username: 'Test Athlete',
-  email: 'test@example.com',
-  password: 'test-password',
+  dietaryPreference: OnboardingDietaryPreference.omnivore,
 );
 
 const _profile = UserProfile(
@@ -513,7 +540,7 @@ const _profile = UserProfile(
   availableTimeMinutes: 45,
   trainingPreference: 'Gym workouts',
   activityLevel: 'Moderately active',
-  dietaryPreference: 'Prioritize protein',
+  dietaryPreference: 'omnivore',
   goalTimeframe: '',
   weeksActive: 0,
   prefersVoiceLogging: false,
@@ -629,13 +656,16 @@ class _AtlasAdapter implements HttpClientAdapter {
       return _json({
         'success': true,
         'data': {
+          'user_id': 'app-user-1',
           'username': 'Test User',
           'age': 30,
           'height_cm': 180,
           'weight_kg': 80,
-          'sex': 'Male',
-          'goal': 'Get stronger',
-          'activity_level': 'Moderately active',
+          'sex': 'male',
+          'fitness_goal': 'athletic_performance',
+          'activity_level': 'moderately_active',
+          'dietary_preference': 'vegetarian',
+          'onboarding_completed': true,
         },
       });
     }

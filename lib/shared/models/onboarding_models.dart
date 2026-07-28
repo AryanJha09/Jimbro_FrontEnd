@@ -78,18 +78,31 @@ enum OnboardingTrainingPreference {
 }
 
 enum OnboardingDietaryPreference {
-  simple('simple'),
-  protein('protein'),
-  calories('calories'),
-  mealPlanning('meal_planning'),
-  notNow('not_now');
+  omnivore('omnivore', 'Omnivore'),
+  vegetarian('vegetarian', 'Vegetarian'),
+  vegan('vegan', 'Vegan'),
+  keto('keto', 'Keto'),
+  other('other', 'Other');
 
-  const OnboardingDietaryPreference(this.wireValue);
+  const OnboardingDietaryPreference(this.wireValue, this.label);
 
   final String wireValue;
+  final String label;
+
+  static const allowedWireValues = <String>{
+    'omnivore',
+    'vegetarian',
+    'vegan',
+    'keto',
+    'other',
+  };
 
   static OnboardingDietaryPreference? fromWireValue(Object? value) {
     return _enumFromWireValue(values, value, (entry) => entry.wireValue);
+  }
+
+  static OnboardingDietaryPreference? fromLabel(Object? value) {
+    return _enumFromWireValue(values, value, (entry) => entry.label);
   }
 }
 

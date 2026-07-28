@@ -2,9 +2,11 @@ import 'dart:convert';
 
 import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:jimbro/core/errors/app_error.dart';
 import 'package:jimbro/core/navigation/app_state.dart';
 import 'package:jimbro/core/notifications/workout_notification_service.dart';
 import 'package:jimbro/core/nutrition/nutrition_targets.dart';
@@ -14,6 +16,11 @@ import 'package:jimbro/shared/models/app_models.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   SharedPreferences.setMockInitialValues({});
+  FlutterSecureStorage.setMockInitialValues({});
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+    FlutterSecureStorage.setMockInitialValues({});
+  });
 
   test('estimates muscle gain targets from complete profile', () {
     const profile = UserProfile(
@@ -179,15 +186,11 @@ void main() {
     );
     final summary = await repository.loadSummary(_liveSession);
 
-    expect(adapter.createdFoodPayloads, hasLength(1));
-    expect(adapter.foodLogPayloads, hasLength(1));
-    expect(adapter.foodLogPayloads.single, {
-      'food_id': 'custom-food-1',
-      'quantity_grams': 150.0,
-      'meal_type': 'lunch',
-      'date': adapter.today,
-    });
-    expect(saved.single.calories, 500);
+    expect(adapter.atomicDayPayloads, hasLength(1));
+    expect(adapter.atomicDayPayloads.single['client_mutation_id'], isNotEmpty);
+    final entries = adapter.atomicDayPayloads.single['entries'] as List;
+    expect(entries.single['food_name'], 'Paneer bowl');
+    expect(saved.entries.single.foodLogId, isNotEmpty);
     expect(summary.consumedCalories, 500);
     expect(summary.proteinConsumed, 35);
   });
@@ -217,11 +220,9 @@ void main() {
     );
 
     expect(suggestions.single.foodId, 'catalog-food-1');
-    expect(adapter.createdFoodPayloads, isEmpty);
-    expect(adapter.foodLogPayloads.single['food_id'], 'catalog-food-1');
-    expect(adapter.foodLogPayloads.single['quantity_grams'], 100.0);
-    expect(
-        adapter.foodLogPayloads.single.containsKey('quantity_source'), isFalse);
+    final entries = adapter.atomicDayPayloads.single['entries'] as List;
+    expect(entries.single['food_id'], 'catalog-food-1');
+    expect(entries.single['quantity_grams'], 100.0);
   });
 
   test('food search uses the documented query-only endpoint', () async {
@@ -246,7 +247,8 @@ void main() {
     expect(adapter.foodSearchQueryParameters.last, {'q': 'chicken'});
   });
 
-  test('food search failure does not block manual food logging', () async {
+  test('food search propagates server failure without blocking manual logging',
+      () async {
     final adapter = _NutritionDioAdapter()..failFoodSearch = true;
     final dio = Dio(
       BaseOptions(
@@ -256,7 +258,16 @@ void main() {
     )..httpClientAdapter = adapter;
     final repository = FastApiNutritionRepository(dio);
 
-    final suggestions = await repository.searchFoods('chicken');
+    await expectLater(
+      repository.searchFoods('chicken'),
+      throwsA(
+        isA<AppError>().having(
+          (error) => error.code,
+          'code',
+          AppErrorCode.serverUnavailable,
+        ),
+      ),
+    );
     await repository.saveFoodLogs(
       _liveSession,
       [
@@ -272,9 +283,8 @@ void main() {
       ],
     );
 
-    expect(suggestions, isEmpty);
-    expect(adapter.createdFoodPayloads.single['name'], 'Manual chicken');
-    expect(adapter.foodLogPayloads.single['food_id'], 'custom-food-1');
+    final entries = adapter.atomicDayPayloads.single['entries'] as List;
+    expect(entries.single['food_name'], 'Manual chicken');
   });
 
   test('food search caches normalized repeated queries', () async {
@@ -292,6 +302,129 @@ void main() {
 
     expect(adapter.foodSearchPaths, ['/food/search']);
     expect(adapter.foodSearchQueryParameters.single, {'q': 'chicken'});
+  });
+
+  test('food search handles whitespace, case, partial and encoded query data',
+      () async {
+    final adapter = _NutritionDioAdapter();
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiNutritionRepository(dio);
+
+    expect(await repository.searchFoods('   ', _liveSession), isEmpty);
+    await repository.searchFoods(' Crème & RICE ', _liveSession);
+
+    expect(adapter.foodSearchPaths, hasLength(1));
+    expect(adapter.foodSearchQueryParameters.single, {'q': 'crème & rice'});
+    expect(
+      adapter.foodSearchHeaders.single['Authorization'],
+      'Bearer token',
+    );
+  });
+
+  test('food search distinguishes empty, malformed and HTTP failures',
+      () async {
+    final adapter = _NutritionDioAdapter()..emptyFoodSearch = true;
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiNutritionRepository(
+      dio,
+      searchCacheTtl: Duration.zero,
+    );
+
+    expect(await repository.searchFoods('none', _liveSession), isEmpty);
+
+    adapter
+      ..emptyFoodSearch = false
+      ..malformedFoodSearch = true;
+    await expectLater(
+      repository.searchFoods('bad', _liveSession),
+      throwsA(
+        isA<AppError>().having(
+          (error) => error.code,
+          'code',
+          AppErrorCode.malformedResponse,
+        ),
+      ),
+    );
+
+    adapter
+      ..malformedFoodSearch = false
+      ..foodSearchStatus = 422;
+    await expectLater(
+      repository.searchFoods('invalid', _liveSession),
+      throwsA(isA<AppError>().having(
+        (error) => error.code,
+        'code',
+        AppErrorCode.validationFailed,
+      )),
+    );
+    adapter.foodSearchStatus = 401;
+    await expectLater(
+      repository.searchFoods('private', _liveSession),
+      throwsA(isA<AppError>().having(
+        (error) => error.code,
+        'code',
+        AppErrorCode.sessionExpired,
+      )),
+    );
+    adapter.foodSearchStatus = 500;
+    await expectLater(
+      repository.searchFoods('server', _liveSession),
+      throwsA(isA<AppError>().having(
+        (error) => error.code,
+        'code',
+        AppErrorCode.serverUnavailable,
+      )),
+    );
+  });
+
+  test('food search labels cached offline results and propagates timeout',
+      () async {
+    final adapter = _NutritionDioAdapter();
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    final repository = FastApiNutritionRepository(
+      dio,
+      searchCacheTtl: Duration.zero,
+    );
+
+    await repository.searchFoods('yogurt', _liveSession);
+    adapter.offlineFoodSearch = true;
+    await expectLater(
+      repository.searchFoods('yogurt', _liveSession),
+      throwsA(
+        isA<CachedSearchResultsException<FoodSuggestion>>().having(
+          (error) => error.results.single.name,
+          'cached result',
+          'Greek yogurt',
+        ),
+      ),
+    );
+
+    adapter
+      ..offlineFoodSearch = false
+      ..timeoutFoodSearch = true;
+    await expectLater(
+      repository.searchFoods('timeout', _liveSession),
+      throwsA(isA<AppError>().having(
+        (error) => error.code,
+        'code',
+        AppErrorCode.requestTimeout,
+      )),
+    );
   });
 
   test('delete removes backend log and refreshes summary', () async {
@@ -323,7 +456,7 @@ void main() {
     await repository.saveFoodLogs(_liveSession, const []);
     final summary = await repository.loadSummary(_liveSession);
 
-    expect(adapter.deletedLogIds, ['log-delete']);
+    expect(adapter.atomicDayPayloads.single['entries'], isEmpty);
     expect(summary.consumedCalories, 0);
     expect(summary.proteinConsumed, 0);
   });
@@ -375,11 +508,34 @@ void main() {
       ],
     );
 
-    expect(adapter.patchedFoodLogPayloads, [
-      {
-        'quantity_grams': 150.0,
-      },
-    ]);
+    final entries = adapter.atomicDayPayloads.single['entries'] as List;
+    expect(entries.single['food_log_id'], 'log-edit');
+    expect(entries.single['quantity_grams'], 150.0);
+  });
+
+  test('stale day revision is reported as a conflict without overwrite',
+      () async {
+    final adapter = _NutritionDioAdapter()..atomicConflict = true;
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://example.test/api/v1',
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    )..httpClientAdapter = adapter;
+    const outbox = OfflineOutboxStore();
+    final repository = FastApiNutritionRepository(dio, outbox: outbox);
+
+    await expectLater(
+      repository.saveFoodLogs(
+        _liveSession,
+        [FoodLogDraft.empty.copyWith(foodName: 'Stale edit')],
+      ),
+      throwsA(isA<NutritionMutationConflictException>()),
+    );
+
+    final queued = await outbox.load(_liveSession);
+    expect(queued, hasLength(1));
+    expect(queued.single.needsReview, isTrue);
   });
 
   test('food summary 404 falls back to food-log list aggregation', () async {
@@ -428,8 +584,7 @@ void main() {
     expect(summary.fatConsumed, 10);
   });
 
-  test('nutrition logs queue offline and flush food create before food log',
-      () async {
+  test('nutrition response loss replays the same atomic mutation id', () async {
     SharedPreferences.setMockInitialValues({});
     final adapter = _NutritionDioAdapter()..offlineFoodCreate = true;
     final dio = Dio(
@@ -441,31 +596,37 @@ void main() {
     const outbox = OfflineOutboxStore();
     final repository = FastApiNutritionRepository(dio, outbox: outbox);
 
-    final local = await repository.saveFoodLogs(
-      _liveSession,
-      [
-        FoodLogDraft.empty.copyWith(
-          foodName: 'Offline paneer',
-          quantityGrams: 150,
-          quantitySource: QuantitySource.explicit,
-          mealType: MealType.dinner,
-          calories: 420,
-          protein: 28,
-          carbs: 24,
-          fat: 22,
-        ),
-      ],
+    await expectLater(
+      repository.saveFoodLogs(
+        _liveSession,
+        [
+          FoodLogDraft.empty.copyWith(
+            foodName: 'Offline paneer',
+            quantityGrams: 150,
+            quantitySource: QuantitySource.explicit,
+            mealType: MealType.dinner,
+            calories: 420,
+            protein: 28,
+            carbs: 24,
+            fat: 22,
+          ),
+        ],
+      ),
+      throwsA(isA<NutritionMutationPendingException>()),
     );
-
-    expect(local.single.foodName, 'Offline paneer');
-    expect(await outbox.load(_liveSession), hasLength(1));
+    final queued = await outbox.load(_liveSession);
+    expect(queued, hasLength(1));
 
     adapter.offlineFoodCreate = false;
     await repository.flushPending(_liveSession);
 
-    expect(adapter.createdFoodPayloads, hasLength(1));
-    expect(adapter.foodLogPayloads, hasLength(1));
-    expect(adapter.foodLogPayloads.single['food_id'], 'custom-food-1');
+    expect(adapter.atomicDayPayloads, hasLength(2));
+    expect(
+      adapter.atomicDayPayloads
+          .map((payload) => payload['client_mutation_id'])
+          .toSet(),
+      {queued.single.localId},
+    );
     expect(await outbox.load(_liveSession), isEmpty);
   });
 
@@ -514,7 +675,7 @@ void main() {
     );
     final summary = await repository.loadSummary(null);
 
-    expect(saved, hasLength(1));
+    expect(saved.entries, hasLength(1));
     expect(summary.consumedCalories, 220);
     expect(summary.proteinConsumed, 12);
   });
@@ -579,14 +740,24 @@ class _LiveTotalsNutritionRepository implements NutritionRepository {
   }
 
   @override
-  Future<List<FoodSuggestion>> searchFoods(String query) async => const [];
+  Future<List<FoodSuggestion>> searchFoods(
+    String query, [
+    AuthSession? session,
+  ]) async =>
+      const [];
 
   @override
-  Future<List<FoodLogDraft>> saveFoodLogs(
+  Future<NutritionMutationResult> saveFoodLogs(
     AuthSession? session,
     List<FoodLogDraft> logs,
   ) async {
-    return logs;
+    return NutritionMutationResult(
+      entries: logs,
+      summary: await loadSummary(session),
+      mutationId: 'test-mutation',
+      revision: 'test-revision',
+      syncStatus: NutritionMutationSyncStatus.synced,
+    );
   }
 
   @override
@@ -601,12 +772,20 @@ class _NutritionDioAdapter implements HttpClientAdapter {
   final summaryPaths = <String>[];
   final foodSearchPaths = <String>[];
   final foodSearchQueryParameters = <Map<String, dynamic>>[];
+  final atomicDayPayloads = <Map<String, dynamic>>[];
   List<Map<String, dynamic>> existingLogs = [];
   double summaryCalories = 500;
   double summaryProtein = 35;
   bool summaryUnsupported = false;
   bool offlineFoodCreate = false;
+  bool atomicConflict = false;
   bool failFoodSearch = false;
+  bool offlineFoodSearch = false;
+  bool timeoutFoodSearch = false;
+  bool malformedFoodSearch = false;
+  bool emptyFoodSearch = false;
+  int foodSearchStatus = 200;
+  final foodSearchHeaders = <Map<String, dynamic>>[];
 
   String get today => DateTime.now().toIso8601String().substring(0, 10);
 
@@ -643,8 +822,36 @@ class _NutritionDioAdapter implements HttpClientAdapter {
       foodSearchQueryParameters.add(Map<String, dynamic>.from(
         options.queryParameters,
       ));
+      foodSearchHeaders.add(Map<String, dynamic>.from(options.headers));
+      if (offlineFoodSearch) {
+        throw DioException(
+          requestOptions: options,
+          type: DioExceptionType.connectionError,
+          error: 'offline',
+        );
+      }
+      if (timeoutFoodSearch) {
+        throw DioException(
+          requestOptions: options,
+          type: DioExceptionType.receiveTimeout,
+        );
+      }
       if (failFoodSearch) {
         return _json(500, {'detail': 'USDA unavailable'});
+      }
+      if (foodSearchStatus != 200) {
+        return _json(foodSearchStatus, {'detail': 'search rejected'});
+      }
+      if (malformedFoodSearch) {
+        return _json(200, {
+          'success': true,
+          'data': [
+            {'food_id': '', 'name': ''}
+          ],
+        });
+      }
+      if (emptyFoodSearch) {
+        return _json(200, {'success': true, 'data': <Object>[]});
       }
       return _json(200, {
         'success': true,
@@ -659,6 +866,68 @@ class _NutritionDioAdapter implements HttpClientAdapter {
             'source': 'Catalog',
           },
         ],
+      });
+    }
+    if (options.method == 'PUT' && options.path.startsWith('/food-log/day/')) {
+      final payload = Map<String, dynamic>.from(options.data as Map);
+      atomicDayPayloads.add(payload);
+      if (atomicConflict) {
+        return _json(409, {
+          'success': false,
+          'error': {'code': 'REVISION_CONFLICT'}
+        });
+      }
+      if (offlineFoodCreate) {
+        throw DioException(
+          requestOptions: options,
+          type: DioExceptionType.connectionError,
+          error: 'offline',
+        );
+      }
+      final requested = (payload['entries'] as List? ?? const [])
+          .cast<Map>()
+          .map((entry) => Map<String, dynamic>.from(entry))
+          .toList();
+      final committed = requested.asMap().entries.map((indexed) {
+        final entry = indexed.value;
+        return {
+          ...entry,
+          'food_log_id': entry['food_log_id'] ?? 'log-${indexed.key + 1}',
+          'quantity_g': entry['quantity_grams'],
+          'log_date': payload['date'],
+          'calories_snapshot': entry['calories'] ?? 0,
+          'protein_snapshot': entry['protein'] ?? 0,
+          'carbs_snapshot': entry['carbs'] ?? 0,
+          'fat_snapshot': entry['fat'] ?? 0,
+        };
+      }).toList();
+      existingLogs = committed;
+      return _json(200, {
+        'success': true,
+        'data': {
+          'entries': committed,
+          'revision': 'revision-${atomicDayPayloads.length}',
+          'totals': {
+            'total_calories': committed.fold<num>(
+              0,
+              (total, entry) =>
+                  total + (entry['calories_snapshot'] as num? ?? 0),
+            ),
+            'total_protein': committed.fold<num>(
+              0,
+              (total, entry) =>
+                  total + (entry['protein_snapshot'] as num? ?? 0),
+            ),
+            'total_carbs': committed.fold<num>(
+              0,
+              (total, entry) => total + (entry['carbs_snapshot'] as num? ?? 0),
+            ),
+            'total_fat': committed.fold<num>(
+              0,
+              (total, entry) => total + (entry['fat_snapshot'] as num? ?? 0),
+            ),
+          },
+        },
       });
     }
     if (options.method == 'POST' && options.path == '/food') {

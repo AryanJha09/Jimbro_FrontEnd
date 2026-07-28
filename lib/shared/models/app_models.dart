@@ -78,57 +78,84 @@ class UserProfile {
   });
 
   final String name;
-  final String goal;
-  final String coachingPreference;
-  final UserLevel userLevel;
-  final int age;
-  final double heightCm;
-  final double weightKg;
-  final String sex;
-  final int availableTimeMinutes;
-  final String trainingPreference;
-  final String activityLevel;
-  final String dietaryPreference;
-  final String goalTimeframe;
-  final int weeksActive;
-  final bool prefersVoiceLogging;
+  final String? goal;
+  final String? coachingPreference;
+  final UserLevel? userLevel;
+  final int? age;
+  final double? heightCm;
+  final double? weightKg;
+  final String? sex;
+  final int? availableTimeMinutes;
+  final String? trainingPreference;
+  final String? activityLevel;
+  final String? dietaryPreference;
+  final String? goalTimeframe;
+  final int? weeksActive;
+  final bool? prefersVoiceLogging;
 
   UserProfile copyWith({
     String? name,
-    String? goal,
-    String? coachingPreference,
-    UserLevel? userLevel,
-    int? age,
-    double? heightCm,
-    double? weightKg,
-    String? sex,
-    int? availableTimeMinutes,
-    String? trainingPreference,
-    String? activityLevel,
-    String? dietaryPreference,
-    String? goalTimeframe,
-    int? weeksActive,
-    bool? prefersVoiceLogging,
+    Object? goal = _unsetProfileField,
+    Object? coachingPreference = _unsetProfileField,
+    Object? userLevel = _unsetProfileField,
+    Object? age = _unsetProfileField,
+    Object? heightCm = _unsetProfileField,
+    Object? weightKg = _unsetProfileField,
+    Object? sex = _unsetProfileField,
+    Object? availableTimeMinutes = _unsetProfileField,
+    Object? trainingPreference = _unsetProfileField,
+    Object? activityLevel = _unsetProfileField,
+    Object? dietaryPreference = _unsetProfileField,
+    Object? goalTimeframe = _unsetProfileField,
+    Object? weeksActive = _unsetProfileField,
+    Object? prefersVoiceLogging = _unsetProfileField,
   }) {
     return UserProfile(
       name: name ?? this.name,
-      goal: goal ?? this.goal,
-      coachingPreference: coachingPreference ?? this.coachingPreference,
-      userLevel: userLevel ?? this.userLevel,
-      age: age ?? this.age,
-      heightCm: heightCm ?? this.heightCm,
-      weightKg: weightKg ?? this.weightKg,
-      sex: sex ?? this.sex,
-      availableTimeMinutes: availableTimeMinutes ?? this.availableTimeMinutes,
-      trainingPreference: trainingPreference ?? this.trainingPreference,
-      activityLevel: activityLevel ?? this.activityLevel,
-      dietaryPreference: dietaryPreference ?? this.dietaryPreference,
-      goalTimeframe: goalTimeframe ?? this.goalTimeframe,
-      weeksActive: weeksActive ?? this.weeksActive,
-      prefersVoiceLogging: prefersVoiceLogging ?? this.prefersVoiceLogging,
+      goal: identical(goal, _unsetProfileField) ? this.goal : goal as String?,
+      coachingPreference: identical(
+        coachingPreference,
+        _unsetProfileField,
+      )
+          ? this.coachingPreference
+          : coachingPreference as String?,
+      userLevel: identical(userLevel, _unsetProfileField)
+          ? this.userLevel
+          : userLevel as UserLevel?,
+      age: identical(age, _unsetProfileField) ? this.age : age as int?,
+      heightCm: identical(heightCm, _unsetProfileField)
+          ? this.heightCm
+          : (heightCm as num?)?.toDouble(),
+      weightKg: identical(weightKg, _unsetProfileField)
+          ? this.weightKg
+          : (weightKg as num?)?.toDouble(),
+      sex: identical(sex, _unsetProfileField) ? this.sex : sex as String?,
+      availableTimeMinutes: identical(availableTimeMinutes, _unsetProfileField)
+          ? this.availableTimeMinutes
+          : availableTimeMinutes as int?,
+      trainingPreference: identical(trainingPreference, _unsetProfileField)
+          ? this.trainingPreference
+          : trainingPreference as String?,
+      activityLevel: identical(activityLevel, _unsetProfileField)
+          ? this.activityLevel
+          : activityLevel as String?,
+      dietaryPreference: identical(dietaryPreference, _unsetProfileField)
+          ? this.dietaryPreference
+          : dietaryPreference as String?,
+      goalTimeframe: identical(goalTimeframe, _unsetProfileField)
+          ? this.goalTimeframe
+          : goalTimeframe as String?,
+      weeksActive: identical(weeksActive, _unsetProfileField)
+          ? this.weeksActive
+          : weeksActive as int?,
+      prefersVoiceLogging: identical(prefersVoiceLogging, _unsetProfileField)
+          ? this.prefersVoiceLogging
+          : prefersVoiceLogging as bool?,
     );
   }
 }
+
+const Object _unsetProfileField = Object();
 
 class UserStaticMetrics {
   const UserStaticMetrics({
@@ -472,6 +499,295 @@ class WorkoutLogDraft {
   );
 }
 
+enum ActiveWorkoutLifecycle { active, finishing, discarded }
+
+enum ActiveWorkoutLocalStatus { dirty, checkpointing, checkpointed, corrupted }
+
+enum ActiveWorkoutRemoteStatus { localOnly, pendingSync, synced, failed }
+
+/// Mutable, locally durable state for exactly one in-progress workout.
+///
+/// This deliberately does not share identity with [WorkoutTemplateDraft]. A
+/// session copies a template's defaults once and all later edits stay here.
+class ActiveWorkoutSession {
+  const ActiveWorkoutSession({
+    required this.sessionId,
+    required this.sourceTemplateId,
+    required this.name,
+    required this.notes,
+    required this.exercises,
+    required this.startedAt,
+    required this.lastCheckpointAt,
+    required this.revision,
+    required this.restDeadline,
+    required this.localStatus,
+    required this.remoteStatus,
+    required this.lifecycle,
+  });
+
+  final String sessionId;
+  final int? sourceTemplateId;
+  final String name;
+  final String notes;
+  final List<WorkoutExerciseDraft> exercises;
+  final DateTime startedAt;
+  final DateTime? lastCheckpointAt;
+  final int revision;
+  final DateTime? restDeadline;
+  final ActiveWorkoutLocalStatus localStatus;
+  final ActiveWorkoutRemoteStatus remoteStatus;
+  final ActiveWorkoutLifecycle lifecycle;
+
+  bool get isActive => lifecycle == ActiveWorkoutLifecycle.active;
+  bool get isFinishing => lifecycle == ActiveWorkoutLifecycle.finishing;
+
+  ActiveWorkoutSession copyWith({
+    String? sessionId,
+    Object? sourceTemplateId = _unset,
+    String? name,
+    String? notes,
+    List<WorkoutExerciseDraft>? exercises,
+    DateTime? startedAt,
+    Object? lastCheckpointAt = _unset,
+    int? revision,
+    Object? restDeadline = _unset,
+    ActiveWorkoutLocalStatus? localStatus,
+    ActiveWorkoutRemoteStatus? remoteStatus,
+    ActiveWorkoutLifecycle? lifecycle,
+  }) {
+    return ActiveWorkoutSession(
+      sessionId: sessionId ?? this.sessionId,
+      sourceTemplateId: identical(sourceTemplateId, _unset)
+          ? this.sourceTemplateId
+          : sourceTemplateId as int?,
+      name: name ?? this.name,
+      notes: notes ?? this.notes,
+      exercises: exercises ?? this.exercises,
+      startedAt: startedAt ?? this.startedAt,
+      lastCheckpointAt: identical(lastCheckpointAt, _unset)
+          ? this.lastCheckpointAt
+          : lastCheckpointAt as DateTime?,
+      revision: revision ?? this.revision,
+      restDeadline: identical(restDeadline, _unset)
+          ? this.restDeadline
+          : restDeadline as DateTime?,
+      localStatus: localStatus ?? this.localStatus,
+      remoteStatus: remoteStatus ?? this.remoteStatus,
+      lifecycle: lifecycle ?? this.lifecycle,
+    );
+  }
+
+  WorkoutLogDraft toCompletedDraft(DateTime endedAt) => WorkoutLogDraft(
+        templateId: sourceTemplateId,
+        name: name,
+        notes: notes,
+        startedAtLabel: startedAt.toIso8601String(),
+        endedAtLabel: endedAt.toIso8601String(),
+        exercises: exercises,
+      );
+
+  Map<String, Object?> toJson() => {
+        'version': 1,
+        'session_id': sessionId,
+        'source_template_id': sourceTemplateId,
+        'name': name,
+        'notes': notes,
+        'started_at': startedAt.toIso8601String(),
+        'last_checkpoint_at': lastCheckpointAt?.toIso8601String(),
+        'revision': revision,
+        'rest_deadline': restDeadline?.toIso8601String(),
+        'local_status': localStatus.name,
+        'remote_status': remoteStatus.name,
+        'lifecycle': lifecycle.name,
+        'exercises': exercises
+            .map(
+              (exercise) => {
+                'exercise_id': exercise.exerciseId,
+                'exercise_name': exercise.exerciseName,
+                'notes': exercise.notes,
+                'target_sets': exercise.targetSets,
+                'target_reps': exercise.targetReps,
+                'sets': exercise.sets
+                    .map(
+                      (set) => {
+                        'set_number': set.setNumber,
+                        'weight_kg': set.weightKg,
+                        'reps': set.reps,
+                        'is_warmup': set.isWarmup,
+                        'is_completed': set.isCompleted,
+                        'rpe': set.rpe,
+                      },
+                    )
+                    .toList(growable: false),
+              },
+            )
+            .toList(growable: false),
+      };
+
+  static ActiveWorkoutSession fromJson(Map<String, dynamic> json) {
+    if (json['version'] != 1) {
+      throw const FormatException('Unsupported active workout checkpoint.');
+    }
+    final sessionId = json['session_id']?.toString().trim() ?? '';
+    final startedAt = DateTime.tryParse(json['started_at']?.toString() ?? '');
+    final rawExercises = json['exercises'];
+    if (sessionId.isEmpty || startedAt == null || rawExercises is! List) {
+      throw const FormatException('Invalid active workout checkpoint.');
+    }
+    return ActiveWorkoutSession(
+      sessionId: sessionId,
+      sourceTemplateId: _activeNullableInt(json['source_template_id']),
+      name: json['name']?.toString() ?? '',
+      notes: json['notes']?.toString() ?? '',
+      exercises: rawExercises.map((rawExercise) {
+        final exercise = Map<String, dynamic>.from(rawExercise as Map);
+        final rawSets = exercise['sets'];
+        if (rawSets is! List) {
+          throw const FormatException('Invalid active workout sets.');
+        }
+        return WorkoutExerciseDraft(
+          exerciseId: _activeNullableInt(exercise['exercise_id']),
+          exerciseName: exercise['exercise_name']?.toString() ?? '',
+          notes: exercise['notes']?.toString() ?? '',
+          targetSets: _activeInt(exercise['target_sets']),
+          targetReps: _activeInt(exercise['target_reps']),
+          sets: rawSets.map((rawSet) {
+            final set = Map<String, dynamic>.from(rawSet as Map);
+            return SetDraft(
+              setNumber: _activeInt(set['set_number']),
+              weightKg: _activeDouble(set['weight_kg']),
+              reps: _activeInt(set['reps']),
+              isWarmup: set['is_warmup'] == true,
+              isCompleted: set['is_completed'] == true,
+              rpe: _activeDouble(set['rpe']),
+            );
+          }).toList(growable: false),
+        );
+      }).toList(growable: false),
+      startedAt: startedAt,
+      lastCheckpointAt:
+          DateTime.tryParse(json['last_checkpoint_at']?.toString() ?? ''),
+      revision: _activeInt(json['revision']),
+      restDeadline: DateTime.tryParse(json['rest_deadline']?.toString() ?? ''),
+      localStatus: _activeEnum(
+        ActiveWorkoutLocalStatus.values,
+        json['local_status'],
+        ActiveWorkoutLocalStatus.checkpointed,
+      ),
+      remoteStatus: _activeEnum(
+        ActiveWorkoutRemoteStatus.values,
+        json['remote_status'],
+        ActiveWorkoutRemoteStatus.localOnly,
+      ),
+      lifecycle: _activeEnum(
+        ActiveWorkoutLifecycle.values,
+        json['lifecycle'],
+        ActiveWorkoutLifecycle.active,
+      ),
+    );
+  }
+}
+
+T _activeEnum<T extends Enum>(List<T> values, Object? raw, T fallback) {
+  final name = raw?.toString();
+  for (final value in values) {
+    if (value.name == name) {
+      return value;
+    }
+  }
+  return fallback;
+}
+
+int _activeInt(Object? value) =>
+    value is num ? value.toInt() : int.tryParse('$value') ?? 0;
+
+int? _activeNullableInt(Object? value) => value == null
+    ? null
+    : value is num
+        ? value.toInt()
+        : int.tryParse('$value');
+
+double _activeDouble(Object? value) =>
+    value is num ? value.toDouble() : double.tryParse('$value') ?? 0;
+
+/// Read-only historical projection used by workout history routes.
+class CompletedWorkoutSnapshot {
+  const CompletedWorkoutSnapshot({
+    required this.logId,
+    required this.startedAt,
+    required this.completedAt,
+    required this.name,
+    required this.notes,
+    required this.exercises,
+    required this.syncStatus,
+  });
+
+  final int logId;
+  final DateTime startedAt;
+  final DateTime completedAt;
+  final String name;
+  final String notes;
+  final List<WorkoutExerciseDraft> exercises;
+  final WorkoutSyncStatus syncStatus;
+
+  int get totalSets => exercises.fold(
+        0,
+        (total, exercise) => total + exercise.sets.length,
+      );
+
+  double get totalLoadKg => exercises.fold(
+        0,
+        (total, exercise) =>
+            total +
+            exercise.sets.fold(
+              0,
+              (setTotal, set) => setTotal + (set.weightKg * set.reps),
+            ),
+      );
+}
+
+enum WorkoutSyncStatus { synced, pendingSync, failed, needsReview }
+
+class WorkoutMutationResult {
+  const WorkoutMutationResult({
+    required this.localWorkoutId,
+    required this.mutationId,
+    required this.syncStatus,
+    required this.errorCode,
+    required this.retryable,
+    this.serverLogId,
+    this.authoritativeWorkout,
+  });
+
+  final String localWorkoutId;
+  final int? serverLogId;
+  final String mutationId;
+  final WorkoutSyncStatus syncStatus;
+  final String? errorCode;
+  final bool retryable;
+  final WorkoutLogDraft? authoritativeWorkout;
+
+  bool get isSynced => syncStatus == WorkoutSyncStatus.synced;
+}
+
+enum NutritionMutationSyncStatus { synced, pendingSync, conflict }
+
+class NutritionMutationResult {
+  const NutritionMutationResult({
+    required this.entries,
+    required this.summary,
+    required this.mutationId,
+    required this.revision,
+    required this.syncStatus,
+  });
+
+  final List<FoodLogDraft> entries;
+  final DailyNutritionSummary summary;
+  final String mutationId;
+  final String revision;
+  final NutritionMutationSyncStatus syncStatus;
+}
+
 class FoodLogDraft {
   const FoodLogDraft({
     this.foodLogId,
@@ -482,6 +798,7 @@ class FoodLogDraft {
     this.proteinPer100g,
     this.carbsPer100g,
     this.fatPer100g,
+    this.isDirty = false,
     required this.foodName,
     required this.quantityGrams,
     required this.mealType,
@@ -499,6 +816,7 @@ class FoodLogDraft {
   final double? proteinPer100g;
   final double? carbsPer100g;
   final double? fatPer100g;
+  final bool isDirty;
   final String foodName;
   final double quantityGrams;
   final MealType mealType;
@@ -516,6 +834,7 @@ class FoodLogDraft {
     Object? proteinPer100g = _unset,
     Object? carbsPer100g = _unset,
     Object? fatPer100g = _unset,
+    bool? isDirty,
     String? foodName,
     double? quantityGrams,
     MealType? mealType,
@@ -542,6 +861,7 @@ class FoodLogDraft {
       fatPer100g: identical(fatPer100g, _unset)
           ? this.fatPer100g
           : fatPer100g as double?,
+      isDirty: isDirty ?? this.isDirty,
       foodName: foodName ?? this.foodName,
       quantityGrams: quantityGrams ?? this.quantityGrams,
       mealType: mealType ?? this.mealType,
@@ -553,6 +873,7 @@ class FoodLogDraft {
   }
 
   static final empty = FoodLogDraft(
+    isDirty: true,
     foodName: '',
     quantityGrams: 100,
     mealType: MealType.snack,
@@ -885,7 +1206,6 @@ class AppDraftState {
     required this.foodLogs,
     required this.nutritionSummary,
     required this.consistency,
-    required this.search,
     this.profileSyncStatus = ProfileSyncStatus.synced,
     this.atlasMetricsStatus = AtlasMetricsStatus.unavailable,
     this.lastLocalProfileUpdate,
@@ -893,6 +1213,9 @@ class AppDraftState {
     this.lastSyncErrorCode,
     this.programGenerationChoice = ProgramGenerationChoice.pending,
     this.programGenerationStatus = ProgramGenerationStatus.idle,
+    this.templateDraftDirty = false,
+    this.templatesAreStale = false,
+    this.lastWorkoutMutation,
   });
 
   final AuthSession? session;
@@ -905,7 +1228,6 @@ class AppDraftState {
   final List<FoodLogDraft> foodLogs;
   final DailyNutritionSummary nutritionSummary;
   final ConsistencyState consistency;
-  final SearchState search;
   final ProfileSyncStatus profileSyncStatus;
   final AtlasMetricsStatus atlasMetricsStatus;
   final DateTime? lastLocalProfileUpdate;
@@ -913,6 +1235,9 @@ class AppDraftState {
   final String? lastSyncErrorCode;
   final ProgramGenerationChoice programGenerationChoice;
   final ProgramGenerationStatus programGenerationStatus;
+  final bool templateDraftDirty;
+  final bool templatesAreStale;
+  final WorkoutMutationResult? lastWorkoutMutation;
 
   AppDraftState copyWith({
     AuthSession? session,
@@ -925,7 +1250,6 @@ class AppDraftState {
     List<FoodLogDraft>? foodLogs,
     DailyNutritionSummary? nutritionSummary,
     ConsistencyState? consistency,
-    SearchState? search,
     ProfileSyncStatus? profileSyncStatus,
     AtlasMetricsStatus? atlasMetricsStatus,
     Object? lastLocalProfileUpdate = _unset,
@@ -933,6 +1257,9 @@ class AppDraftState {
     Object? lastSyncErrorCode = _unset,
     ProgramGenerationChoice? programGenerationChoice,
     ProgramGenerationStatus? programGenerationStatus,
+    bool? templateDraftDirty,
+    bool? templatesAreStale,
+    Object? lastWorkoutMutation = _unset,
   }) {
     return AppDraftState(
       session: session ?? this.session,
@@ -945,7 +1272,6 @@ class AppDraftState {
       foodLogs: foodLogs ?? this.foodLogs,
       nutritionSummary: nutritionSummary ?? this.nutritionSummary,
       consistency: consistency ?? this.consistency,
-      search: search ?? this.search,
       profileSyncStatus: profileSyncStatus ?? this.profileSyncStatus,
       atlasMetricsStatus: atlasMetricsStatus ?? this.atlasMetricsStatus,
       lastLocalProfileUpdate: identical(lastLocalProfileUpdate, _unset)
@@ -961,6 +1287,11 @@ class AppDraftState {
           programGenerationChoice ?? this.programGenerationChoice,
       programGenerationStatus:
           programGenerationStatus ?? this.programGenerationStatus,
+      templateDraftDirty: templateDraftDirty ?? this.templateDraftDirty,
+      templatesAreStale: templatesAreStale ?? this.templatesAreStale,
+      lastWorkoutMutation: identical(lastWorkoutMutation, _unset)
+          ? this.lastWorkoutMutation
+          : lastWorkoutMutation as WorkoutMutationResult?,
     );
   }
 }

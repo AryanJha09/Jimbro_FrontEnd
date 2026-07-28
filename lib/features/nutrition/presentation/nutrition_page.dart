@@ -1,12 +1,12 @@
 import 'dart:async';
 
-import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../core/errors/app_error.dart';
 import '../../../core/navigation/app_state.dart';
+import '../../../core/repositories/app_repositories.dart';
 import '../../../core/theme/jim_tokens.dart';
-import '../../../shared/components/action_state.dart';
 import '../../../shared/components/backend_state_view.dart';
 import '../../../shared/components/insight_card.dart';
 import '../../../shared/components/jim_page_scaffold.dart';
@@ -64,16 +64,6 @@ class _NutritionContent extends ConsumerWidget {
                 subtitle: summary.targetCalories > 0
                     ? '${_formatNumber(summary.remainingCalories)} calories left'
                     : '${_formatNumber(summary.consumedCalories)} calories logged',
-                trailing: JimGuardedIconButton(
-                  tooltip: 'Save day',
-                  onRun: () => controller.saveNutritionLogs(),
-                  onSuccess: () => _showNutritionSuccess(
-                    context,
-                    'Nutrition logs saved to Supabase.',
-                  ),
-                  onError: (error) => _showNutritionFailure(context, error),
-                  icon: Icons.save_rounded,
-                ),
               ),
               const SizedBox(height: 14),
               _MacroSummaryGrid(summary: summary),
@@ -117,7 +107,9 @@ class _NutritionContent extends ConsumerWidget {
               entries: groupedMeals[mealType] ?? const [],
               onAddFood: () => controller.addFoodLog(mealType),
               onChanged: controller.updateFoodLog,
-              onRemove: controller.removeFoodLog,
+              onLog: controller.saveNutritionLogs,
+              onDelete: controller.deleteFoodLog,
+              onUndoDelete: controller.restoreDeletedFoodLog,
             ),
           ),
         ),
@@ -132,6 +124,13 @@ class _NutritionContent extends ConsumerWidget {
                 consumedLiters: summary.hydrationConsumedLiters,
                 targetLiters: summary.hydrationTargetLiters,
                 onChanged: controller.updateHydration,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Hydration is kept on this screen only and is not synced yet.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: JimColors.terracotta,
+                ),
               ),
             ],
           ),
@@ -282,22 +281,39 @@ class _MacroProgress extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final progress = target <= 0 ? 0.0 : (consumed / target).clamp(0.0, 1.0);
+    final value = '${_formatNumber(consumed)} / ${_formatNumber(target)} $unit';
+    final useStackedLabels = MediaQuery.textScalerOf(context).scale(1) > 1;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            Expanded(
-              child: Text(label, style: theme.textTheme.labelLarge),
-            ),
-            Text(
-              '${_formatNumber(consumed)} / ${_formatNumber(target)} $unit',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: JimColors.inkMuted,
+        if (useStackedLabels)
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(label, style: theme.textTheme.labelLarge),
+              const SizedBox(height: JimSpacing.xxs),
+              Text(
+                value,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: JimColors.inkMuted,
+                ),
               ),
-            ),
-          ],
-        ),
+            ],
+          )
+        else
+          Row(
+            children: [
+              Expanded(
+                child: Text(label, style: theme.textTheme.labelLarge),
+              ),
+              Text(
+                value,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: JimColors.inkMuted,
+                ),
+              ),
+            ],
+          ),
         const SizedBox(height: 6),
         ClipRRect(
           borderRadius: BorderRadius.circular(JimRadius.pill),
@@ -313,57 +329,69 @@ class _MacroProgress extends StatelessWidget {
   }
 }
 
-class _MealSection extends StatelessWidget {
+class _MealSection extends StatefulWidget {
   const _MealSection({
     required this.mealType,
     required this.entries,
     required this.onAddFood,
     required this.onChanged,
-    required this.onRemove,
+    required this.onLog,
+    required this.onDelete,
+    required this.onUndoDelete,
   });
 
   final MealType mealType;
   final List<_MealFoodLogEntry> entries;
   final VoidCallback onAddFood;
   final Future<void> Function(int index, FoodLogDraft foodLog) onChanged;
-  final Future<void> Function(int index) onRemove;
+  final Future<NutritionMutationResult> Function() onLog;
+  final Future<FoodLogDraft> Function(int index) onDelete;
+  final Future<void> Function(int index, FoodLogDraft deleted) onUndoDelete;
+
+  @override
+  State<_MealSection> createState() => _MealSectionState();
+}
+
+class _MealSectionState extends State<_MealSection> {
+  static const _pageSize = 20;
+  int _visibleCount = _pageSize;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final calories = entries.fold<double>(
+    final calories = widget.entries.fold<double>(
       0,
       (total, entry) => total + entry.foodLog.calories,
     );
-    final protein = entries.fold<double>(
+    final protein = widget.entries.fold<double>(
       0,
       (total, entry) => total + entry.foodLog.protein,
     );
-    final mealLabel = _mealTypeLabel(mealType);
+    final mealLabel = _mealTypeLabel(widget.mealType);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         SectionHeader(
           eyebrow: mealLabel.toUpperCase(),
           title: '$mealLabel · ${_formatNumber(calories)} kcal',
-          subtitle: entries.isEmpty
+          subtitle: widget.entries.isEmpty
               ? 'No foods yet'
-              : '${entries.length} food${entries.length == 1 ? '' : 's'} · ${_formatNumber(protein)} g protein',
+              : '${widget.entries.length} food${widget.entries.length == 1 ? '' : 's'} · ${_formatNumber(protein)} g protein',
           trailing: IconButton.outlined(
-            key: ValueKey('add-food-${mealType.name}-button'),
+            key: ValueKey('add-food-${widget.mealType.name}-button'),
             tooltip: 'Add $mealLabel food',
-            onPressed: onAddFood,
+            onPressed: widget.onAddFood,
             icon: const Icon(Icons.add_rounded),
           ),
         ),
         const SizedBox(height: 10),
-        if (entries.isEmpty)
+        if (widget.entries.isEmpty)
           JimSurface(
             padding: const EdgeInsets.all(JimSpacing.md),
             tone: JimSurfaceTone.soft,
             child: Row(
               children: [
-                Icon(_mealTypeIcon(mealType), color: JimColors.inkMuted),
+                Icon(_mealTypeIcon(widget.mealType), color: JimColors.inkMuted),
                 const SizedBox(width: 10),
                 Expanded(
                   child: Text(
@@ -374,21 +402,41 @@ class _MealSection extends StatelessWidget {
                   ),
                 ),
                 TextButton(
-                  onPressed: onAddFood,
+                  onPressed: widget.onAddFood,
                   child: const Text('Add'),
                 ),
               ],
             ),
           )
         else
-          ...entries.map(
-            (entry) => Padding(
-              padding: const EdgeInsets.only(bottom: 12),
-              child: _FoodLogEditor(
-                index: entry.index,
-                foodLog: entry.foodLog,
-                onChanged: (foodLog) => onChanged(entry.index, foodLog),
-                onRemove: () => onRemove(entry.index),
+          ...widget.entries.take(_visibleCount).map(
+                (entry) => Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: _FoodLogEditor(
+                    index: entry.index,
+                    foodLog: entry.foodLog,
+                    onChanged: (foodLog) =>
+                        widget.onChanged(entry.index, foodLog),
+                    onLog: widget.onLog,
+                    onDelete: () => widget.onDelete(entry.index),
+                    onUndoDelete: (deleted) =>
+                        widget.onUndoDelete(entry.index, deleted),
+                  ),
+                ),
+              ),
+        if (_visibleCount < widget.entries.length)
+          Align(
+            alignment: Alignment.center,
+            child: TextButton.icon(
+              onPressed: () => setState(() {
+                _visibleCount = (_visibleCount + _pageSize).clamp(
+                  0,
+                  widget.entries.length,
+                );
+              }),
+              icon: const Icon(Icons.expand_more_rounded),
+              label: Text(
+                'Show more $mealLabel (${widget.entries.length - _visibleCount})',
               ),
             ),
           ),
@@ -402,13 +450,17 @@ class _FoodLogEditor extends ConsumerStatefulWidget {
     required this.index,
     required this.foodLog,
     required this.onChanged,
-    required this.onRemove,
+    required this.onLog,
+    required this.onDelete,
+    required this.onUndoDelete,
   });
 
   final int index;
   final FoodLogDraft foodLog;
   final ValueChanged<FoodLogDraft> onChanged;
-  final VoidCallback onRemove;
+  final Future<NutritionMutationResult> Function() onLog;
+  final Future<FoodLogDraft> Function() onDelete;
+  final Future<void> Function(FoodLogDraft deleted) onUndoDelete;
 
   @override
   ConsumerState<_FoodLogEditor> createState() => _FoodLogEditorState();
@@ -535,13 +587,26 @@ class _HydrationButton extends StatelessWidget {
   }
 }
 
+enum _FoodEntryStatus { editing, logged, pendingSync, failed }
+
+enum _FeatureSearchStatus {
+  idle,
+  loading,
+  results,
+  noResults,
+  cachedOffline,
+  error,
+}
+
 class _FoodLogEditorState extends ConsumerState<_FoodLogEditor> {
   Timer? _debounce;
   late final TextEditingController _nameController;
   late final TextEditingController _quantityController;
   List<FoodSuggestion> _suggestions = const [];
-  bool _isSearching = false;
-  bool _searchFailed = false;
+  late _FoodEntryStatus _entryStatus;
+  _FeatureSearchStatus _searchStatus = _FeatureSearchStatus.idle;
+  Object? _searchError;
+  bool _mutationInFlight = false;
   final _searchGate = SearchRequestGate();
 
   @override
@@ -551,6 +616,9 @@ class _FoodLogEditorState extends ConsumerState<_FoodLogEditor> {
     _quantityController = TextEditingController(
       text: _formatNumber(widget.foodLog.quantityGrams),
     );
+    _entryStatus = widget.foodLog.isDirty
+        ? _FoodEntryStatus.editing
+        : _FoodEntryStatus.logged;
   }
 
   @override
@@ -563,6 +631,11 @@ class _FoodLogEditorState extends ConsumerState<_FoodLogEditor> {
     if (_quantityController.text != quantityText) {
       _quantityController.text = quantityText;
     }
+    if (oldWidget.foodLog.isDirty && !widget.foodLog.isDirty) {
+      _entryStatus = _FoodEntryStatus.logged;
+    } else if (!oldWidget.foodLog.isDirty && widget.foodLog.isDirty) {
+      _entryStatus = _FoodEntryStatus.editing;
+    }
   }
 
   @override
@@ -573,27 +646,29 @@ class _FoodLogEditorState extends ConsumerState<_FoodLogEditor> {
     super.dispose();
   }
 
-  void _queueFoodSearch(String query) {
+  void _queueFoodSearch(String query, {bool force = false}) {
     _debounce?.cancel();
     final normalized = query.trim().toLowerCase();
     if (normalized.isEmpty) {
       _searchGate.clear();
       setState(() {
         _suggestions = const [];
-        _isSearching = false;
-        _searchFailed = false;
+        _searchStatus = _FeatureSearchStatus.idle;
+        _searchError = null;
       });
       return;
     }
 
-    if (normalized == _searchGate.activeQuery && !_isSearching) {
+    if (!force &&
+        normalized == _searchGate.activeQuery &&
+        _searchStatus != _FeatureSearchStatus.loading) {
       return;
     }
 
     final generation = _searchGate.begin(normalized);
     setState(() {
-      _isSearching = true;
-      _searchFailed = false;
+      _searchStatus = _FeatureSearchStatus.loading;
+      _searchError = null;
     });
     _debounce = Timer(const Duration(milliseconds: 420), () async {
       try {
@@ -605,230 +680,519 @@ class _FoodLogEditorState extends ConsumerState<_FoodLogEditor> {
         }
         setState(() {
           _suggestions = results;
-          _isSearching = false;
-          _searchFailed = false;
+          _searchStatus = results.isEmpty
+              ? _FeatureSearchStatus.noResults
+              : _FeatureSearchStatus.results;
+          _searchError = null;
         });
-      } catch (_) {
+      } on CachedSearchResultsException<FoodSuggestion> catch (error) {
         if (!mounted || !_searchGate.isCurrent(generation, normalized)) {
           return;
         }
         setState(() {
-          _isSearching = false;
-          _searchFailed = true;
+          _suggestions = error.results;
+          _searchStatus = _FeatureSearchStatus.cachedOffline;
+          _searchError = error.error;
+        });
+      } catch (error) {
+        if (!mounted || !_searchGate.isCurrent(generation, normalized)) {
+          return;
+        }
+        setState(() {
+          _suggestions = const [];
+          _searchStatus = _FeatureSearchStatus.error;
+          _searchError = error;
         });
       }
     });
+  }
+
+  void _markEditing() {
+    if (_entryStatus != _FoodEntryStatus.editing && mounted) {
+      setState(() => _entryStatus = _FoodEntryStatus.editing);
+    }
+  }
+
+  Future<void> _logFood() async {
+    if (_mutationInFlight || _entryStatus == _FoodEntryStatus.pendingSync) {
+      return;
+    }
+    setState(() => _mutationInFlight = true);
+    try {
+      final result = await widget.onLog();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _entryStatus = result.syncStatus == NutritionMutationSyncStatus.synced
+            ? _FoodEntryStatus.logged
+            : _FoodEntryStatus.pendingSync;
+      });
+      if (result.syncStatus == NutritionMutationSyncStatus.synced) {
+        _showNutritionSuccess(context, 'Food logged and synced.');
+      }
+    } on NutritionMutationPendingException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _entryStatus = _FoodEntryStatus.pendingSync);
+      _showNutritionFailure(context, error);
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _entryStatus = _FoodEntryStatus.failed);
+      _showNutritionFailure(context, error);
+    } finally {
+      if (mounted) {
+        setState(() => _mutationInFlight = false);
+      }
+    }
+  }
+
+  Future<void> _deleteFood() async {
+    if (_mutationInFlight) {
+      return;
+    }
+    setState(() => _mutationInFlight = true);
+    try {
+      final deleted = await widget.onDelete();
+      if (!mounted) {
+        return;
+      }
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            deleted.foodLogId == null ? 'Food draft removed.' : 'Food deleted.',
+          ),
+          action: SnackBarAction(
+            label: 'Undo',
+            onPressed: () async {
+              try {
+                await widget.onUndoDelete(deleted);
+                if (messenger.mounted && deleted.foodLogId != null) {
+                  messenger.showSnackBar(
+                    const SnackBar(
+                      content: Text('Food restored and synced.'),
+                    ),
+                  );
+                }
+              } catch (error) {
+                if (messenger.mounted) {
+                  messenger.showSnackBar(
+                    SnackBar(content: Text(_friendlyNutritionError(error))),
+                  );
+                }
+              }
+            },
+          ),
+        ),
+      );
+    } on NutritionMutationPendingException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _entryStatus = _FoodEntryStatus.pendingSync);
+      _showNutritionFailure(context, error);
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _entryStatus = _FoodEntryStatus.failed);
+      _showNutritionFailure(context, error);
+    } finally {
+      if (mounted) {
+        setState(() => _mutationInFlight = false);
+      }
+    }
+  }
+
+  Widget _mealField(FoodLogDraft foodLog) {
+    return DropdownButtonFormField<MealType>(
+      key: ValueKey('food-meal-field-${widget.index}'),
+      isExpanded: true,
+      initialValue: foodLog.mealType,
+      items: MealType.values
+          .map(
+            (mealType) => DropdownMenuItem(
+              value: mealType,
+              child: Text(_mealTypeLabel(mealType)),
+            ),
+          )
+          .toList(),
+      onChanged: (value) {
+        if (value != null) {
+          _markEditing();
+          widget.onChanged(foodLog.copyWith(mealType: value));
+        }
+      },
+      decoration: const InputDecoration(labelText: 'Meal type'),
+    );
+  }
+
+  Widget _quantityField(FoodLogDraft foodLog) {
+    return TextFormField(
+      key: ValueKey('food-quantity-field-${widget.index}'),
+      controller: _quantityController,
+      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+      onChanged: (value) {
+        _markEditing();
+        widget.onChanged(
+          foodLog.copyWith(
+            quantityGrams: double.tryParse(value) ?? foodLog.quantityGrams,
+          ),
+        );
+      },
+      decoration: const InputDecoration(labelText: 'Grams'),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final foodLog = widget.foodLog;
     return JimSurface(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Align(
-            alignment: Alignment.centerRight,
-            child: TextButton.icon(
-              onPressed: widget.onRemove,
-              icon: const Icon(Icons.delete_outline_rounded),
-              label: const Text('Remove'),
-            ),
-          ),
-          TextFormField(
-            key: ValueKey('food-name-field-${widget.index}'),
-            controller: _nameController,
-            onChanged: (value) {
-              widget.onChanged(
-                foodLog.copyWith(
-                  foodId: null,
-                  caloriesPer100g: null,
-                  proteinPer100g: null,
-                  carbsPer100g: null,
-                  fatPer100g: null,
-                  foodName: value,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final isCompact = constraints.maxWidth < 400;
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (isCompact) ...[
+                _NutritionStatusBadge(status: _entryStatus),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    key: ValueKey('delete-food-${widget.index}-button'),
+                    onPressed: _mutationInFlight ? null : _deleteFood,
+                    icon: const Icon(Icons.delete_outline_rounded),
+                    label: const Text('Delete'),
+                  ),
                 ),
-              );
-              _queueFoodSearch(value);
-            },
-            decoration: InputDecoration(
-              labelText: 'Food name',
-              prefixIcon: const Icon(Icons.ramen_dining_outlined),
-              suffixIcon: _isSearching
-                  ? const Padding(
-                      padding: EdgeInsets.all(14),
-                      child: SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
+              ] else
+                Row(
+                  children: [
+                    _NutritionStatusBadge(status: _entryStatus),
+                    const Spacer(),
+                    TextButton.icon(
+                      key: ValueKey('delete-food-${widget.index}-button'),
+                      onPressed: _mutationInFlight ? null : _deleteFood,
+                      icon: const Icon(Icons.delete_outline_rounded),
+                      label: const Text('Delete'),
+                    ),
+                  ],
+                ),
+              TextFormField(
+                key: ValueKey('food-name-field-${widget.index}'),
+                controller: _nameController,
+                onChanged: (value) {
+                  _markEditing();
+                  widget.onChanged(
+                    foodLog.copyWith(
+                      foodId: null,
+                      caloriesPer100g: null,
+                      proteinPer100g: null,
+                      carbsPer100g: null,
+                      fatPer100g: null,
+                      foodName: value,
+                    ),
+                  );
+                  _queueFoodSearch(value);
+                },
+                decoration: InputDecoration(
+                  labelText: 'Food name',
+                  prefixIcon: const Icon(Icons.ramen_dining_outlined),
+                  suffixIcon: _searchStatus == _FeatureSearchStatus.loading
+                      ? const Padding(
+                          padding: EdgeInsets.all(14),
+                          child: SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                        )
+                      : null,
+                ),
+              ),
+              if (_searchStatus == _FeatureSearchStatus.loading) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'Searching foods...',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: JimColors.inkMuted,
                       ),
-                    )
-                  : null,
-            ),
-          ),
-          if (_isSearching) ...[
-            const SizedBox(height: 8),
-            Text(
-              'Searching foods...',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: JimColors.inkMuted,
-                  ),
-            ),
-          ] else if (_searchFailed) ...[
-            const SizedBox(height: 8),
-            Text(
-              'Couldn\'t refresh foods. You can still add food manually.',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: JimColors.terracotta,
-                  ),
-            ),
-          ],
-          if (_suggestions.isNotEmpty) ...[
-            const SizedBox(height: 10),
-            Text(
-              _searchGate.activeQuery.length < 3
-                  ? 'Suggestions'
-                  : 'Food matches',
-              style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                    color: JimColors.inkMuted,
-                  ),
-            ),
-            const SizedBox(height: 8),
-            ..._suggestions.take(4).map(
-                  (suggestion) => Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: _FoodSuggestionTile(
-                      suggestion: suggestion,
-                      quantityGrams: foodLog.quantityGrams,
-                      onTap: () {
-                        ref
-                            .read(appDraftProvider.notifier)
-                            .applyFoodSuggestion(widget.index, suggestion);
-                        setState(() => _suggestions = const []);
+                ),
+              ] else if (_searchStatus == _FeatureSearchStatus.noResults) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'No food results found.',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: JimColors.inkMuted,
+                      ),
+                ),
+              ] else if (_searchStatus ==
+                  _FeatureSearchStatus.cachedOffline) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'Offline — showing cached food results.',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: JimColors.terracotta,
+                      ),
+                ),
+              ] else if (_searchStatus == _FeatureSearchStatus.error) ...[
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        presentAppError(
+                          _searchError ?? Exception('Food search failed.'),
+                          fallbackMessage:
+                              'Food search is unavailable. Please try again.',
+                        ),
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                              color: JimColors.terracotta,
+                            ),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () => _queueFoodSearch(
+                        _nameController.text,
+                        force: true,
+                      ),
+                      child: const Text('Retry'),
+                    ),
+                  ],
+                ),
+              ],
+              if (_suggestions.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Text(
+                  _searchGate.activeQuery.length < 3
+                      ? 'Suggestions'
+                      : 'Food matches',
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        color: JimColors.inkMuted,
+                      ),
+                ),
+                const SizedBox(height: 8),
+                ..._suggestions.take(4).map(
+                      (suggestion) => Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: _FoodSuggestionTile(
+                          suggestion: suggestion,
+                          quantityGrams: foodLog.quantityGrams,
+                          onTap: () {
+                            _markEditing();
+                            ref
+                                .read(appDraftProvider.notifier)
+                                .applyFoodSuggestion(widget.index, suggestion);
+                            _searchGate.clear();
+                            setState(() {
+                              _suggestions = const [];
+                              _searchStatus = _FeatureSearchStatus.idle;
+                              _searchError = null;
+                            });
+                          },
+                        ),
+                      ),
+                    ),
+              ],
+              const SizedBox(height: 12),
+              if (isCompact) ...[
+                _mealField(foodLog),
+                const SizedBox(height: 12),
+                _quantityField(foodLog),
+              ] else
+                Row(
+                  children: [
+                    Expanded(child: _mealField(foodLog)),
+                    const SizedBox(width: 12),
+                    Expanded(child: _quantityField(foodLog)),
+                  ],
+                ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: _MacroInput(
+                      fieldKey: ValueKey('food-calories-field-${widget.index}'),
+                      label: 'Calories',
+                      initialValue: foodLog.calories,
+                      onChanged: (value) {
+                        _markEditing();
+                        widget.onChanged(
+                          foodLog.copyWith(
+                            foodId: null,
+                            caloriesPer100g: null,
+                            proteinPer100g: null,
+                            carbsPer100g: null,
+                            fatPer100g: null,
+                            calories: value,
+                          ),
+                        );
                       },
                     ),
                   ),
-                ),
-          ],
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: DropdownButtonFormField<MealType>(
-                  initialValue: foodLog.mealType,
-                  items: MealType.values
-                      .map(
-                        (mealType) => DropdownMenuItem(
-                          value: mealType,
-                          child: Text(_mealTypeLabel(mealType)),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: _MacroInput(
+                      fieldKey: ValueKey('food-protein-field-${widget.index}'),
+                      label: 'Protein',
+                      initialValue: foodLog.protein,
+                      onChanged: (value) {
+                        _markEditing();
+                        widget.onChanged(
+                          foodLog.copyWith(
+                            foodId: null,
+                            caloriesPer100g: null,
+                            proteinPer100g: null,
+                            carbsPer100g: null,
+                            fatPer100g: null,
+                            protein: value,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: _MacroInput(
+                      fieldKey: ValueKey('food-carbs-field-${widget.index}'),
+                      label: 'Carbs',
+                      initialValue: foodLog.carbs,
+                      onChanged: (value) {
+                        _markEditing();
+                        widget.onChanged(
+                          foodLog.copyWith(
+                            foodId: null,
+                            caloriesPer100g: null,
+                            proteinPer100g: null,
+                            carbsPer100g: null,
+                            fatPer100g: null,
+                            carbs: value,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: _MacroInput(
+                      fieldKey: ValueKey('food-fat-field-${widget.index}'),
+                      label: 'Fat',
+                      initialValue: foodLog.fat,
+                      onChanged: (value) {
+                        _markEditing();
+                        widget.onChanged(
+                          foodLog.copyWith(
+                            foodId: null,
+                            caloriesPer100g: null,
+                            proteinPer100g: null,
+                            carbsPer100g: null,
+                            fatPer100g: null,
+                            fat: value,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  key: ValueKey('log-food-${widget.index}-button'),
+                  onPressed: _mutationInFlight ||
+                          _entryStatus == _FoodEntryStatus.logged ||
+                          _entryStatus == _FoodEntryStatus.pendingSync
+                      ? null
+                      : _logFood,
+                  icon: _mutationInFlight
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : Icon(
+                          _entryStatus == _FoodEntryStatus.failed
+                              ? Icons.refresh_rounded
+                              : Icons.check_rounded,
                         ),
-                      )
-                      .toList(),
-                  onChanged: (value) {
-                    if (value != null) {
-                      widget.onChanged(foodLog.copyWith(mealType: value));
-                    }
-                  },
-                  decoration: const InputDecoration(labelText: 'Meal type'),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: TextFormField(
-                  controller: _quantityController,
-                  keyboardType:
-                      const TextInputType.numberWithOptions(decimal: true),
-                  onChanged: (value) => widget.onChanged(
-                    foodLog.copyWith(
-                      quantityGrams:
-                          double.tryParse(value) ?? foodLog.quantityGrams,
-                    ),
-                  ),
-                  decoration: const InputDecoration(labelText: 'Grams'),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: _MacroInput(
-                  fieldKey: ValueKey('food-calories-field-${widget.index}'),
-                  label: 'Calories',
-                  initialValue: foodLog.calories,
-                  onChanged: (value) => widget.onChanged(
-                    foodLog.copyWith(
-                      foodId: null,
-                      caloriesPer100g: null,
-                      proteinPer100g: null,
-                      carbsPer100g: null,
-                      fatPer100g: null,
-                      calories: value,
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: _MacroInput(
-                  fieldKey: ValueKey('food-protein-field-${widget.index}'),
-                  label: 'Protein',
-                  initialValue: foodLog.protein,
-                  onChanged: (value) => widget.onChanged(
-                    foodLog.copyWith(
-                      foodId: null,
-                      caloriesPer100g: null,
-                      proteinPer100g: null,
-                      carbsPer100g: null,
-                      fatPer100g: null,
-                      protein: value,
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: _MacroInput(
-                  fieldKey: ValueKey('food-carbs-field-${widget.index}'),
-                  label: 'Carbs',
-                  initialValue: foodLog.carbs,
-                  onChanged: (value) => widget.onChanged(
-                    foodLog.copyWith(
-                      foodId: null,
-                      caloriesPer100g: null,
-                      proteinPer100g: null,
-                      carbsPer100g: null,
-                      fatPer100g: null,
-                      carbs: value,
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: _MacroInput(
-                  fieldKey: ValueKey('food-fat-field-${widget.index}'),
-                  label: 'Fat',
-                  initialValue: foodLog.fat,
-                  onChanged: (value) => widget.onChanged(
-                    foodLog.copyWith(
-                      foodId: null,
-                      caloriesPer100g: null,
-                      proteinPer100g: null,
-                      carbsPer100g: null,
-                      fatPer100g: null,
-                      fat: value,
+                  label: Text(
+                    _foodEntryActionLabel(
+                      _entryStatus,
+                      isExistingEntry: foodLog.foodLogId != null,
                     ),
                   ),
                 ),
               ),
             ],
-          ),
-        ],
+          );
+        },
       ),
     );
   }
+}
+
+class _NutritionStatusBadge extends StatelessWidget {
+  const _NutritionStatusBadge({required this.status});
+
+  final _FoodEntryStatus status;
+
+  @override
+  Widget build(BuildContext context) {
+    final (label, icon, color) = switch (status) {
+      _FoodEntryStatus.editing => (
+          'Not logged',
+          Icons.edit_outlined,
+          JimColors.inkMuted,
+        ),
+      _FoodEntryStatus.logged => (
+          'Logged',
+          Icons.cloud_done_outlined,
+          JimColors.accentStrong,
+        ),
+      _FoodEntryStatus.pendingSync => (
+          'Pending sync',
+          Icons.cloud_upload_outlined,
+          JimColors.terracotta,
+        ),
+      _FoodEntryStatus.failed => (
+          'Failed — retry',
+          Icons.error_outline_rounded,
+          JimColors.terracotta,
+        ),
+    };
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 17, color: color),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            label,
+            style:
+                Theme.of(context).textTheme.labelMedium?.copyWith(color: color),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+String _foodEntryActionLabel(
+  _FoodEntryStatus status, {
+  required bool isExistingEntry,
+}) {
+  return switch (status) {
+    _FoodEntryStatus.editing => isExistingEntry ? 'Save changes' : 'Log food',
+    _FoodEntryStatus.logged => 'Logged',
+    _FoodEntryStatus.pendingSync => 'Pending sync',
+    _FoodEntryStatus.failed => 'Retry logging',
+  };
 }
 
 Map<MealType, List<_MealFoodLogEntry>> _groupFoodLogsByMeal(
@@ -947,49 +1311,24 @@ void _showNutritionFailure(BuildContext context, Object error) {
 }
 
 String _friendlyNutritionError(Object error) {
-  if (error is DioException) {
-    return switch (error.type) {
-      DioExceptionType.connectionTimeout ||
-      DioExceptionType.sendTimeout ||
-      DioExceptionType.receiveTimeout =>
-        'Nutrition save timeout\nsource: lib/features/nutrition/presentation/nutrition_page.dart -> _runNutritionAction\nproblem: backend did not answer before Dio timeout\nraw: ${error.message}',
-      DioExceptionType.connectionError =>
-        'Nutrition save connection error\nsource: lib/features/nutrition/presentation/nutrition_page.dart -> _runNutritionAction\nproblem: Flutter could not reach FastAPI/ngrok\nraw: ${error.message}',
-      DioExceptionType.badResponse => _friendlyNutritionStatusError(
-          error.response?.statusCode,
-          error.response?.data,
-        ),
-      DioExceptionType.cancel => 'The nutrition request was cancelled.',
-      DioExceptionType.badCertificate =>
-        'The backend TLS certificate was rejected. Check the backend URL.',
-      DioExceptionType.unknown =>
-        'Nutrition save failed before backend response\nsource: lib/features/nutrition/presentation/nutrition_page.dart -> _runNutritionAction\nraw: ${error.message}',
-    };
+  if (error is NutritionMutationConflictException) {
+    return 'This day changed elsewhere. Reload it before saving so newer data is not overwritten.';
   }
-
-  final raw = error.toString().replaceFirst('Exception: ', '').trim();
-  if (raw.contains('receive timeout') || raw.contains('send timeout')) {
-    return 'The backend is taking longer than expected. Your food entry is still here; try again in a moment.';
+  if (error is NutritionMutationPendingException) {
+    return 'Saved on this device — waiting to sync. Your current day is unchanged.';
   }
-  return raw;
+  return presentAppError(
+    error,
+    fallbackMessage:
+        'We could not save that nutrition change. Your entry is still here; please try again.',
+  );
 }
 
 String _technicalError(Object error) {
-  return error.toString().replaceFirst('Exception: ', '').trim();
-}
-
-String _friendlyNutritionStatusError(int? statusCode, Object? body) {
-  if (statusCode == 401) {
-    return 'Your session token was rejected. Sign out, sign back in, then retry nutrition save.';
-  }
-  if (statusCode == 422) {
-    return 'The backend rejected the food payload. Check food, quantity, meal type, and macros.';
-  }
-  if (statusCode != null && statusCode >= 500) {
-    return 'The backend hit a server error while saving food. Your entry is still here; retry after the API recovers.';
-  }
-  final bodyText = body?.toString() ?? 'Nutrition save failed.';
-  return bodyText.length > 180 ? '${bodyText.substring(0, 180)}...' : bodyText;
+  return presentAppError(
+    error,
+    fallbackMessage: 'Nutrition data is unavailable right now.',
+  );
 }
 
 class _MacroInput extends StatefulWidget {

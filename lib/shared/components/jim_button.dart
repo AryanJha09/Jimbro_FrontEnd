@@ -43,7 +43,12 @@ class JimPrimaryButton extends StatelessWidget {
             Icon(icon, size: 18),
             const SizedBox(width: 10),
           ],
-          Text(label),
+          Flexible(
+            child: Text(
+              label,
+              textAlign: TextAlign.center,
+            ),
+          ),
         ],
       ),
     );
@@ -90,7 +95,12 @@ class JimSecondaryButton extends StatelessWidget {
             Icon(icon, size: 18),
             const SizedBox(width: 10),
           ],
-          Text(label),
+          Flexible(
+            child: Text(
+              label,
+              textAlign: TextAlign.center,
+            ),
+          ),
         ],
       ),
     );

@@ -239,7 +239,6 @@ class _HomeDraftController extends AppDraftController {
           weeklyCheckins: 0,
           totalLogs: 0,
         ),
-        search: SearchState(query: '', groups: []),
       );
 }
 

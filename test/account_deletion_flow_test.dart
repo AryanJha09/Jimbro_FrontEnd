@@ -19,6 +19,9 @@ void main() {
       () async {
     final authRepository = _MutableAuthRepository();
     final accountRepository = _ImmediateAccountRepository();
+    final profileRepository = _CacheAwareProfileRepository();
+    final workoutRepository = _CacheAwareWorkoutRepository();
+    final nutritionRepository = _CacheAwareNutritionRepository();
     SharedPreferences.setMockInitialValues({
       'offline_outbox_test-user': '[]',
       'jimbro.workout_schedule.test-user': '[]',
@@ -28,6 +31,9 @@ void main() {
     final container = _container(
       authRepository: authRepository,
       accountRepository: accountRepository,
+      profileRepository: profileRepository,
+      workoutRepository: workoutRepository,
+      nutritionRepository: nutritionRepository,
     );
     addTearDown(container.dispose);
 
@@ -45,6 +51,9 @@ void main() {
     expect(prefs.getString('jimbro.workout_schedule.test-user'), isNull);
     expect(prefs.getString('jimbro.onboarding.v1.test-user'), isNull);
     expect(prefs.getString('jimbro.onboarding.v1.test-user.tmp'), isNull);
+    expect(profileRepository.clearedUserIds, ['test-user']);
+    expect(workoutRepository.clearedUserIds, ['test-user']);
+    expect(nutritionRepository.clearedUserIds, ['test-user']);
   });
 
   test('failed account deletion preserves session and local data', () async {
@@ -211,14 +220,20 @@ const _session = AuthSession(
 ProviderContainer _container({
   required AuthRepository authRepository,
   required AccountRepository accountRepository,
+  ProfileRepository? profileRepository,
+  WorkoutRepository? workoutRepository,
+  NutritionRepository? nutritionRepository,
 }) {
   return ProviderContainer(
     overrides: [
       authRepositoryProvider.overrideWithValue(authRepository),
       accountRepositoryProvider.overrideWithValue(accountRepository),
-      profileRepositoryProvider.overrideWithValue(MockProfileRepository()),
-      workoutRepositoryProvider.overrideWithValue(MockWorkoutRepository()),
-      nutritionRepositoryProvider.overrideWithValue(MockNutritionRepository()),
+      profileRepositoryProvider
+          .overrideWithValue(profileRepository ?? MockProfileRepository()),
+      workoutRepositoryProvider
+          .overrideWithValue(workoutRepository ?? MockWorkoutRepository()),
+      nutritionRepositoryProvider
+          .overrideWithValue(nutritionRepository ?? MockNutritionRepository()),
       consistencyRepositoryProvider
           .overrideWithValue(MockConsistencyRepository()),
       atlasRepositoryProvider.overrideWithValue(MockAtlasRepository()),
@@ -228,6 +243,30 @@ ProviderContainer _container({
       searchRepositoryProvider.overrideWithValue(MockSearchRepository()),
     ],
   );
+}
+
+class _CacheAwareProfileRepository extends MockProfileRepository
+    implements UserScopedCache {
+  final clearedUserIds = <String>[];
+
+  @override
+  void clearUserCache(String userId) => clearedUserIds.add(userId);
+}
+
+class _CacheAwareWorkoutRepository extends MockWorkoutRepository
+    implements UserScopedCache {
+  final clearedUserIds = <String>[];
+
+  @override
+  void clearUserCache(String userId) => clearedUserIds.add(userId);
+}
+
+class _CacheAwareNutritionRepository extends MockNutritionRepository
+    implements UserScopedCache {
+  final clearedUserIds = <String>[];
+
+  @override
+  void clearUserCache(String userId) => clearedUserIds.add(userId);
 }
 
 Future<void> _enterApp(WidgetTester tester) async {
@@ -256,7 +295,7 @@ Future<void> _completeOnboardingFlow(WidgetTester tester) async {
   await _selectOnboardingOption(tester, 'Home workouts');
   await _tapOnboardingCta(tester, 'Continue');
   await _tapOnboardingCta(tester, 'Continue');
-  await _selectOnboardingOption(tester, 'Keep it simple');
+  await _selectOnboardingOption(tester, 'Vegetarian');
   await _tapOnboardingCta(tester, 'Continue');
   await _tapOnboardingCta(tester, 'Continue');
   await _selectOnboardingOption(tester, 'Prefer not to say');
@@ -331,6 +370,15 @@ class _ImmediateAccountRepository implements AccountRepository {
   int calls = 0;
 
   @override
+  Future<ApplicationUserProvisioningResult> provisionAuthenticatedUser(
+    AuthSession session,
+  ) async {
+    return ApplicationUserProvisioningResult(
+      applicationUserId: session.userId,
+    );
+  }
+
+  @override
   Future<AccountDeletionResult> deleteAccount(AuthSession session) async {
     calls++;
     if (!succeed) {
@@ -343,6 +391,15 @@ class _ImmediateAccountRepository implements AccountRepository {
 class _ControlledAccountRepository implements AccountRepository {
   final _pending = <Completer<AccountDeletionResult>>[];
   int calls = 0;
+
+  @override
+  Future<ApplicationUserProvisioningResult> provisionAuthenticatedUser(
+    AuthSession session,
+  ) async {
+    return ApplicationUserProvisioningResult(
+      applicationUserId: session.userId,
+    );
+  }
 
   @override
   Future<AccountDeletionResult> deleteAccount(AuthSession session) {

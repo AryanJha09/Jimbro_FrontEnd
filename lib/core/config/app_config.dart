@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
@@ -57,8 +58,11 @@ class AppConfig {
   bool get useSupabaseDirectAuth =>
       authMode == AuthMode.supabase && isSupabaseConfigured;
 
+  String get normalizedFastApiBaseUrl => _normalizeBaseUrl(fastApiBaseUrl);
+
   List<AppConfigValidationIssue> validate({
     Set<String>? presentVariableNames,
+    bool isReleaseBuild = kReleaseMode,
   }) {
     final names = presentVariableNames;
     final issues = <AppConfigValidationIssue>[];
@@ -103,6 +107,22 @@ class AppConfig {
     }
 
     requireName('FASTAPI_BASE_URL', 'FastAPI backend mode');
+    final parsedFastApiUrl = Uri.tryParse(fastApiBaseUrl.trim());
+    if (fastApiBaseUrl.isNotEmpty &&
+        (parsedFastApiUrl == null ||
+            !parsedFastApiUrl.hasScheme ||
+            !parsedFastApiUrl.hasAuthority ||
+            (parsedFastApiUrl.scheme != 'http' &&
+                parsedFastApiUrl.scheme != 'https'))) {
+      issues.add(
+        const AppConfigValidationIssue(
+          severity: AppConfigValidationSeverity.error,
+          code: 'fastapi_base_url_invalid',
+          variableName: 'FASTAPI_BASE_URL',
+          message: 'FASTAPI_BASE_URL must be an absolute http or https URL.',
+        ),
+      );
+    }
     if (fastApiBaseUrl.isNotEmpty && !_baseUrlIncludesApiV1(fastApiBaseUrl)) {
       issues.add(
         const AppConfigValidationIssue(
@@ -120,6 +140,18 @@ class AppConfig {
           code: 'fastapi_base_url_duplicate_api_v1',
           variableName: 'FASTAPI_BASE_URL',
           message: 'FASTAPI_BASE_URL must include /api/v1 exactly once.',
+        ),
+      );
+    }
+    if (parsedFastApiUrl != null &&
+        _isLoopbackHost(parsedFastApiUrl.host) &&
+        isReleaseBuild) {
+      issues.add(
+        const AppConfigValidationIssue(
+          severity: AppConfigValidationSeverity.error,
+          code: 'release_fastapi_loopback_url',
+          variableName: 'FASTAPI_BASE_URL',
+          message: 'Release builds cannot use a loopback API URL.',
         ),
       );
     }
@@ -153,7 +185,8 @@ class AppConfig {
     return AppConfig(
       backendMode: backendMode,
       authMode: authMode,
-      fastApiBaseUrl: (envValue('FASTAPI_BASE_URL') ?? '').trim(),
+      fastApiBaseUrl:
+          _normalizeBaseUrl((envValue('FASTAPI_BASE_URL') ?? '').trim()),
       supabaseUrl: (envValue('SUPABASE_URL') ?? '').trim(),
       supabaseAnonKey: (envValue('SUPABASE_ANON_KEY') ?? '').trim(),
       supabaseRedirectScheme:
@@ -187,6 +220,35 @@ String appConfigValidationSummary(List<AppConfigValidationIssue> issues) {
 
 bool _baseUrlIncludesApiV1(String value) {
   return _apiV1SegmentCount(value) >= 1;
+}
+
+String _normalizeBaseUrl(String value) {
+  final trimmed = value.trim();
+  if (trimmed.isEmpty) {
+    return trimmed;
+  }
+  final parsed = Uri.tryParse(trimmed);
+  if (parsed == null || !parsed.hasScheme || !parsed.hasAuthority) {
+    return trimmed;
+  }
+  final normalizedSegments = parsed.pathSegments
+      .where((segment) => segment.trim().isNotEmpty)
+      .toList(growable: false);
+  return parsed
+      .replace(
+        pathSegments: normalizedSegments,
+        query: null,
+        fragment: null,
+      )
+      .toString()
+      .replaceFirst(RegExp(r'/$'), '');
+}
+
+bool _isLoopbackHost(String host) {
+  final normalized = host.trim().toLowerCase();
+  return normalized == 'localhost' ||
+      normalized == '127.0.0.1' ||
+      normalized == '::1';
 }
 
 int _apiV1SegmentCount(String value) {

@@ -1,11 +1,12 @@
 import 'dart:async';
 
-import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../core/errors/app_error.dart';
 import '../../../core/navigation/app_state.dart';
 import '../../../core/notifications/workout_notification_service.dart';
+import '../../../core/repositories/app_repositories.dart';
 import '../../../core/theme/jim_tokens.dart';
 import '../../../shared/components/action_state.dart';
 import '../../../shared/components/backend_state_view.dart';
@@ -13,6 +14,7 @@ import '../../../shared/components/jim_button.dart';
 import '../../../shared/components/jim_page_scaffold.dart';
 import '../../../shared/components/jim_surface.dart';
 import '../../../shared/models/app_models.dart';
+import '../application/active_workout_controller.dart';
 
 class WorkoutsPage extends ConsumerWidget {
   const WorkoutsPage({super.key});
@@ -43,6 +45,8 @@ class _WorkoutsContent extends ConsumerWidget {
     final controller = ref.read(appDraftProvider.notifier);
     final theme = Theme.of(context);
     final template = draft.template;
+    final activeAsync = ref.watch(activeWorkoutProvider);
+    final activeSession = activeAsync.valueOrNull?.session;
 
     return JimPageScaffold(
       eyebrow: 'WORKOUTS',
@@ -50,7 +54,14 @@ class _WorkoutsContent extends ConsumerWidget {
       subtitle:
           'Create reusable plans, open them later, then start a workout from the template.',
       headerTrailing: IconButton(
-        onPressed: controller.createTemplateDraft,
+        onPressed: () async {
+          await controller.createTemplateDraft();
+          if (context.mounted) {
+            await Navigator.of(context).pushNamed(
+              '/app/workouts/templates/new',
+            );
+          }
+        },
         icon: const Icon(Icons.add_rounded),
         tooltip: 'Create Template',
       ),
@@ -58,9 +69,32 @@ class _WorkoutsContent extends ConsumerWidget {
         _TemplateLibrary(
           templates: draft.templates,
           activeTemplateId: template.templateId,
-          onCreate: controller.createTemplateDraft,
-          onOpen: controller.openWorkoutTemplate,
-          onStart: controller.startWorkoutFromTemplate,
+          onCreate: () async {
+            await controller.createTemplateDraft();
+            if (context.mounted) {
+              await Navigator.of(context).pushNamed(
+                '/app/workouts/templates/new',
+              );
+            }
+          },
+          onOpen: (selected) async {
+            await controller.openWorkoutTemplate(selected);
+            if (context.mounted && selected.templateId != null) {
+              await Navigator.of(context).pushNamed(
+                '/app/workouts/templates/${selected.templateId}/edit',
+              );
+            }
+          },
+          onStart: (selected) async {
+            final session = await ref
+                .read(activeWorkoutProvider.notifier)
+                .startOrResume(selected);
+            if (context.mounted) {
+              await Navigator.of(context).pushNamed(
+                '/app/workouts/session/${session.sessionId}',
+              );
+            }
+          },
           onDelete: (template) async {
             await _runWorkoutAction(
               context,
@@ -69,6 +103,44 @@ class _WorkoutsContent extends ConsumerWidget {
             );
           },
         ),
+        if (activeSession != null) ...[
+          const SizedBox(height: JimSpacing.md),
+          JimCtaPanel(
+            title: activeSession.isFinishing
+                ? 'Workout finish is pending'
+                : 'Workout in progress',
+            body:
+                '${activeSession.name} is safely checkpointed. Resume it or explicitly discard it.',
+            primaryLabel: 'Resume',
+            onPrimaryPressed: () => Navigator.of(context).pushNamed(
+              '/app/workouts/session/${activeSession.sessionId}',
+            ),
+            secondaryLabel: 'Discard',
+            onSecondaryPressed: () => _confirmDiscardActiveWorkout(
+              context,
+              ref,
+            ),
+            icon: Icons.play_circle_outline_rounded,
+          ),
+        ],
+        if (activeAsync.valueOrNull?.corruptedCheckpointRecovered == true) ...[
+          const SizedBox(height: JimSpacing.sm),
+          Text(
+            'A damaged workout checkpoint was removed safely.',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: JimColors.inkMuted,
+            ),
+          ),
+        ],
+        if (draft.templatesAreStale) ...[
+          const SizedBox(height: JimSpacing.sm),
+          Text(
+            'Showing saved templates from this device while the server is unavailable.',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: JimColors.inkMuted,
+            ),
+          ),
+        ],
         const SizedBox(height: 16),
         _WorkoutSchedulePanel(
           templates: draft.templates,
@@ -79,174 +151,29 @@ class _WorkoutsContent extends ConsumerWidget {
               weekday: weekday,
               timeLabel: timeLabel,
             );
-            return result.notification.message;
+            return 'Stored on this device. ${result.notification.message}';
           },
           onClear: controller.deleteWorkoutSchedule,
         ),
         const SizedBox(height: 16),
-        if (draft.workoutLog.isInProgress) ...[
-          _WorkoutExecutionPanel(
+        if (draft.workoutLog.endedAtLabel.trim().isNotEmpty &&
+            (draft.workoutLog.workoutLogId != null ||
+                draft.lastWorkoutMutation != null)) ...[
+          _LastWorkoutSavedPanel(
             workoutLog: draft.workoutLog,
-            onNotesChanged: controller.updateWorkoutNotes,
-            onExerciseChanged: controller.updateWorkoutExercise,
-            onSuggestionSelected: controller.applyWorkoutExerciseSuggestion,
-            onSetChanged: controller.updateWorkoutSet,
-            onAddSet: controller.addWorkoutSet,
-            onRemoveSet: controller.removeWorkoutSet,
-            onFinish: () async {
-              await _runWorkoutAction(
-                context,
-                () async => controller.logWorkoutSession(),
-                successMessage: 'Workout finished and saved.',
-              );
-            },
+            mutation: draft.lastWorkoutMutation,
+            onRetry: controller.retryWorkoutSync,
           ),
-          const SizedBox(height: 16),
-        ] else if (draft.workoutLog.workoutLogId != null &&
-            draft.workoutLog.endedAtLabel.trim().isNotEmpty) ...[
-          _LastWorkoutSavedPanel(workoutLog: draft.workoutLog),
           const SizedBox(height: 16),
         ],
-        JimSurface(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('Template builder', style: theme.textTheme.titleLarge),
-              const SizedBox(height: 12),
-              TextFormField(
-                key: const ValueKey('template-name-field'),
-                initialValue: template.name,
-                onChanged: (value) => controller.updateTemplate(
-                  template.copyWith(name: value),
-                ),
-                decoration: const InputDecoration(
-                  labelText: 'Template name',
-                  prefixIcon: Icon(Icons.edit_note_rounded),
-                ),
-              ),
-              const SizedBox(height: 14),
-              TextFormField(
-                initialValue: template.description,
-                minLines: 2,
-                maxLines: 3,
-                onChanged: (value) => controller.updateTemplate(
-                  template.copyWith(description: value),
-                ),
-                decoration: const InputDecoration(
-                  labelText: 'Session description',
-                  prefixIcon: Icon(Icons.notes_rounded),
-                ),
-              ),
-              const SizedBox(height: 18),
-              Text('Add exercises', style: theme.textTheme.titleLarge),
-              const SizedBox(height: 10),
-              Text(
-                '${template.exercises.length} exercises in this draft. Add one movement, choose a suggestion, then fill sets.',
-                style: theme.textTheme.bodyMedium?.copyWith(
-                  color: JimColors.inkSoft,
-                ),
-              ),
-              const SizedBox(height: 14),
-              SizedBox(
-                width: double.infinity,
-                child: JimPrimaryButton(
-                  label: 'Add exercise',
-                  icon: Icons.add_rounded,
-                  onPressed: controller.addExercise,
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 16),
-        if (template.exercises.isEmpty)
-          JimEmptyState(
-            title: 'No movements yet',
-            message:
-                'Add your first exercise when you are ready to build this session.',
-            actionLabel: 'Add exercise',
-            onAction: controller.addExercise,
-            icon: Icons.fitness_center_rounded,
-          )
-        else
-          ...template.exercises.asMap().entries.map(
-                (entry) => Padding(
-                  padding: const EdgeInsets.only(bottom: 16),
-                  child: _ExerciseEditor(
-                    index: entry.key,
-                    exercise: entry.value,
-                    fieldKeyPrefix: 'template',
-                    onChanged: (exercise) =>
-                        controller.updateExercise(entry.key, exercise),
-                    onSuggestionSelected: (suggestion) => controller
-                        .applyExerciseSuggestion(entry.key, suggestion),
-                    onSetChanged: (setIndex, setDraft) =>
-                        controller.updateSet(entry.key, setIndex, setDraft),
-                    onAddSet: () => controller.addSet(entry.key),
-                    onRemoveSet: (setIndex) =>
-                        controller.removeSet(entry.key, setIndex),
-                    onRemove: () => controller.removeExercise(entry.key),
-                  ),
-                ),
-              ),
-        JimSurface(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('Session note', style: theme.textTheme.titleLarge),
-              const SizedBox(height: 12),
-              TextFormField(
-                initialValue: draft.workoutLog.notes,
-                minLines: 2,
-                maxLines: 4,
-                onChanged: controller.updateWorkoutNotes,
-                decoration: const InputDecoration(
-                  labelText: 'How did the session feel?',
-                  prefixIcon: Icon(Icons.mic_none_rounded),
-                ),
-              ),
-              const SizedBox(height: 18),
-              Text('Save or log', style: theme.textTheme.titleLarge),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: JimGuardedPrimaryButton(
-                      label: 'Save Template',
-                      loadingLabel: 'Saving...',
-                      icon: Icons.save_rounded,
-                      onRun: () => controller.saveWorkoutTemplate(),
-                      onSuccess: () => _showWorkoutSuccess(
-                        context,
-                        'Workout template saved.',
-                      ),
-                      onError: (error) => _showWorkoutFailure(context, error),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              SizedBox(
-                width: double.infinity,
-                child: JimGuardedPrimaryButton(
-                  label: draft.workoutLog.isInProgress
-                      ? 'Finish Workout'
-                      : 'Log Workout',
-                  loadingLabel: draft.workoutLog.isInProgress
-                      ? 'Finishing...'
-                      : 'Saving...',
-                  icon: Icons.cloud_upload_rounded,
-                  onRun: () => controller.logWorkoutSession(),
-                  onSuccess: () => _showWorkoutSuccess(
-                    context,
-                    draft.workoutLog.isInProgress
-                        ? 'Workout finished and saved.'
-                        : 'Workout log saved to Supabase.',
-                  ),
-                  onError: (error) => _showWorkoutFailure(context, error),
-                ),
-              ),
-            ],
+        Align(
+          alignment: Alignment.centerLeft,
+          child: JimTextButton(
+            label: 'Workout history',
+            icon: Icons.history_rounded,
+            onPressed: () => Navigator.of(context).pushNamed(
+              '/app/workouts/history',
+            ),
           ),
         ),
       ],
@@ -254,7 +181,535 @@ class _WorkoutsContent extends ConsumerWidget {
   }
 }
 
-class _TemplateLibrary extends StatelessWidget {
+class TemplateBuilderPage extends ConsumerWidget {
+  const TemplateBuilderPage({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final draftAsync = ref.watch(appDraftProvider);
+    return Scaffold(
+      appBar: AppBar(title: const Text('Template builder')),
+      body: draftAsync.when(
+        loading: () => const BackendLoadingView(message: 'Loading template...'),
+        error: (error, stackTrace) => BackendErrorView(
+          error: error,
+          onRetry: () => ref.invalidate(appDraftProvider),
+        ),
+        data: (draft) {
+          final controller = ref.read(appDraftProvider.notifier);
+          final template = draft.template;
+          final theme = Theme.of(context);
+          return JimPageScaffold(
+            eyebrow: 'WORKOUT TEMPLATE',
+            title: template.templateId == null
+                ? 'Create template'
+                : 'Edit template',
+            subtitle:
+                'Build a reusable plan. Live workout results are kept separate.',
+            bottomPadding: JimSpacing.xl,
+            children: [
+              JimSurface(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    TextFormField(
+                      key: const ValueKey('template-name-field'),
+                      initialValue: template.name,
+                      onChanged: (value) => controller.updateTemplate(
+                        template.copyWith(name: value),
+                      ),
+                      decoration: const InputDecoration(
+                        labelText: 'Template name',
+                        prefixIcon: Icon(Icons.edit_note_rounded),
+                      ),
+                    ),
+                    const SizedBox(height: JimSpacing.md),
+                    TextFormField(
+                      initialValue: template.description,
+                      minLines: 2,
+                      maxLines: 3,
+                      onChanged: (value) => controller.updateTemplate(
+                        template.copyWith(description: value),
+                      ),
+                      decoration: const InputDecoration(
+                        labelText: 'Template description',
+                        prefixIcon: Icon(Icons.notes_rounded),
+                      ),
+                    ),
+                    const SizedBox(height: JimSpacing.md),
+                    Text(
+                      '${template.exercises.length} exercises in this template.',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: JimColors.inkSoft,
+                      ),
+                    ),
+                    const SizedBox(height: JimSpacing.md),
+                    JimPrimaryButton(
+                      label: 'Add exercise',
+                      icon: Icons.add_rounded,
+                      expand: true,
+                      onPressed: controller.addExercise,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: JimSpacing.md),
+              if (template.exercises.isEmpty)
+                JimEmptyState(
+                  title: 'No movements yet',
+                  message: 'Add the first exercise for this reusable plan.',
+                  actionLabel: 'Add exercise',
+                  onAction: controller.addExercise,
+                  icon: Icons.fitness_center_rounded,
+                )
+              else
+                ...template.exercises.asMap().entries.map(
+                      (entry) => Padding(
+                        padding: const EdgeInsets.only(bottom: JimSpacing.md),
+                        child: _ExerciseEditor(
+                          index: entry.key,
+                          exercise: entry.value,
+                          fieldKeyPrefix: 'template',
+                          onChanged: (exercise) =>
+                              controller.updateExercise(entry.key, exercise),
+                          onSuggestionSelected: (suggestion) => controller
+                              .applyExerciseSuggestion(entry.key, suggestion),
+                          onSetChanged: (setIndex, setDraft) => controller
+                              .updateSet(entry.key, setIndex, setDraft),
+                          onAddSet: () => controller.addSet(entry.key),
+                          onRemoveSet: (setIndex) =>
+                              controller.removeSet(entry.key, setIndex),
+                          onRemove: () => controller.removeExercise(entry.key),
+                        ),
+                      ),
+                    ),
+              JimGuardedPrimaryButton(
+                label: 'Save Template',
+                loadingLabel: 'Saving...',
+                icon: Icons.save_rounded,
+                onRun: controller.saveWorkoutTemplate,
+                onSuccess: () {
+                  _showWorkoutSuccess(context, 'Workout template saved.');
+                  Navigator.of(context).pop();
+                },
+                onError: (error) => _showWorkoutFailure(context, error),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class ActiveWorkoutPage extends ConsumerStatefulWidget {
+  const ActiveWorkoutPage({
+    super.key,
+    required this.sessionId,
+  });
+
+  final String sessionId;
+
+  @override
+  ConsumerState<ActiveWorkoutPage> createState() => _ActiveWorkoutPageState();
+}
+
+class _ActiveWorkoutPageState extends ConsumerState<ActiveWorkoutPage>
+    with WidgetsBindingObserver {
+  late final ActiveWorkoutController _activeController;
+
+  @override
+  void initState() {
+    super.initState();
+    _activeController = ref.read(activeWorkoutProvider.notifier);
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      unawaited(_activeController.checkpointNow());
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final activeAsync = ref.watch(activeWorkoutProvider);
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) {
+          unawaited(_confirmLeaveActiveWorkout(context));
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Active workout'),
+          leading: IconButton(
+            tooltip: 'Back',
+            icon: const Icon(Icons.arrow_back_rounded),
+            onPressed: () => _confirmLeaveActiveWorkout(context),
+          ),
+        ),
+        body: activeAsync.when(
+          loading: () => const BackendLoadingView(
+            message: 'Restoring workout...',
+          ),
+          error: (error, stackTrace) => BackendErrorView(
+            error: error,
+            onRetry: () => ref.invalidate(activeWorkoutProvider),
+          ),
+          data: (activeState) {
+            final session = activeState.session;
+            if (session == null || session.sessionId != widget.sessionId) {
+              return JimPageScaffold(
+                eyebrow: 'ACTIVE WORKOUT',
+                title: 'Session unavailable',
+                bottomPadding: JimSpacing.xl,
+                children: [
+                  JimEmptyState(
+                    title: 'This session is no longer active.',
+                    message: 'It may have been finished or discarded.',
+                    actionLabel: 'Back to workouts',
+                    onAction: () => Navigator.of(context).pop(),
+                    icon: Icons.check_circle_outline_rounded,
+                  ),
+                ],
+              );
+            }
+            final controller = ref.read(activeWorkoutProvider.notifier);
+            return JimPageScaffold(
+              eyebrow: 'ACTIVE WORKOUT',
+              title: session.name,
+              subtitle:
+                  'Started ${MaterialLocalizations.of(context).formatTimeOfDay(TimeOfDay.fromDateTime(session.startedAt))}',
+              bottomPadding: JimSpacing.xl,
+              children: [
+                JimSurface(
+                  tone: JimSurfaceTone.accent,
+                  child: TextFormField(
+                    initialValue: session.notes,
+                    minLines: 2,
+                    maxLines: 4,
+                    onChanged: controller.updateNotes,
+                    decoration: const InputDecoration(
+                      labelText: 'Session notes',
+                      prefixIcon: Icon(Icons.notes_rounded),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: JimSpacing.md),
+                ...session.exercises.asMap().entries.map(
+                      (entry) => Padding(
+                        padding: const EdgeInsets.only(bottom: JimSpacing.md),
+                        child: _ExerciseEditor(
+                          index: entry.key,
+                          exercise: entry.value,
+                          fieldKeyPrefix: 'active',
+                          onChanged: (exercise) =>
+                              controller.updateExercise(entry.key, exercise),
+                          onSuggestionSelected: (suggestion) =>
+                              controller.updateExercise(
+                            entry.key,
+                            entry.value.copyWith(
+                              exerciseId: suggestion.exerciseId,
+                              exerciseName: suggestion.name,
+                            ),
+                          ),
+                          onSetChanged: (setIndex, setDraft) => controller
+                              .updateSet(entry.key, setIndex, setDraft),
+                          onAddSet: () => controller.addSet(entry.key),
+                          onRemoveSet: (setIndex) =>
+                              controller.removeSet(entry.key, setIndex),
+                          onRemove: null,
+                        ),
+                      ),
+                    ),
+                JimGuardedPrimaryButton(
+                  key: const ValueKey('active-finish-action'),
+                  label: 'Finish Workout',
+                  loadingLabel: 'Finishing...',
+                  icon: Icons.check_circle_rounded,
+                  onRun: controller.finish,
+                  onSuccess: () async {
+                    final mutation = ref
+                        .read(appDraftProvider)
+                        .valueOrNull
+                        ?.lastWorkoutMutation;
+                    if (!context.mounted) {
+                      return;
+                    }
+                    await Navigator.of(context).pushReplacementNamed(
+                      '/app/workouts/session/${widget.sessionId}/end',
+                      arguments: mutation,
+                    );
+                  },
+                  onError: (error) => _showWorkoutFailure(context, error),
+                ),
+                const SizedBox(height: JimSpacing.sm),
+                Center(
+                  child: JimTextButton(
+                    label: 'Discard workout',
+                    icon: Icons.delete_outline_rounded,
+                    onPressed: () => _confirmDiscardActiveWorkout(context, ref),
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Future<void> _confirmLeaveActiveWorkout(BuildContext context) async {
+    final leave = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: const Text('Leave active workout?'),
+            content: const Text(
+              'Your session will stay active and can be resumed from Workouts.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(false),
+                child: const Text('Stay'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(dialogContext).pop(true),
+                child: const Text('Leave and resume later'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+    if (leave && context.mounted) {
+      await ref.read(activeWorkoutProvider.notifier).checkpointNow();
+      if (context.mounted) {
+        Navigator.of(context).pop();
+      }
+    }
+  }
+}
+
+class WorkoutFinishSummaryPage extends ConsumerWidget {
+  const WorkoutFinishSummaryPage({
+    super.key,
+    required this.sessionId,
+    this.mutation,
+  });
+
+  final String sessionId;
+  final WorkoutMutationResult? mutation;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final latest = ref.watch(appDraftProvider).valueOrNull?.lastWorkoutMutation;
+    final result = mutation ?? latest;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Workout summary')),
+      body: JimPageScaffold(
+        eyebrow: 'WORKOUT COMPLETE',
+        title: result?.syncStatus == WorkoutSyncStatus.synced
+            ? 'Workout saved'
+            : 'Finish pending sync',
+        subtitle: _workoutMutationMessage(result),
+        bottomPadding: JimSpacing.xl,
+        children: [
+          JimCtaPanel(
+            title: 'Session complete',
+            body: result?.syncStatus == WorkoutSyncStatus.synced
+                ? 'Your completed workout is now read-only history.'
+                : 'The checkpoint remains on this device until the server confirms completion.',
+            primaryLabel: 'View workout history',
+            onPrimaryPressed: () => Navigator.of(context).pushReplacementNamed(
+              '/app/workouts/history',
+            ),
+            icon: Icons.task_alt_rounded,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class WorkoutHistoryPage extends ConsumerWidget {
+  const WorkoutHistoryPage({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final historyAsync = ref.watch(workoutHistoryProvider);
+    return Scaffold(
+      appBar: AppBar(title: const Text('Workout history')),
+      body: historyAsync.when(
+        loading: () => const BackendLoadingView(message: 'Loading history...'),
+        error: (error, stackTrace) => BackendErrorView(
+          error: error,
+          onRetry: () => ref.invalidate(appDraftProvider),
+        ),
+        data: (history) {
+          final completed = history
+              .where(
+                (log) =>
+                    log.workoutLogId != null &&
+                    log.endedAtLabel.trim().isNotEmpty,
+              )
+              .toList(growable: false);
+          if (completed.isEmpty) {
+            return JimPageScaffold(
+              eyebrow: 'WORKOUT HISTORY',
+              title: 'Completed workouts',
+              bottomPadding: JimSpacing.xl,
+              children: const [
+                JimEmptyState(
+                  title: 'No completed workouts yet',
+                  message: 'Finished sessions will appear here.',
+                  icon: Icons.history_rounded,
+                ),
+              ],
+            );
+          }
+          return JimPageScaffold(
+            eyebrow: 'WORKOUT HISTORY',
+            title: 'Completed workouts',
+            bottomPadding: JimSpacing.xl,
+            children: completed
+                .map(
+                  (log) => Padding(
+                    padding: const EdgeInsets.only(bottom: JimSpacing.md),
+                    child: JimSurface(
+                      child: ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: Text(log.name),
+                        subtitle: Text('${log.exercises.length} exercises'),
+                        trailing: const Icon(Icons.chevron_right_rounded),
+                        onTap: () => Navigator.of(context).pushNamed(
+                          '/app/workouts/history/${log.workoutLogId}',
+                        ),
+                      ),
+                    ),
+                  ),
+                )
+                .toList(growable: false),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class WorkoutHistoryDetailPage extends ConsumerWidget {
+  const WorkoutHistoryDetailPage({
+    super.key,
+    required this.logId,
+  });
+
+  final int logId;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final history = ref.watch(workoutHistoryProvider).valueOrNull ?? const [];
+    WorkoutLogDraft? log;
+    for (final item in history) {
+      if (item.workoutLogId == logId && item.endedAtLabel.trim().isNotEmpty) {
+        log = item;
+        break;
+      }
+    }
+    final available = log != null;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Workout detail')),
+      body: JimPageScaffold(
+        eyebrow: 'COMPLETED WORKOUT',
+        title: available ? log.name : 'Workout unavailable',
+        subtitle: available ? 'Read-only completed session' : null,
+        bottomPadding: JimSpacing.xl,
+        children: [
+          if (!available)
+            const JimEmptyState(
+              title: 'Workout not found',
+              message: 'Return to history and choose an available workout.',
+              icon: Icons.search_off_rounded,
+            )
+          else ...[
+            JimSurface(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Session notes',
+                      style: Theme.of(context).textTheme.titleLarge),
+                  const SizedBox(height: JimSpacing.sm),
+                  Text(log.notes.trim().isEmpty ? 'No notes' : log.notes),
+                ],
+              ),
+            ),
+            const SizedBox(height: JimSpacing.md),
+            ...log.exercises.map(
+              (exercise) => Padding(
+                padding: const EdgeInsets.only(bottom: JimSpacing.md),
+                child: JimSurface(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        exercise.exerciseName,
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: JimSpacing.xs),
+                      Text('${exercise.sets.length} completed sets'),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+Future<void> _confirmDiscardActiveWorkout(
+  BuildContext context,
+  WidgetRef ref,
+) async {
+  final discard = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Discard active workout?'),
+          content: const Text(
+            'This removes the in-progress checkpoint. The source template will not change.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Keep workout'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Discard'),
+            ),
+          ],
+        ),
+      ) ??
+      false;
+  if (discard) {
+    await ref.read(activeWorkoutProvider.notifier).discard();
+    if (context.mounted && Navigator.of(context).canPop()) {
+      Navigator.of(context).pop();
+    }
+  }
+}
+
+class _TemplateLibrary extends StatefulWidget {
   const _TemplateLibrary({
     required this.templates,
     required this.activeTemplateId,
@@ -272,13 +727,21 @@ class _TemplateLibrary extends StatelessWidget {
   final ValueChanged<WorkoutTemplateDraft> onDelete;
 
   @override
+  State<_TemplateLibrary> createState() => _TemplateLibraryState();
+}
+
+class _TemplateLibraryState extends State<_TemplateLibrary> {
+  static const _pageSize = 20;
+  int _visibleCount = _pageSize;
+
+  @override
   Widget build(BuildContext context) {
-    if (templates.isEmpty) {
+    if (widget.templates.isEmpty) {
       return JimEmptyState(
         title: 'Create your first workout template.',
         message: 'Save a simple plan once, then reuse it when you train again.',
         actionLabel: 'Create Template',
-        onAction: onCreate,
+        onAction: widget.onCreate,
         icon: Icons.note_add_rounded,
       );
     }
@@ -286,153 +749,50 @@ class _TemplateLibrary extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
+        Wrap(
+          alignment: WrapAlignment.spaceBetween,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          runSpacing: JimSpacing.xs,
           children: [
-            Expanded(
-              child: Text(
-                'Saved templates',
-                style: Theme.of(context).textTheme.titleLarge,
-              ),
+            Text(
+              'Saved templates',
+              style: Theme.of(context).textTheme.titleLarge,
             ),
             JimTextButton(
               label: 'Create Template',
               icon: Icons.add_rounded,
-              onPressed: onCreate,
+              onPressed: widget.onCreate,
             ),
           ],
         ),
         const SizedBox(height: 12),
-        ...templates.reversed.map(
-          (template) => Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: _TemplateCard(
-              template: template,
-              isActive: template.templateId == activeTemplateId,
-              onOpen: () => onOpen(template),
-              onStart: () => onStart(template),
-              onDelete: () => onDelete(template),
+        ...widget.templates.reversed.take(_visibleCount).map(
+              (template) => Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: _TemplateCard(
+                  template: template,
+                  isActive: template.templateId == widget.activeTemplateId,
+                  onOpen: () => widget.onOpen(template),
+                  onStart: () => widget.onStart(template),
+                  onDelete: () => widget.onDelete(template),
+                ),
+              ),
+            ),
+        if (_visibleCount < widget.templates.length)
+          Align(
+            alignment: Alignment.center,
+            child: JimTextButton(
+              label:
+                  'Show more templates (${widget.templates.length - _visibleCount})',
+              icon: Icons.expand_more_rounded,
+              onPressed: () => setState(() {
+                _visibleCount = (_visibleCount + _pageSize).clamp(
+                  0,
+                  widget.templates.length,
+                );
+              }),
             ),
           ),
-        ),
-      ],
-    );
-  }
-}
-
-class _WorkoutExecutionPanel extends StatelessWidget {
-  const _WorkoutExecutionPanel({
-    required this.workoutLog,
-    required this.onNotesChanged,
-    required this.onExerciseChanged,
-    required this.onSuggestionSelected,
-    required this.onSetChanged,
-    required this.onAddSet,
-    required this.onRemoveSet,
-    required this.onFinish,
-  });
-
-  final WorkoutLogDraft workoutLog;
-  final ValueChanged<String> onNotesChanged;
-  final void Function(int index, WorkoutExerciseDraft exercise)
-      onExerciseChanged;
-  final void Function(int index, ExerciseSuggestion suggestion)
-      onSuggestionSelected;
-  final void Function(int exerciseIndex, int setIndex, SetDraft setDraft)
-      onSetChanged;
-  final ValueChanged<int> onAddSet;
-  final void Function(int exerciseIndex, int setIndex) onRemoveSet;
-  final Future<void> Function() onFinish;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final setCount = workoutLog.exercises.fold<int>(
-      0,
-      (total, exercise) => total + exercise.sets.length,
-    );
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        JimSurface(
-          tone: JimSurfaceTone.accent,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  const Icon(
-                    Icons.timer_rounded,
-                    color: JimColors.accentStrong,
-                  ),
-                  const SizedBox(width: JimSpacing.sm),
-                  Expanded(
-                    child: Text(
-                      workoutLog.name.trim().isEmpty
-                          ? 'Workout in progress'
-                          : workoutLog.name,
-                      style: theme.textTheme.titleLarge,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: JimSpacing.xs),
-              Text(
-                '${workoutLog.exercises.length} exercises • $setCount sets',
-                style: theme.textTheme.bodyMedium?.copyWith(
-                  color: JimColors.inkSoft,
-                ),
-              ),
-              const SizedBox(height: JimSpacing.md),
-              TextFormField(
-                initialValue: workoutLog.notes,
-                minLines: 2,
-                maxLines: 4,
-                onChanged: onNotesChanged,
-                decoration: const InputDecoration(
-                  labelText: 'Session notes',
-                  prefixIcon: Icon(Icons.notes_rounded),
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: JimSpacing.md),
-        if (workoutLog.exercises.isEmpty)
-          const JimEmptyState(
-            title: 'No exercises loaded',
-            message: 'Start from a saved template to preload your workout.',
-            icon: Icons.fitness_center_rounded,
-          )
-        else
-          ...workoutLog.exercises.asMap().entries.map(
-                (entry) => Padding(
-                  padding: const EdgeInsets.only(bottom: JimSpacing.md),
-                  child: _ExerciseEditor(
-                    index: entry.key,
-                    exercise: entry.value,
-                    fieldKeyPrefix: 'workout',
-                    onChanged: (exercise) =>
-                        onExerciseChanged(entry.key, exercise),
-                    onSuggestionSelected: (suggestion) =>
-                        onSuggestionSelected(entry.key, suggestion),
-                    onSetChanged: (setIndex, setDraft) =>
-                        onSetChanged(entry.key, setIndex, setDraft),
-                    onAddSet: () => onAddSet(entry.key),
-                    onRemoveSet: (setIndex) => onRemoveSet(entry.key, setIndex),
-                    onRemove: null,
-                  ),
-                ),
-              ),
-        SizedBox(
-          width: double.infinity,
-          child: JimGuardedPrimaryButton(
-            label: 'Finish Workout',
-            loadingLabel: 'Finishing...',
-            icon: Icons.check_circle_rounded,
-            onRun: onFinish,
-          ),
-        ),
       ],
     );
   }
@@ -441,25 +801,49 @@ class _WorkoutExecutionPanel extends StatelessWidget {
 class _LastWorkoutSavedPanel extends StatelessWidget {
   const _LastWorkoutSavedPanel({
     required this.workoutLog,
+    required this.mutation,
+    required this.onRetry,
   });
 
   final WorkoutLogDraft workoutLog;
+  final WorkoutMutationResult? mutation;
+  final Future<void> Function() onRetry;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final status = mutation?.syncStatus ?? WorkoutSyncStatus.synced;
+    final isSynced = status == WorkoutSyncStatus.synced;
+    final needsReview = status == WorkoutSyncStatus.needsReview ||
+        status == WorkoutSyncStatus.failed;
     return JimSurface(
       tone: JimSurfaceTone.soft,
       child: Row(
         children: [
-          const Icon(Icons.check_circle_rounded, color: JimColors.success),
+          Icon(
+            isSynced
+                ? Icons.check_circle_rounded
+                : needsReview
+                    ? Icons.error_outline_rounded
+                    : Icons.sync_rounded,
+            color: isSynced ? JimColors.success : JimColors.accentStrong,
+          ),
           const SizedBox(width: JimSpacing.sm),
           Expanded(
             child: Text(
-              '${workoutLog.name.trim().isEmpty ? 'Workout' : workoutLog.name} saved.',
+              isSynced
+                  ? '${workoutLog.name.trim().isEmpty ? 'Workout' : workoutLog.name} saved.'
+                  : needsReview
+                      ? 'Needs attention'
+                      : 'Saved on device — waiting to sync',
               style: theme.textTheme.titleSmall,
             ),
           ),
+          if (mutation?.retryable == true)
+            TextButton(
+              onPressed: onRetry,
+              child: const Text('Retry'),
+            ),
         ],
       ),
     );
@@ -510,7 +894,7 @@ class _WorkoutSchedulePanel extends StatelessWidget {
         ),
         const SizedBox(height: JimSpacing.xs),
         Text(
-          'Assign saved templates to days. Each active day repeats weekly.',
+          'Stored on this device for this account. Each active day repeats weekly.',
           style: theme.textTheme.bodyMedium?.copyWith(
             color: JimColors.inkSoft,
             height: 1.35,
@@ -808,12 +1192,21 @@ class _ExerciseEditor extends ConsumerStatefulWidget {
   ConsumerState<_ExerciseEditor> createState() => _ExerciseEditorState();
 }
 
+enum _ExerciseSearchStatus {
+  idle,
+  loading,
+  results,
+  noResults,
+  cachedOffline,
+  error,
+}
+
 class _ExerciseEditorState extends ConsumerState<_ExerciseEditor> {
   Timer? _debounce;
   late final TextEditingController _exerciseNameController;
   List<ExerciseSuggestion> _suggestions = const [];
-  bool _isSearching = false;
-  bool _searchFailed = false;
+  _ExerciseSearchStatus _searchStatus = _ExerciseSearchStatus.idle;
+  Object? _searchError;
   final _searchGate = SearchRequestGate();
 
   @override
@@ -838,27 +1231,29 @@ class _ExerciseEditorState extends ConsumerState<_ExerciseEditor> {
     super.dispose();
   }
 
-  void _queueExerciseSearch(String query) {
+  void _queueExerciseSearch(String query, {bool force = false}) {
     _debounce?.cancel();
     final normalized = query.trim().toLowerCase();
     if (normalized.isEmpty) {
       _searchGate.clear();
       setState(() {
         _suggestions = const [];
-        _isSearching = false;
-        _searchFailed = false;
+        _searchStatus = _ExerciseSearchStatus.idle;
+        _searchError = null;
       });
       return;
     }
 
-    if (normalized == _searchGate.activeQuery && !_isSearching) {
+    if (!force &&
+        normalized == _searchGate.activeQuery &&
+        _searchStatus != _ExerciseSearchStatus.loading) {
       return;
     }
 
     final generation = _searchGate.begin(normalized);
     setState(() {
-      _isSearching = true;
-      _searchFailed = false;
+      _searchStatus = _ExerciseSearchStatus.loading;
+      _searchError = null;
     });
     _debounce = Timer(const Duration(milliseconds: 300), () async {
       try {
@@ -870,16 +1265,28 @@ class _ExerciseEditorState extends ConsumerState<_ExerciseEditor> {
         }
         setState(() {
           _suggestions = results;
-          _isSearching = false;
-          _searchFailed = false;
+          _searchStatus = results.isEmpty
+              ? _ExerciseSearchStatus.noResults
+              : _ExerciseSearchStatus.results;
+          _searchError = null;
         });
-      } catch (_) {
+      } on CachedSearchResultsException<ExerciseSuggestion> catch (error) {
         if (!mounted || !_searchGate.isCurrent(generation, normalized)) {
           return;
         }
         setState(() {
-          _isSearching = false;
-          _searchFailed = true;
+          _suggestions = error.results;
+          _searchStatus = _ExerciseSearchStatus.cachedOffline;
+          _searchError = error.error;
+        });
+      } catch (error) {
+        if (!mounted || !_searchGate.isCurrent(generation, normalized)) {
+          return;
+        }
+        setState(() {
+          _suggestions = const [];
+          _searchStatus = _ExerciseSearchStatus.error;
+          _searchError = error;
         });
       }
     });
@@ -919,7 +1326,7 @@ class _ExerciseEditorState extends ConsumerState<_ExerciseEditor> {
             decoration: InputDecoration(
               labelText: 'Exercise name',
               prefixIcon: const Icon(Icons.fitness_center_rounded),
-              suffixIcon: _isSearching
+              suffixIcon: _searchStatus == _ExerciseSearchStatus.loading
                   ? const Padding(
                       padding: EdgeInsets.all(14),
                       child: SizedBox(
@@ -931,7 +1338,7 @@ class _ExerciseEditorState extends ConsumerState<_ExerciseEditor> {
                   : null,
             ),
           ),
-          if (_isSearching) ...[
+          if (_searchStatus == _ExerciseSearchStatus.loading) ...[
             const SizedBox(height: 8),
             Text(
               'Searching exercises...',
@@ -939,13 +1346,46 @@ class _ExerciseEditorState extends ConsumerState<_ExerciseEditor> {
                     color: JimColors.inkMuted,
                   ),
             ),
-          ] else if (_searchFailed) ...[
+          ] else if (_searchStatus == _ExerciseSearchStatus.noResults) ...[
             const SizedBox(height: 8),
             Text(
-              'Couldn\'t refresh exercises. Check connection and try again.',
+              'No exercise results found.',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: JimColors.inkMuted,
+                  ),
+            ),
+          ] else if (_searchStatus == _ExerciseSearchStatus.cachedOffline) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Offline — showing cached exercise results.',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
                     color: JimColors.terracotta,
                   ),
+            ),
+          ] else if (_searchStatus == _ExerciseSearchStatus.error) ...[
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    presentAppError(
+                      _searchError ?? Exception('Exercise search failed.'),
+                      fallbackMessage:
+                          'Exercise search is unavailable. Please try again.',
+                    ),
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: JimColors.terracotta,
+                        ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => _queueExerciseSearch(
+                    _exerciseNameController.text,
+                    force: true,
+                  ),
+                  child: const Text('Retry'),
+                ),
+              ],
             ),
           ],
           if (_suggestions.isNotEmpty) ...[
@@ -975,7 +1415,12 @@ class _ExerciseEditorState extends ConsumerState<_ExerciseEditor> {
                       suggestion: suggestion,
                       onTap: () {
                         widget.onSuggestionSelected(suggestion);
-                        setState(() => _suggestions = const []);
+                        _searchGate.clear();
+                        setState(() {
+                          _suggestions = const [];
+                          _searchStatus = _ExerciseSearchStatus.idle;
+                          _searchError = null;
+                        });
                       },
                     ),
                   ),
@@ -1182,6 +1627,16 @@ void _showWorkoutSuccess(BuildContext context, String message) {
   );
 }
 
+String _workoutMutationMessage(WorkoutMutationResult? result) {
+  return switch (result?.syncStatus) {
+    WorkoutSyncStatus.synced => 'Workout saved.',
+    WorkoutSyncStatus.pendingSync => 'Saved on device — waiting to sync.',
+    WorkoutSyncStatus.needsReview => 'Needs attention.',
+    WorkoutSyncStatus.failed => 'Workout save failed. Retry when ready.',
+    null => 'Workout status is unavailable.',
+  };
+}
+
 void _showWorkoutFailure(BuildContext context, Object error) {
   if (!context.mounted) {
     return;
@@ -1216,45 +1671,11 @@ Future<void> _showWorkoutErrorDialog(
 }
 
 String _friendlyWorkoutError(Object error) {
-  if (error is DioException) {
-    return switch (error.type) {
-      DioExceptionType.connectionTimeout ||
-      DioExceptionType.sendTimeout ||
-      DioExceptionType.receiveTimeout =>
-        'Workout save timeout\nsource: lib/features/workouts/presentation/workouts_page.dart -> _runWorkoutAction\nproblem: backend did not answer before Dio timeout\nraw: ${error.message}',
-      DioExceptionType.connectionError =>
-        'Workout save connection error\nsource: lib/features/workouts/presentation/workouts_page.dart -> _runWorkoutAction\nproblem: Flutter could not reach FastAPI/ngrok\nraw: ${error.message}',
-      DioExceptionType.badResponse => _friendlyStatusError(
-          error.response?.statusCode,
-          error.response?.data,
-        ),
-      DioExceptionType.cancel => 'The workout request was cancelled.',
-      DioExceptionType.badCertificate =>
-        'The backend TLS certificate was rejected. Check the backend URL.',
-      DioExceptionType.unknown =>
-        'Workout save failed before backend response\nsource: lib/features/workouts/presentation/workouts_page.dart -> _runWorkoutAction\nraw: ${error.message}',
-    };
-  }
-
-  final raw = error.toString().replaceFirst('Exception: ', '').trim();
-  if (raw.contains('receive timeout') || raw.contains('send timeout')) {
-    return 'Workout save timeout\nsource: lib/features/workouts/presentation/workouts_page.dart -> _runWorkoutAction\nproblem: backend did not answer before Dio timeout\nraw: $raw';
-  }
-  return raw;
-}
-
-String _friendlyStatusError(int? statusCode, Object? body) {
-  if (statusCode == 401) {
-    return 'Workout save unauthorized\nsource: lib/features/workouts/presentation/workouts_page.dart -> _friendlyStatusError\nstatus: 401\nproblem: FastAPI rejected the Authorization bearer token.\nresponse_body: ${body ?? 'empty'}\nfix: Verify backend JWT validation, Supabase project ref, and whether Flutter is sending a fresh access token.';
-  }
-  if (statusCode == 422) {
-    return 'Workout payload rejected\nsource: lib/features/workouts/presentation/workouts_page.dart -> _friendlyStatusError\nstatus: 422\nproblem: FastAPI rejected the workout request schema.\nresponse_body: ${body ?? 'empty'}\nfix: Compare the request payload shown in app_repositories.dart diagnostics with the backend Pydantic model.';
-  }
-  if (statusCode != null && statusCode >= 500) {
-    return 'Workout backend server error\nsource: lib/features/workouts/presentation/workouts_page.dart -> _friendlyStatusError\nstatus: $statusCode\nproblem: FastAPI crashed or returned an internal error while saving workout.\nresponse_body: ${body ?? 'empty'}\nfix: Inspect backend logs for this route and confirm DB insert/user lookup succeeds.';
-  }
-  final bodyText = body?.toString() ?? 'Workout save failed.';
-  return 'Workout save failed\nsource: lib/features/workouts/presentation/workouts_page.dart -> _friendlyStatusError\nstatus: ${statusCode ?? 'unknown'}\nresponse_body: $bodyText';
+  return presentAppError(
+    error,
+    fallbackMessage:
+        'We could not save that workout change. Your edits are still here; please try again.',
+  );
 }
 
 class _SetEditor extends StatelessWidget {

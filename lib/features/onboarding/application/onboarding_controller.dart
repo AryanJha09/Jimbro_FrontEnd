@@ -6,7 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/navigation/app_state.dart';
 import '../../../shared/models/onboarding_models.dart';
 
-const int onboardingSchemaVersion = 1;
+const int onboardingSchemaVersion = 2;
 
 enum OnboardingStepId {
   welcome('welcome'),
@@ -98,9 +98,15 @@ class SharedPreferencesOnboardingPersistenceStore
     final key = _keyFor(model.userId);
     final temporaryKey = _temporaryKeyFor(model.userId);
     final payload = jsonEncode(model.toJson());
-    await _preferences.setString(temporaryKey, payload);
-    await _preferences.setString(key, payload);
-    await _preferences.remove(temporaryKey);
+    if (!await _preferences.setString(temporaryKey, payload)) {
+      throw StateError('Could not stage onboarding progress.');
+    }
+    if (!await _preferences.setString(key, payload)) {
+      throw StateError('Could not save onboarding progress.');
+    }
+    if (!await _preferences.remove(temporaryKey)) {
+      throw StateError('Could not finalize onboarding progress.');
+    }
   }
 
   @override
@@ -139,6 +145,7 @@ final onboardingControllerProvider =
 
 class OnboardingController extends AsyncNotifier<OnboardingStateModel> {
   static const _localUserId = 'local';
+  bool _persistenceInFlight = false;
 
   @override
   Future<OnboardingStateModel> build() async {
@@ -276,12 +283,12 @@ class OnboardingController extends AsyncNotifier<OnboardingStateModel> {
     await _commit(next);
   }
 
-  Future<void> complete() async {
+  Future<bool> complete() async {
     final current = _requireState();
     final validation = validateForCompletion(current);
     if (!validation.isValid) {
       state = AsyncData(current.copyWith(errorMessage: validation.message));
-      return;
+      return false;
     }
     final completedSteps = {
       ...current.completedStepIds,
@@ -292,7 +299,7 @@ class OnboardingController extends AsyncNotifier<OnboardingStateModel> {
       completedStepIds: completedSteps,
       errorMessage: null,
     );
-    await _commit(
+    return _commit(
       next,
       status: OnboardingPersistenceStatus.completed,
       completedAt: DateTime.now(),
@@ -393,48 +400,58 @@ class OnboardingController extends AsyncNotifier<OnboardingStateModel> {
       answers: update(current.answers),
       errorMessage: null,
     );
-    await _commit(next);
+    await _commit(next, failureState: next);
   }
 
-  Future<void> _commit(
+  Future<bool> _commit(
     OnboardingStateModel next, {
     OnboardingPersistenceStatus status = OnboardingPersistenceStatus.inProgress,
     DateTime? completedAt,
+    OnboardingStateModel? failureState,
   }) async {
-    final store = await ref.read(onboardingPersistenceStoreProvider.future);
-    final now = DateTime.now();
-    final persisted = OnboardingPersistenceModel.fromState(
-      userId: _currentUserId,
-      status: status,
-      state: next,
-      startedAt: _startedAtFor(next) ?? now,
-      updatedAt: now,
-      completedAt: completedAt,
-    );
-    state = AsyncData(next.copyWith(errorMessage: null));
+    if (_persistenceInFlight) {
+      return false;
+    }
+    _persistenceInFlight = true;
     try {
+      final store = await ref.read(onboardingPersistenceStoreProvider.future);
+      final now = DateTime.now();
+      final persisted = OnboardingPersistenceModel.fromState(
+        userId: _currentUserId,
+        status: status,
+        state: next,
+        startedAt: _startedAtFor(next) ?? now,
+        updatedAt: now,
+        completedAt: completedAt,
+      );
       await store.save(persisted);
+      state = AsyncData(next.copyWith(errorMessage: null));
+      return true;
     } catch (_) {
       state = AsyncData(
-        next.copyWith(
+        (failureState ?? _requireState()).copyWith(
           errorMessage:
               'Your answers are still here, but they could not be saved on this device yet.',
         ),
       );
+      return false;
+    } finally {
+      _persistenceInFlight = false;
     }
   }
 
   OnboardingStateModel _repairForResume(OnboardingStateModel value) {
-    final firstIncomplete = _firstIncompleteStep(value);
-    final currentStep = OnboardingStepId.fromWireValue(value.currentStepId);
+    final repaired = value.copyWith(schemaVersion: onboardingSchemaVersion);
+    final firstIncomplete = _firstIncompleteStep(repaired);
+    final currentStep = OnboardingStepId.fromWireValue(repaired.currentStepId);
     if (firstIncomplete != null &&
         _stepIndex(currentStep) > _stepIndex(firstIncomplete)) {
-      return value.copyWith(
+      return repaired.copyWith(
         currentStepId: firstIncomplete.wireValue,
         errorMessage: null,
       );
     }
-    return value.copyWith(errorMessage: null);
+    return repaired.copyWith(errorMessage: null);
   }
 
   OnboardingStepId? _firstIncompleteStep(OnboardingStateModel value) {
@@ -587,7 +604,7 @@ class OnboardingController extends AsyncNotifier<OnboardingStateModel> {
       OnboardingStepId.lifestyleInsight =>
         'Finish your lifestyle answers so Jim can shape a realistic path.',
       OnboardingStepId.dietaryPreference =>
-        'Choose how Jim should support your food habits.',
+        'Choose your dietary preference before continuing.',
       OnboardingStepId.age => 'Enter your age.',
       OnboardingStepId.sex => 'Choose the option Jim should use for estimates.',
       OnboardingStepId.height => 'Enter your height.',

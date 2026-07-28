@@ -42,6 +42,7 @@ class _HistoryContent extends ConsumerWidget {
     final insightAsync = ref.watch(historyInsightProvider);
     final recoveryAsync = ref.watch(recoveryInsightProvider);
     final theme = Theme.of(context);
+    final hasScaledText = MediaQuery.textScalerOf(context).scale(1) > 1;
 
     return DecoratedBox(
       decoration: const BoxDecoration(
@@ -81,31 +82,47 @@ class _HistoryContent extends ConsumerWidget {
                 children: [
                   Text('Companion progress', style: theme.textTheme.titleLarge),
                   const SizedBox(height: 14),
-                  Row(
-                    children: [
-                      JimCompanionAvatar(
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final companion = JimCompanionAvatar(
                         stage: consistency.companionStage,
                         size: 110,
                         showLabel: true,
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Current streak',
-                              style: theme.textTheme.headlineSmall,
+                      );
+                      final details = Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Current streak',
+                            style: theme.textTheme.headlineSmall,
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Longest run: ${consistency.longestStreak} days\nTotal logs: ${consistency.totalLogs}',
+                            style: theme.textTheme.bodyLarge?.copyWith(
+                              color: JimColors.inkSoft,
                             ),
-                            const SizedBox(height: 6),
-                            Text(
-                              'Longest run: ${consistency.longestStreak} days\nTotal logs: ${consistency.totalLogs}',
-                              style: theme.textTheme.bodyLarge?.copyWith(
-                                color: JimColors.inkSoft,
-                              ),
-                            ),
-                            if (kDebugMode) ...[
-                              const SizedBox(height: 12),
+                          ),
+                          if (kDebugMode) ...[
+                            const SizedBox(height: 12),
+                            if (hasScaledText)
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  OutlinedButton(
+                                    onPressed: () =>
+                                        controller.adjustConsistency(-1),
+                                    child: const Text('-1 day'),
+                                  ),
+                                  const SizedBox(height: JimSpacing.xs),
+                                  FilledButton(
+                                    onPressed: () =>
+                                        controller.adjustConsistency(1),
+                                    child: const Text('+1 day'),
+                                  ),
+                                ],
+                              )
+                            else
                               Row(
                                 children: [
                                   Expanded(
@@ -125,11 +142,27 @@ class _HistoryContent extends ConsumerWidget {
                                   ),
                                 ],
                               ),
-                            ],
                           ],
-                        ),
-                      ),
-                    ],
+                        ],
+                      );
+                      if (hasScaledText && constraints.maxWidth < 400) {
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Center(child: companion),
+                            const SizedBox(height: JimSpacing.md),
+                            details,
+                          ],
+                        );
+                      }
+                      return Row(
+                        children: [
+                          companion,
+                          const SizedBox(width: 16),
+                          Expanded(child: details),
+                        ],
+                      );
+                    },
                   ),
                   const SizedBox(height: 16),
                   Row(
@@ -214,8 +247,9 @@ class _CurrentStreakPill extends StatelessWidget {
         borderRadius: BorderRadius.circular(JimRadius.pill),
         border: Border.all(color: JimColors.accentLine),
       ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
+      child: Wrap(
+        crossAxisAlignment: WrapCrossAlignment.center,
+        runSpacing: JimSpacing.xs,
         children: [
           Text(
             '$days day streak',

@@ -70,6 +70,70 @@ void main() {
     );
   });
 
+  test('base URL normalization removes redundant and trailing slashes', () {
+    const config = AppConfig(
+      backendMode: BackendMode.fastApi,
+      authMode: AuthMode.fastApi,
+      fastApiBaseUrl: 'https://api.example.test//api//v1///',
+      supabaseUrl: '',
+      supabaseAnonKey: '',
+      supabaseRedirectScheme: 'jimbro',
+      supabaseRedirectHost: 'login-callback',
+    );
+
+    expect(
+      config.normalizedFastApiBaseUrl,
+      'https://api.example.test/api/v1',
+    );
+  });
+
+  test('release configuration rejects a loopback API host', () {
+    const config = AppConfig(
+      backendMode: BackendMode.fastApi,
+      authMode: AuthMode.fastApi,
+      fastApiBaseUrl: 'http://127.0.0.1:8000/api/v1',
+      supabaseUrl: '',
+      supabaseAnonKey: '',
+      supabaseRedirectScheme: 'jimbro',
+      supabaseRedirectHost: 'login-callback',
+    );
+
+    expect(
+      config.validate(
+        presentVariableNames: const {
+          'FASTAPI_BASE_URL',
+        },
+        isReleaseBuild: true,
+      ).where((issue) => issue.code == 'release_fastapi_loopback_url'),
+      hasLength(1),
+    );
+  });
+
+  test('FastAPI auth restores and clears a securely stored session', () async {
+    final store = _MemorySecureAuthSessionStore(
+      const AuthSession(
+        userId: 'restored-user',
+        displayName: 'Restored User',
+        email: 'restored@example.com',
+        accessToken: 'stored-token',
+        refreshToken: 'stored-refresh-token',
+        provider: 'fastapi',
+      ),
+    );
+    final repository = FastApiAuthRepository(
+      Dio(BaseOptions(baseUrl: 'https://api.example.test/api/v1')),
+      sessionStore: store,
+    );
+
+    final restored = await repository.currentSession();
+    expect(restored?.userId, 'restored-user');
+    expect(restored?.accessToken, 'stored-token');
+
+    await repository.signOut();
+    expect(store.session, isNull);
+    expect(await repository.currentSession(), isNull);
+  });
+
   test('401 from protected save clears session and auth gate state', () async {
     final authRepository = _MutableAuthRepository();
     final container = ProviderContainer(
@@ -143,17 +207,11 @@ void main() {
         ),
       ),
       throwsA(
-        isA<Exception>()
-            .having(
-              (error) => error.toString(),
-              'message',
-              contains('Authentication token missing'),
-            )
-            .having(
-              (error) => error.toString(),
-              'backend sent',
-              contains('backend_request_sent: false'),
-            ),
+        isA<AuthSessionExpiredException>().having(
+          (error) => error.toString(),
+          'safe message',
+          'Your session expired. Please sign in again.',
+        ),
       ),
     );
   });
@@ -190,6 +248,21 @@ class _MutableAuthRepository implements AuthRepository {
     signOutCalled = true;
     session = null;
   }
+}
+
+class _MemorySecureAuthSessionStore implements SecureAuthSessionStore {
+  _MemorySecureAuthSessionStore(this.session);
+
+  AuthSession? session;
+
+  @override
+  Future<AuthSession?> read() async => session;
+
+  @override
+  Future<void> write(AuthSession session) async => this.session = session;
+
+  @override
+  Future<void> clear() async => session = null;
 }
 
 class _ExpiringWorkoutRepository extends MockWorkoutRepository {

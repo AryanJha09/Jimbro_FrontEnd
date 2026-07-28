@@ -16,9 +16,9 @@ Production backend is deployed on Render at `https://jimbro-uvi6.onrender.com/`.
 
 JimBro is now a mobile-first fitness coaching MVP with:
 
-- Guided one-question onboarding with persistent progress, validation, resume repair, dynamic coaching insights, and final profile persistence.
+- Guided one-question onboarding with persistent progress, validation, resume repair, dynamic coaching insights, required database-safe dietary preference, and final profile persistence.
 - Onboarding/profile consistency hardening: completed onboarding becomes the canonical local profile for Profile, Nutrition, Workout, and Home; Atlas sync failures are non-fatal and show sync-pending messaging.
-- Auth/session hardening for mock, FastAPI, and Supabase-direct modes.
+- Auth/session hardening for mock, FastAPI, and Supabase-direct modes, including a blocking application-user bootstrap before authenticated navigation.
 - Profile edit/save with validation, target refresh, sign out, and calculated calorie/protein/hydration/TDEE cards.
 - Home dashboard wired to real backend context when available: `/agent/context` first, then Atlas metrics, food summary, workout logs/trends/templates fallback.
 - Workout templates, saved-template library, weekly schedule, local schedule fallback, start-from-template, active workout execution, edited sets/reps/weight/RPE, finish workout, and nested workout log payloads.
@@ -52,7 +52,7 @@ Blocked/unverified:
 - Real device notification delivery/tap behavior still needs manual iOS and Android verification.
 - Live protected backend smoke checks need a real bearer token.
 - Live backend end-to-end persistence still needs verification against deployed FastAPI/Supabase.
-- Manual live onboarding is blocked until backend stops requiring plaintext `password` in `POST /atlas/onboard` for already-authenticated bearer sessions.
+- Live deployment is blocked until the backend implements the bearer-only Atlas contract and idempotent `/supabase/profile` reconciliation contract documented in `docs/BACKEND_ATLAS_ONBOARD_CONTRACT_REQUEST.md`.
 
 ## Current Dirty Worktree
 
@@ -110,8 +110,9 @@ Atlas/profile:
 - `GET /atlas/metrics`
 - `PATCH /atlas/profile`
 - Onboarding maps supported fields, sends `constraints_json` rather than `constraints`, does not send `generate_program`, and omits unsupported sex enum values.
-- Current deployed backend still requires `username`, `email`, and `password` in `/atlas/onboard`. Frontend only sends `password` when it exists transiently from the current email/password auth flow. It never persists, fabricates, or logs password.
-- Restored Supabase/FastAPI sessions do not expose plaintext password, so frontend skips `/atlas/onboard`, saves the canonical profile locally/in app state, uses profile-based local metrics, and shows a sync-pending message.
+- Frontend Atlas onboarding is bearer-only and never sends or retains a plaintext password for profile creation.
+- Authenticated startup and fresh login/sign-up call `GET /supabase/profile` as the canonical provisioning/reconciliation gate and require a returned application-user identifier before navigation.
+- Completed onboarding sends one of `omnivore`, `vegetarian`, `vegan`, `keto`, or `other` and marks `onboarding_completed` only in the canonical profile write.
 - `GET /atlas/metrics` 404 / `ATLAS_METRICS_NOT_FOUND` is treated as metrics pending, not app failure.
 - Live Atlas metrics are source of truth for BMR/TDEE/macros/hydration when available; local formulas are fallback only.
 - Backend source code is not present in this repo. Requested backend change is documented in `docs/BACKEND_ATLAS_ONBOARD_CONTRACT_REQUEST.md`: `/atlas/onboard` should accept authenticated bearer JWT users without requiring `password`, derive user id/email server-side, make username optional/derived, and return profile/metrics with `updated_at`.
@@ -165,6 +166,8 @@ Highest priority:
 
 1. Backend Atlas onboarding contract fix:
    - update deployed backend so `POST /atlas/onboard` accepts authenticated bearer users without `password`
+   - make authenticated `GET /supabase/profile` idempotently provision/reconcile `public.users` and return its identifier
+   - add the real backend migration for dietary enum/default/not-null and unique Auth UUID invariants
    - derive user id/email from JWT/session
    - make `username` optional/derived
    - return saved profile/metrics with `updated_at`

@@ -4,6 +4,8 @@ import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/errors/app_error.dart';
+import '../../core/errors/profile_schema_exception.dart';
 import '../../core/nutrition/nutrition_targets.dart';
 import '../../core/notifications/workout_notification_service.dart';
 import '../../core/repositories/app_repositories.dart';
@@ -11,9 +13,91 @@ import '../../shared/models/app_models.dart';
 import '../../shared/models/atlas_insight.dart';
 import '../../shared/models/onboarding_models.dart';
 
-final authSessionProvider = StateProvider<AuthSession?>((ref) => null);
-final isAuthenticatedProvider = StateProvider<bool>((ref) => false);
-final hasCompletedOnboardingProvider = StateProvider<bool>((ref) => false);
+enum AppBootstrapStatus {
+  unauthenticated,
+  authenticating,
+  authenticatedProvisioning,
+  onboardingRequired,
+  ready,
+  expired,
+  recoverableError,
+  fatalError,
+}
+
+class AppBootstrapState {
+  const AppBootstrapState({
+    required this.status,
+    this.session,
+    this.error,
+  });
+
+  const AppBootstrapState.authenticating()
+      : this(status: AppBootstrapStatus.authenticating);
+
+  final AppBootstrapStatus status;
+  final AuthSession? session;
+  final Object? error;
+
+  bool get isAuthenticated =>
+      session != null &&
+      status != AppBootstrapStatus.unauthenticated &&
+      status != AppBootstrapStatus.expired;
+
+  bool get onboardingCompleted => status == AppBootstrapStatus.ready;
+
+  bool get allowsProtectedWrites =>
+      status == AppBootstrapStatus.onboardingRequired ||
+      status == AppBootstrapStatus.ready;
+
+  AppBootstrapState copyWith({
+    AppBootstrapStatus? status,
+    Object? session = _bootstrapUnset,
+    Object? error = _bootstrapUnset,
+  }) {
+    return AppBootstrapState(
+      status: status ?? this.status,
+      session: identical(session, _bootstrapUnset)
+          ? this.session
+          : session as AuthSession?,
+      error: identical(error, _bootstrapUnset) ? this.error : error,
+    );
+  }
+}
+
+const _bootstrapUnset = Object();
+
+AppBootstrapStatus _bootstrapFailureStatus(Object error) {
+  if (error is AuthSessionExpiredException ||
+      error is AppError && error.code == AppErrorCode.sessionExpired) {
+    return AppBootstrapStatus.expired;
+  }
+  if (error is UserProvisioningException) {
+    return AppBootstrapStatus.fatalError;
+  }
+  final mapped = mapAppError(
+    error,
+    fallbackMessage:
+        'JimBro could not load your profile. Please try again or sign out.',
+    method: 'GET',
+    route: '/supabase/profile',
+  );
+  return mapped.diagnostics.retryable
+      ? AppBootstrapStatus.recoverableError
+      : AppBootstrapStatus.fatalError;
+}
+
+final appBootstrapProvider = StateProvider<AppBootstrapState>(
+  (ref) => const AppBootstrapState.authenticating(),
+);
+final authSessionProvider = Provider<AuthSession?>(
+  (ref) => ref.watch(appBootstrapProvider).session,
+);
+final isAuthenticatedProvider = Provider<bool>(
+  (ref) => ref.watch(appBootstrapProvider).isAuthenticated,
+);
+final hasCompletedOnboardingProvider = Provider<bool>(
+  (ref) => ref.watch(appBootstrapProvider).onboardingCompleted,
+);
 final forceShowOnboardingProvider = StateProvider<bool>((ref) => false);
 final currentTabProvider = StateProvider<int>((ref) => 0);
 
@@ -46,6 +130,17 @@ final recoveryInsightProvider = FutureProvider<AtlasInsight>((ref) async {
     draft.session,
     draft.consistency,
   );
+});
+
+final workoutHistoryProvider =
+    FutureProvider<List<WorkoutLogDraft>>((ref) async {
+  final repository = ref.watch(workoutRepositoryProvider);
+  final session = ref.watch(authSessionProvider);
+  if (repository is WorkoutHistoryRepository) {
+    return (repository as WorkoutHistoryRepository).loadWorkoutHistory(session);
+  }
+  final latest = await repository.loadWorkoutLog(session);
+  return latest.workoutLogId == null ? const [] : [latest];
 });
 
 final atlasPromptPreviewProvider =
@@ -102,31 +197,19 @@ class ProfileSyncResult {
   bool get hasWarning => warning != null && warning!.trim().isNotEmpty;
 }
 
-class _TransientOnboardingPassword {
-  const _TransientOnboardingPassword({
-    required this.email,
-    required this.password,
-  });
-
-  final String email;
-  final String password;
-
-  String? passwordFor(String sessionEmail) {
-    if (email.trim().toLowerCase() != sessionEmail.trim().toLowerCase()) {
-      return null;
-    }
-    return password;
-  }
-}
-
 class AppDraftController extends AsyncNotifier<AppDraftState> {
-  _TransientOnboardingPassword? _transientOnboardingPassword;
+  int _bootstrapGeneration = 0;
+  Future<void>? _sessionBootstrapInFlight;
+  String? _sessionBootstrapUserId;
+  Future<WorkoutTemplateDraft>? _templateSaveInFlight;
 
   AuthRepository get _authRepository => ref.read(authRepositoryProvider);
   AccountRepository get _accountRepository =>
       ref.read(accountRepositoryProvider);
   LocalAccountDataStore get _localAccountDataStore =>
       ref.read(localAccountDataStoreProvider);
+  WorkoutTemplateDraftStore get _workoutTemplateDraftStore =>
+      ref.read(workoutTemplateDraftStoreProvider);
   ProfileRepository get _profileRepository =>
       ref.read(profileRepositoryProvider);
   WorkoutRepository get _workoutRepository =>
@@ -139,7 +222,6 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       ref.read(programRepositoryProvider);
   ConsistencyRepository get _consistencyRepository =>
       ref.read(consistencyRepositoryProvider);
-  SearchRepository get _searchRepository => ref.read(searchRepositoryProvider);
 
   @override
   Future<AppDraftState> build() async {
@@ -152,43 +234,86 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     ref.watch(nutritionRepositoryProvider);
     ref.watch(programRepositoryProvider);
     ref.watch(consistencyRepositoryProvider);
-    ref.watch(searchRepositoryProvider);
 
-    final session = await _authRepository.currentSession();
-    if (session != null) {
-      ref.read(authSessionProvider.notifier).state = session;
-      ref.read(isAuthenticatedProvider.notifier).state = true;
-      await _flushPending(session);
-    }
-
-    late final AppDraftState draft;
+    final generation = ++_bootstrapGeneration;
+    _setBootstrap(const AppBootstrapState.authenticating());
     try {
-      draft = await _loadDraftForSession(session);
-    } on AuthSessionExpiredException {
-      if (session != null) {
-        try {
-          await _authRepository.signOut();
-        } catch (_) {
-          // The backend rejected the session; local state still returns to Auth.
+      final session = await _authRepository.currentSession();
+      if (session == null) {
+        final draft = await _loadDraftForSession(null);
+        if (generation == _bootstrapGeneration) {
+          _setBootstrap(
+            const AppBootstrapState(
+              status: AppBootstrapStatus.unauthenticated,
+            ),
+          );
+        }
+        return draft;
+      }
+      _setBootstrap(
+        AppBootstrapState(
+          status: AppBootstrapStatus.authenticatedProvisioning,
+          session: session,
+        ),
+      );
+      final bootstrap = await _confirmApplicationUser(session);
+      await _flushPending(session);
+      final draft = await _loadDraftForSession(
+        session,
+        canonicalProfile: bootstrap.profile,
+      );
+      if (generation == _bootstrapGeneration) {
+        final onboardingCompleted = bootstrap.onboardingCompleted ?? false;
+        final nextStatus = onboardingCompleted
+            ? AppBootstrapStatus.ready
+            : AppBootstrapStatus.onboardingRequired;
+        _setBootstrap(
+          ref.read(appBootstrapProvider).copyWith(
+                status: nextStatus,
+                session: session,
+                error: null,
+              ),
+        );
+        if (kDebugMode) {
+          debugPrint(
+            'Profile bootstrap assignment: status=${nextStatus.name} '
+            'loading=false errorCleared=true.',
+          );
         }
       }
-      ref.read(authSessionProvider.notifier).state = null;
-      ref.read(isAuthenticatedProvider.notifier).state = false;
-      ref.read(hasCompletedOnboardingProvider.notifier).state = false;
+      return draft;
+    } on AuthSessionExpiredException {
+      try {
+        await _authRepository.signOut();
+      } catch (_) {
+        // The backend rejected the session; local state still returns to Auth.
+      }
       ref.read(forceShowOnboardingProvider.notifier).state = false;
       ref.read(currentTabProvider.notifier).state = 0;
-      return _loadDraftForSession(null);
+      final draft = await _loadDraftForSession(null);
+      if (generation == _bootstrapGeneration) {
+        _setBootstrap(
+          const AppBootstrapState(status: AppBootstrapStatus.expired),
+        );
+      }
+      return draft;
+    } catch (error) {
+      if (generation == _bootstrapGeneration) {
+        _setBootstrap(
+          AppBootstrapState(
+            status: _bootstrapFailureStatus(error),
+            session: ref.read(appBootstrapProvider).session,
+            error: error,
+          ),
+        );
+      }
+      rethrow;
     }
-    if (session != null && _profileLooksOnboarded(draft.profile)) {
-      ref.read(hasCompletedOnboardingProvider.notifier).state = true;
-    }
-    return draft;
   }
 
   Future<void> signInWithMockProvider(String provider) async {
-    _transientOnboardingPassword = null;
     final session = await _authRepository.signInWithMockProvider(provider);
-    await _replaceSession(session);
+    await _bootstrapSession(session);
   }
 
   Future<void> signInWithEmailPassword({
@@ -199,11 +324,34 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       email: email,
       password: password,
     );
-    _transientOnboardingPassword = _TransientOnboardingPassword(
+    await _bootstrapSession(session);
+  }
+
+  Future<void> signUpWithEmailPassword({
+    required String email,
+    required String password,
+  }) async {
+    final repository = _authRepository;
+    if (repository is! EmailSignUpRepository) {
+      throw UnsupportedError('Email sign-up is unavailable in this mode.');
+    }
+    final session =
+        await (repository as EmailSignUpRepository).signUpWithEmailPassword(
       email: email,
       password: password,
     );
-    await _replaceSession(session);
+    await _bootstrapSession(session);
+  }
+
+  Future<void> retryAccountProvisioning() async {
+    final session =
+        ref.read(authSessionProvider) ?? await _authRepository.currentSession();
+    if (session == null) {
+      throw const AuthSessionExpiredException(
+        'Your session expired. Please sign in again.',
+      );
+    }
+    await _bootstrapSession(session);
   }
 
   Future<void> signOut() async {
@@ -472,8 +620,10 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       current.copyWith(
         template: template,
         workoutLog: syncedWorkoutLog,
+        templateDraftDirty: true,
       ),
     );
+    await _workoutTemplateDraftStore.write(current.session, template);
   }
 
   Future<void> createTemplateDraft() async {
@@ -485,8 +635,10 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       current.copyWith(
         template: WorkoutTemplateDraft.empty,
         workoutLog: WorkoutLogDraft.empty,
+        templateDraftDirty: false,
       ),
     );
+    await _workoutTemplateDraftStore.clear(current.session);
   }
 
   Future<void> openWorkoutTemplate(WorkoutTemplateDraft template) async {
@@ -501,8 +653,10 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
           current.workoutLog,
           template,
         ),
+        templateDraftDirty: false,
       ),
     );
+    await _workoutTemplateDraftStore.clear(current.session);
   }
 
   Future<void> startWorkoutFromTemplate(WorkoutTemplateDraft template) async {
@@ -772,7 +926,10 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
   Future<List<ExerciseSuggestion>> searchExerciseSuggestions(
     String query,
   ) async {
-    return _workoutRepository.searchExercises(query);
+    return _workoutRepository.searchExercises(
+      query,
+      state.valueOrNull?.session,
+    );
   }
 
   Future<void> applyExerciseSuggestion(
@@ -941,10 +1098,6 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     state = AsyncData(
       current.copyWith(
         foodLogs: newFoodLogs,
-        nutritionSummary: _rebuildNutritionSummary(
-          logs: newFoodLogs,
-          base: current.nutritionSummary,
-        ),
       ),
     );
   }
@@ -967,22 +1120,22 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
             previous.protein != foodLogWithSource.protein ||
             previous.carbs != foodLogWithSource.carbs ||
             previous.fat != foodLogWithSource.fat;
-    newFoodLogs[index] = changedFoodDefinition
-        ? rescaledFoodLog.copyWith(foodId: null)
-        : rescaledFoodLog;
+    newFoodLogs[index] = (changedFoodDefinition
+            ? rescaledFoodLog.copyWith(foodId: null)
+            : rescaledFoodLog)
+        .copyWith(isDirty: true);
     state = AsyncData(
       current.copyWith(
         foodLogs: newFoodLogs,
-        nutritionSummary: _rebuildNutritionSummary(
-          logs: newFoodLogs,
-          base: current.nutritionSummary,
-        ),
       ),
     );
   }
 
   Future<List<FoodSuggestion>> searchFoodSuggestions(String query) async {
-    return _nutritionRepository.searchFoods(query);
+    return _nutritionRepository.searchFoods(
+      query,
+      state.valueOrNull?.session,
+    );
   }
 
   Future<void> applyFoodSuggestion(
@@ -994,14 +1147,11 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       return;
     }
     final newFoodLogs = [...current.foodLogs];
-    newFoodLogs[index] = suggestion.applyTo(newFoodLogs[index]);
+    newFoodLogs[index] =
+        suggestion.applyTo(newFoodLogs[index]).copyWith(isDirty: true);
     state = AsyncData(
       current.copyWith(
         foodLogs: newFoodLogs,
-        nutritionSummary: _rebuildNutritionSummary(
-          logs: newFoodLogs,
-          base: current.nutritionSummary,
-        ),
       ),
     );
   }
@@ -1015,12 +1165,41 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     state = AsyncData(
       current.copyWith(
         foodLogs: newFoodLogs,
-        nutritionSummary: _rebuildNutritionSummary(
-          logs: newFoodLogs,
-          base: current.nutritionSummary,
-        ),
       ),
     );
+  }
+
+  Future<FoodLogDraft> deleteFoodLog(int index) async {
+    final current = state.valueOrNull;
+    if (current == null) {
+      throw Exception('Nutrition state is not ready.');
+    }
+    final deleted = current.foodLogs[index];
+    final next = [...current.foodLogs]..removeAt(index);
+    if (deleted.foodLogId == null) {
+      state = AsyncData(current.copyWith(foodLogs: next));
+      return deleted;
+    }
+    await _saveFoodLogs(current, next);
+    return deleted;
+  }
+
+  Future<void> restoreDeletedFoodLog(
+    int index,
+    FoodLogDraft deleted,
+  ) async {
+    final current = state.valueOrNull;
+    if (current == null) {
+      throw Exception('Nutrition state is not ready.');
+    }
+    final restored = deleted.copyWith(foodLogId: null);
+    final next = [...current.foodLogs]
+      ..insert(index.clamp(0, current.foodLogs.length), restored);
+    if (deleted.foodLogId == null) {
+      state = AsyncData(current.copyWith(foodLogs: next));
+      return;
+    }
+    await _saveFoodLogs(current, next);
   }
 
   Future<void> updateHydration(double liters) async {
@@ -1064,20 +1243,7 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     state = AsyncData(current.copyWith(consistency: saved));
   }
 
-  Future<void> updateSearchQuery(String query) async {
-    final current = state.valueOrNull;
-    if (current == null) {
-      return;
-    }
-    final groups = await _searchRepository.search(current.session, query);
-    state = AsyncData(
-      current.copyWith(
-        search: current.search.copyWith(query: query, groups: groups),
-      ),
-    );
-  }
-
-  Future<void> _saveFoodLogs(
+  Future<NutritionMutationResult> _saveFoodLogs(
     AppDraftState current,
     List<FoodLogDraft> logs,
   ) async {
@@ -1086,16 +1252,16 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       source: 'lib/core/navigation/app_state.dart -> _saveFoodLogs',
       feature: 'nutrition save',
     );
-    final savedLogs = await _runProtectedAction(
+    final mutation = await _runProtectedAction(
       () => _nutritionRepository.saveFoodLogs(
         session,
         logs,
       ),
     );
-    final savedSummary = await _runProtectedAction(
-      () => _nutritionRepository.loadSummary(session),
-    );
-    final isLiveSession = session.provider != 'mock';
+    final savedLogs = mutation.entries;
+    final savedSummary = mutation.summary;
+    final usesAuthoritativeBackendTotals =
+        _nutritionRepository is! MockNutritionRepository;
     final summaryFromLogs = _rebuildNutritionSummary(
       logs: savedLogs,
       base: current.nutritionSummary,
@@ -1103,7 +1269,7 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     state = AsyncData(
       current.copyWith(
         foodLogs: savedLogs,
-        nutritionSummary: isLiveSession
+        nutritionSummary: usesAuthoritativeBackendTotals
             ? (_summaryHasVisibleTotals(savedSummary) || savedLogs.isEmpty
                 ? savedSummary
                 : summaryFromLogs)
@@ -1111,6 +1277,7 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       ),
     );
     _refreshAgentContext(session);
+    return mutation;
   }
 
   Future<void> _flushPending(AuthSession session) async {
@@ -1132,6 +1299,20 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
   }
 
   Future<WorkoutTemplateDraft> saveWorkoutTemplate() async {
+    final inFlight = _templateSaveInFlight;
+    if (inFlight != null) {
+      return inFlight;
+    }
+    final save = _saveWorkoutTemplateOnce();
+    _templateSaveInFlight = save;
+    try {
+      return await save;
+    } finally {
+      _templateSaveInFlight = null;
+    }
+  }
+
+  Future<WorkoutTemplateDraft> _saveWorkoutTemplateOnce() async {
     final current = state.valueOrNull;
     if (current == null) {
       throw Exception('Workout state is not ready.');
@@ -1161,8 +1342,10 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
               ? current.workoutLog.exercises
               : saved.exercises,
         ),
+        templateDraftDirty: false,
       ),
     );
+    await _workoutTemplateDraftStore.clear(session);
     return saved;
   }
 
@@ -1178,8 +1361,10 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
           template: current.template.templateId == null
               ? WorkoutTemplateDraft.empty
               : current.template,
+          templateDraftDirty: false,
         ),
       );
+      await _workoutTemplateDraftStore.clear(current.session);
       return;
     }
     final session = await _requireSessionForProtectedAction(
@@ -1217,7 +1402,7 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     );
   }
 
-  Future<WorkoutLogDraft> logWorkoutSession() async {
+  Future<WorkoutMutationResult> logWorkoutSession() async {
     final current = state.valueOrNull;
     if (current == null) {
       throw Exception('Workout state is not ready.');
@@ -1255,28 +1440,121 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
         'No member or exercise values logged.',
       );
     }
-    final savedLog = await _runProtectedAction(
+    final result = await _runProtectedAction(
       () => _workoutRepository.saveWorkoutLog(
         session,
         draftToLog,
       ),
     );
+    final displayedWorkout = result.authoritativeWorkout ?? draftToLog;
+    state = AsyncData(current.copyWith(
+      workoutLog: displayedWorkout,
+      lastWorkoutMutation: result,
+    ));
+    _refreshAgentContext(session);
+    return result;
+  }
+
+  Future<WorkoutMutationResult> finishActiveWorkout(
+    ActiveWorkoutSession activeSession,
+  ) async {
+    final current = state.valueOrNull;
+    if (current == null) {
+      throw Exception('Workout state is not ready.');
+    }
+    final session = await _requireSessionForProtectedAction(
+      current,
+      source: 'lib/core/navigation/app_state.dart -> finishActiveWorkout',
+      feature: 'active workout completion',
+    );
+
+    final pending = current.lastWorkoutMutation;
+    if (pending != null &&
+        pending.mutationId == activeSession.sessionId &&
+        pending.syncStatus == WorkoutSyncStatus.pendingSync) {
+      await _runProtectedAction(() => _workoutRepository.flushPending(session));
+      final authoritative = await _runProtectedAction(
+          () => _workoutRepository.loadWorkoutLog(session));
+      if (authoritative.workoutLogId != null) {
+        final synced = WorkoutMutationResult(
+          localWorkoutId: pending.localWorkoutId,
+          serverLogId: authoritative.workoutLogId,
+          mutationId: pending.mutationId,
+          syncStatus: WorkoutSyncStatus.synced,
+          errorCode: null,
+          retryable: false,
+          authoritativeWorkout: authoritative,
+        );
+        state = AsyncData(
+          current.copyWith(
+            workoutLog: authoritative,
+            lastWorkoutMutation: synced,
+          ),
+        );
+        return synced;
+      }
+      return pending;
+    }
+
+    final draftToLog = activeSession.toCompletedDraft(DateTime.now());
+    final repository = _workoutRepository;
+    final result = await _runProtectedAction(
+      () => repository is IdempotentWorkoutCompletionRepository
+          ? (repository as IdempotentWorkoutCompletionRepository).finishWorkout(
+              session,
+              draftToLog,
+              mutationId: activeSession.sessionId,
+            )
+          : repository.saveWorkoutLog(session, draftToLog),
+    );
+    final displayedWorkout = result.authoritativeWorkout ?? draftToLog;
     state = AsyncData(
       current.copyWith(
-        workoutLog: savedLog,
+        workoutLog: displayedWorkout,
+        lastWorkoutMutation: result,
       ),
     );
     _refreshAgentContext(session);
-    return savedLog;
+    ref.invalidate(workoutHistoryProvider);
+    return result;
   }
 
-  Future<List<FoodLogDraft>> saveNutritionLogs() async {
+  Future<void> retryWorkoutSync() async {
+    final current = state.valueOrNull;
+    final pending = current?.lastWorkoutMutation;
+    if (current == null || pending == null || !pending.retryable) {
+      return;
+    }
+    final session = await _requireSessionForProtectedAction(
+      current,
+      source: 'lib/core/navigation/app_state.dart -> retryWorkoutSync',
+      feature: 'workout sync retry',
+    );
+    await _workoutRepository.flushPending(session);
+    final authoritative = await _workoutRepository.loadWorkoutLog(session);
+    if (authoritative.workoutLogId == null) {
+      return;
+    }
+    state = AsyncData(current.copyWith(
+      workoutLog: authoritative,
+      lastWorkoutMutation: WorkoutMutationResult(
+        localWorkoutId: pending.localWorkoutId,
+        serverLogId: authoritative.workoutLogId,
+        mutationId: pending.mutationId,
+        syncStatus: WorkoutSyncStatus.synced,
+        errorCode: null,
+        retryable: false,
+        authoritativeWorkout: authoritative,
+      ),
+    ));
+  }
+
+  Future<NutritionMutationResult> saveNutritionLogs() async {
     final current = state.valueOrNull;
     if (current == null) {
       throw Exception('Nutrition state is not ready.');
     }
-    await _saveFoodLogs(current, current.foodLogs);
-    return state.valueOrNull?.foodLogs ?? const [];
+    return _saveFoodLogs(current, current.foodLogs);
   }
 
   Future<void> refreshAfterJimActions(Iterable<String> actions) async {
@@ -1435,50 +1713,6 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     );
   }
 
-  AtlasOnboardingAccount _atlasOnboardingAccount({
-    required AuthSession? session,
-    required UserProfile profile,
-  }) {
-    final email = session?.email.trim() ?? '';
-    final password = _transientOnboardingPassword?.passwordFor(email);
-    if (email.isEmpty || password == null || password.isEmpty) {
-      // /atlas/onboard currently requires a password even though live requests
-      // already use an authenticated Supabase/FastAPI bearer session.
-      if (kDebugMode) {
-        debugPrint(
-          'Atlas onboarding blocked: required account credential is missing. '
-          'password_missing=${password == null || password.isEmpty} '
-          'email_missing=${email.isEmpty}. No secret values logged.',
-        );
-      }
-      throw const AtlasOnboardingCredentialException(
-        'Your setup is saved on this device. Jim will sync it when the coaching service is available.',
-      );
-    }
-    return AtlasOnboardingAccount(
-      username: _atlasUsername(session: session!, profile: profile),
-      email: email,
-      password: password,
-    );
-  }
-
-  String _atlasUsername({
-    required AuthSession session,
-    required UserProfile profile,
-  }) {
-    for (final candidate in [
-      profile.name,
-      session.displayName,
-      session.email.split('@').first,
-    ]) {
-      final trimmed = candidate.trim();
-      if (trimmed.isNotEmpty && trimmed != 'JimBro User') {
-        return trimmed;
-      }
-    }
-    return session.email.trim();
-  }
-
   Future<ProfileSyncResult> _syncOnboardingProfile({
     required AppDraftState current,
     required UserProfile profile,
@@ -1490,6 +1724,7 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       final saved = await _profileRepository.saveProfile(
         current.session,
         profile,
+        onboardingCompleted: true,
       );
       final metrics = _localMetricsForProfile(saved);
       final savedMetrics = await _profileRepository.saveMetrics(
@@ -1499,34 +1734,18 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       return ProfileSyncResult(profile: saved, metrics: savedMetrics);
     }
 
-    var canonicalProfile = profile;
-    try {
-      canonicalProfile = await _profileRepository.saveProfile(
-        current.session,
-        profile,
-      );
-    } on AuthSessionExpiredException {
-      rethrow;
-    } on Exception catch (error) {
-      if (kDebugMode) {
-        debugPrint(
-          'Atlas onboarding profile pre-save unavailable; keeping local canonical profile. '
-          'error_type=${error.runtimeType}. No secret values logged.',
-        );
-      }
-    }
+    final canonicalProfile = await _profileRepository.saveProfile(
+      current.session,
+      profile,
+      onboardingCompleted: true,
+    );
 
     try {
-      final account = _atlasOnboardingAccount(
-        session: current.session,
-        profile: canonicalProfile,
-      );
       var metrics = await _runProtectedAction(
         () => _profileRepository.submitAtlasOnboarding(
           current.session,
           canonicalProfile,
           answers,
-          account,
         ),
       );
       try {
@@ -1553,8 +1772,6 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
         );
       }
       return ProfileSyncResult(profile: canonicalProfile, metrics: metrics);
-    } on AtlasOnboardingCredentialException catch (error) {
-      return _fallbackProfileSync(canonicalProfile, error.message);
     } on AtlasProfileSyncException catch (error) {
       return _fallbackProfileSync(canonicalProfile, error.message);
     } on DioException catch (error) {
@@ -1592,18 +1809,10 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       return ProfileSyncResult(profile: saved, metrics: savedMetrics);
     }
 
-    var canonicalProfile = profile;
-    try {
-      canonicalProfile = await _profileRepository.saveProfile(
-        current.session,
-        profile,
-      );
-    } on AuthSessionExpiredException {
-      rethrow;
-    } on Exception {
-      // Keep the submitted profile canonical locally while backend profile
-      // persistence recovers.
-    }
+    final canonicalProfile = await _profileRepository.saveProfile(
+      current.session,
+      profile,
+    );
 
     try {
       final metrics = await _runProtectedAction(
@@ -1670,19 +1879,185 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
           );
   }
 
+  Future<void> _bootstrapSession(AuthSession session) {
+    final existing = _sessionBootstrapInFlight;
+    if (existing != null && _sessionBootstrapUserId == session.userId) {
+      return existing;
+    }
+
+    final operation = _replaceSession(session);
+    _sessionBootstrapInFlight = operation;
+    _sessionBootstrapUserId = session.userId;
+    void clearInFlight() {
+      if (identical(_sessionBootstrapInFlight, operation)) {
+        _sessionBootstrapInFlight = null;
+        _sessionBootstrapUserId = null;
+      }
+    }
+
+    unawaited(
+      operation.then<void>(
+        (_) => clearInFlight(),
+        onError: (Object _, StackTrace __) => clearInFlight(),
+      ),
+    );
+    return operation;
+  }
+
   Future<void> _replaceSession(AuthSession session) async {
-    ref.read(authSessionProvider.notifier).state = session;
-    ref.read(isAuthenticatedProvider.notifier).state = true;
+    final generation = ++_bootstrapGeneration;
+    _setBootstrap(
+      AppBootstrapState(
+        status: AppBootstrapStatus.authenticatedProvisioning,
+        session: session,
+      ),
+    );
     state = const AsyncLoading();
-    state = await AsyncValue.guard(() => _loadDraftForSession(session));
-    final loaded = state.valueOrNull;
-    if (loaded != null && _profileLooksOnboarded(loaded.profile)) {
-      ref.read(hasCompletedOnboardingProvider.notifier).state = true;
+    try {
+      final bootstrap = await _confirmApplicationUser(session);
+      final loaded = await _loadDraftForSession(
+        session,
+        canonicalProfile: bootstrap.profile,
+      );
+      if (generation != _bootstrapGeneration) {
+        return;
+      }
+      state = AsyncData(loaded);
+      final onboardingCompleted = bootstrap.onboardingCompleted ?? false;
+      final nextStatus = onboardingCompleted
+          ? AppBootstrapStatus.ready
+          : AppBootstrapStatus.onboardingRequired;
+      _setBootstrap(
+        ref.read(appBootstrapProvider).copyWith(
+              status: nextStatus,
+              session: session,
+              error: null,
+            ),
+      );
+      if (kDebugMode) {
+        debugPrint(
+          'Profile bootstrap transition: status=${nextStatus.name} '
+          'errorCleared=true.',
+        );
+      }
+    } catch (error, stackTrace) {
+      if (generation != _bootstrapGeneration) {
+        return;
+      }
+      if (error is AuthSessionExpiredException) {
+        try {
+          await _authRepository.signOut();
+        } catch (_) {
+          // The session is unusable locally even if remote sign-out fails.
+        }
+      }
+      state = AsyncError(error, stackTrace);
+      _setBootstrap(
+        AppBootstrapState(
+          status: _bootstrapFailureStatus(error),
+          session: error is AuthSessionExpiredException ? null : session,
+          error: error,
+        ),
+      );
+      rethrow;
+    }
+  }
+
+  void _setBootstrap(AppBootstrapState bootstrap) {
+    final previous = ref.read(appBootstrapProvider);
+    if (kDebugMode &&
+        (previous.status != bootstrap.status ||
+            previous.session?.userId != bootstrap.session?.userId)) {
+      debugPrint(
+        'JimBro bootstrap transition: generation=$_bootstrapGeneration '
+        'from=${previous.status.name} to=${bootstrap.status.name} '
+        'sessionPresent=${bootstrap.session != null} '
+        'errorType=${bootstrap.error?.runtimeType ?? 'none'}.',
+      );
+    }
+    ref.read(appBootstrapProvider.notifier).state = bootstrap;
+  }
+
+  void markOnboardingComplete() {
+    final bootstrap = ref.read(appBootstrapProvider);
+    final session = bootstrap.session;
+    if (session == null) {
+      return;
+    }
+    _setBootstrap(
+      AppBootstrapState(
+        status: AppBootstrapStatus.ready,
+        session: session,
+      ),
+    );
+  }
+
+  Future<ApplicationUserProvisioningResult> _confirmApplicationUser(
+    AuthSession session,
+  ) async {
+    try {
+      final result = await _accountRepository.provisionAuthenticatedUser(
+        session,
+      );
+      if (result.applicationUserId.trim().isEmpty) {
+        throw const UserProvisioningException();
+      }
+      if (kDebugMode) {
+        debugPrint(
+          result.reconciled
+              ? 'Application user ready. code=AUTH_USER_RECONCILED.'
+              : 'Application user profile lookup confirmed.',
+        );
+      }
+      return result;
+    } on AuthSessionExpiredException {
+      rethrow;
+    } on AppError {
+      rethrow;
+    } on DioException {
+      rethrow;
+    } on ProfileSchemaException {
+      rethrow;
+    } on UserProvisioningException {
+      rethrow;
+    } catch (error) {
+      if (kDebugMode) {
+        debugPrint(
+          'Application-user provisioning failed. '
+          'code=USER_PROVISIONING_FAILED error_type=${error.runtimeType}. '
+          'No token or profile payload logged.',
+        );
+      }
+      throw AppError(
+        code: AppErrorCode.malformedResponse,
+        userMessage:
+            'JimBro received profile data it could not read. Please try again or sign out.',
+        diagnostics: const AppErrorDiagnostics(
+          method: 'GET',
+          route: '/supabase/profile',
+          retryable: false,
+        ),
+      );
     }
   }
 
   Future<void> _clearLocalSession({AuthSession? deletedAccount}) async {
-    _transientOnboardingPassword = null;
+    ++_bootstrapGeneration;
+    final signingOutSession = state.valueOrNull?.session;
+    if (signingOutSession != null) {
+      await _workoutTemplateDraftStore.clear(signingOutSession);
+    }
+    if (deletedAccount != null) {
+      for (final repository in <Object>[
+        _profileRepository,
+        _workoutRepository,
+        _nutritionRepository,
+      ]) {
+        if (repository is UserScopedCache) {
+          repository.clearUserCache(deletedAccount.userId);
+        }
+      }
+    }
     try {
       await _authRepository.signOut();
     } catch (_) {
@@ -1690,9 +2065,11 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
         rethrow;
       }
     }
-    ref.read(authSessionProvider.notifier).state = null;
-    ref.read(isAuthenticatedProvider.notifier).state = false;
-    ref.read(hasCompletedOnboardingProvider.notifier).state = false;
+    _setBootstrap(
+      const AppBootstrapState(
+        status: AppBootstrapStatus.unauthenticated,
+      ),
+    );
     ref.read(forceShowOnboardingProvider.notifier).state = false;
     ref.read(currentTabProvider.notifier).state = 0;
     state = const AsyncLoading();
@@ -1711,28 +2088,33 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     state = await AsyncValue.guard(() => _loadDraftForSession(null));
   }
 
-  Future<AppDraftState> _loadDraftForSession(AuthSession? session) async {
-    final results = await Future.wait<Object>([
-      _loadOrDefault<UserProfile>(
-        () => _profileRepository.loadProfile(session),
-        const UserProfile(
-          name: 'JimBro User',
-          goal: '',
-          coachingPreference: '',
-          userLevel: UserLevel.beginner,
-          age: 0,
-          heightCm: 0,
-          weightKg: 0,
-          sex: '',
-          availableTimeMinutes: 0,
-          trainingPreference: '',
-          activityLevel: '',
-          dietaryPreference: '',
-          goalTimeframe: '',
-          weeksActive: 0,
-          prefersVoiceLogging: false,
-        ),
-      ),
+  Future<AppDraftState> _loadDraftForSession(
+    AuthSession? session, {
+    UserProfile? canonicalProfile,
+  }) async {
+    final results = await Future.wait<Object?>([
+      canonicalProfile != null
+          ? Future<UserProfile>.value(canonicalProfile)
+          : _loadOrDefault<UserProfile>(
+              () => _profileRepository.loadProfile(session),
+              const UserProfile(
+                name: 'JimBro User',
+                goal: '',
+                coachingPreference: '',
+                userLevel: UserLevel.beginner,
+                age: 0,
+                heightCm: 0,
+                weightKg: 0,
+                sex: '',
+                availableTimeMinutes: 0,
+                trainingPreference: '',
+                activityLevel: '',
+                dietaryPreference: '',
+                goalTimeframe: '',
+                weeksActive: 0,
+                prefersVoiceLogging: false,
+              ),
+            ),
       _loadOrDefault<UserStaticMetrics>(
         () => _profileRepository.loadMetrics(session),
         const UserStaticMetrics(
@@ -1778,23 +2160,31 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
           totalLogs: 0,
         ),
       ),
+      _workoutTemplateDraftStore.load(session),
+      _workoutRepository is PendingWorkoutMutationSource
+          ? (_workoutRepository as PendingWorkoutMutationSource)
+              .loadPendingWorkoutMutation(session)
+          : Future<WorkoutMutationResult?>.value(),
     ]);
 
     final loadedTemplates = results[2] as List<WorkoutTemplateDraft>;
     final templates = loadedTemplates;
-    final template =
-        templates.isEmpty ? WorkoutTemplateDraft.empty : templates.last;
+    final checkpoint = results[8] as WorkoutTemplateDraft?;
+    final pendingWorkout = results[9] as WorkoutMutationResult?;
+    final template = checkpoint ??
+        (templates.isEmpty ? WorkoutTemplateDraft.empty : templates.last);
     final workoutSchedule = results[3] as List<WorkoutScheduleEntry>;
     final loadedWorkoutLog = results[4] as WorkoutLogDraft;
-    final workoutLog = loadedWorkoutLog.name.isEmpty &&
-            loadedWorkoutLog.notes.isEmpty &&
-            loadedWorkoutLog.exercises.isEmpty
-        ? loadedWorkoutLog.copyWith(
-            name: template.name,
-            templateId: template.templateId,
-            exercises: template.exercises,
-          )
-        : loadedWorkoutLog;
+    final workoutLog = pendingWorkout?.authoritativeWorkout ??
+        (loadedWorkoutLog.name.isEmpty &&
+                loadedWorkoutLog.notes.isEmpty &&
+                loadedWorkoutLog.exercises.isEmpty
+            ? loadedWorkoutLog.copyWith(
+                name: template.name,
+                templateId: template.templateId,
+                exercises: template.exercises,
+              )
+            : loadedWorkoutLog);
 
     final profile = results[0] as UserProfile;
     final loadedMetrics = results[1] as UserStaticMetrics;
@@ -1828,13 +2218,16 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
       foodLogs: results[5] as List<FoodLogDraft>,
       nutritionSummary: nutritionSummary,
       consistency: results[7] as ConsistencyState,
-      search: _searchRepository.emptyState(),
       profileSyncStatus: ProfileSyncStatus.synced,
       atlasMetricsStatus: _metricsAreAvailable(loadedMetrics)
           ? AtlasMetricsStatus.available
           : _metricsAreAvailable(estimatedMetrics)
               ? AtlasMetricsStatus.pending
               : AtlasMetricsStatus.unavailable,
+      templateDraftDirty: checkpoint != null,
+      templatesAreStale: _workoutRepository is TemplateLoadMetadata &&
+          (_workoutRepository as TemplateLoadMetadata).templatesAreStale,
+      lastWorkoutMutation: pendingWorkout,
     );
   }
 
@@ -1879,20 +2272,19 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
     };
   }
 
-  bool _profileLooksOnboarded(UserProfile profile) {
-    return profile.name.trim().isNotEmpty &&
-        profile.name != 'JimBro User' &&
-        profile.age > 0 &&
-        profile.heightCm > 0 &&
-        profile.weightKg > 0 &&
-        profile.goal.trim().isNotEmpty;
-  }
-
   Future<AuthSession> _requireSessionForProtectedAction(
     AppDraftState current, {
     required String source,
     required String feature,
   }) async {
+    final bootstrap = ref.read(appBootstrapProvider);
+    if (!bootstrap.allowsProtectedWrites) {
+      throw AppError(
+        code: AppErrorCode.synchronizationFailed,
+        userMessage: 'Your account is still being prepared. Please wait.',
+        diagnostics: const AppErrorDiagnostics(retryable: true),
+      );
+    }
     final stateSession = current.session;
     if (stateSession != null) {
       return stateSession;
@@ -1906,48 +2298,38 @@ class AppDraftController extends AsyncNotifier<AppDraftState> {
 
     final repositorySession = await _authRepository.currentSession();
     if (repositorySession != null) {
-      ref.read(authSessionProvider.notifier).state = repositorySession;
-      ref.read(isAuthenticatedProvider.notifier).state = true;
       state = AsyncData(current.copyWith(session: repositorySession));
       return repositorySession;
     }
 
-    throw Exception(
-      'Authentication session missing before protected $feature.\n'
-      'source: $source\n'
-      'problem: The UI is inside the authenticated app flow, but AppDraftState.session, authSessionProvider, and AuthRepository.currentSession() are all null.\n'
-      'likely_cause: App state was restored/advanced past auth without carrying the Supabase session into AppDraftState, or the Supabase session was cleared/expired after login.\n'
-      'frontend_fix_attempted: The controller checked current AppDraftState.session, authSessionProvider, and AuthRepository.currentSession() immediately before sending the protected request.\n'
-      'backend_request_sent: false\n'
-      'isAuthenticatedProvider: ${ref.read(isAuthenticatedProvider)}\n'
-      'hasCompletedOnboardingProvider: ${ref.read(hasCompletedOnboardingProvider)}\n'
-      'session_in_state: missing\n'
-      'session_in_auth_provider: missing\n'
-      'next_step: Sign out/in once. If this repeats, inspect why SupabaseAuthRepository.currentSession() is null after login.',
+    throw AppError(
+      code: AppErrorCode.sessionExpired,
+      userMessage: 'Your session expired. Please sign in again.',
+      diagnostics: const AppErrorDiagnostics(retryable: false),
     );
   }
 
   Future<T> _runProtectedAction<T>(Future<T> Function() action) async {
     try {
       return await action();
-    } on AuthSessionExpiredException catch (error) {
+    } on AuthSessionExpiredException {
       await _clearExpiredSession();
-      throw AuthSessionExpiredException(
-        'Your session expired. Please sign in again.\n'
-        '${kDebugMode ? error.message : 'backend_request_sent: true'}',
+      throw const AuthSessionExpiredException(
+        'Your session expired. Please sign in again.',
       );
     }
   }
 
   Future<void> _clearExpiredSession() async {
+    ++_bootstrapGeneration;
     try {
       await _authRepository.signOut();
     } catch (_) {
       // The backend already rejected the session; local state must still clear.
     }
-    ref.read(authSessionProvider.notifier).state = null;
-    ref.read(isAuthenticatedProvider.notifier).state = false;
-    ref.read(hasCompletedOnboardingProvider.notifier).state = false;
+    _setBootstrap(
+      const AppBootstrapState(status: AppBootstrapStatus.expired),
+    );
     ref.read(forceShowOnboardingProvider.notifier).state = false;
     ref.read(currentTabProvider.notifier).state = 0;
     state = AsyncData(await _loadDraftForSession(null));
